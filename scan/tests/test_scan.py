@@ -181,6 +181,15 @@ FAKE_SCANIMAGE = textwrap.dedent("""\
     #!/usr/bin/env python3
     # scanimage as the WF-3540 behaves: the runs in $FAKE_RUNS, one per call
     import json, os, sys
+    if "-L" in sys.argv:   # the search: what $FAKE_LIST says is on the network
+        print(os.environ.get("FAKE_LIST", ""))
+        sys.exit(0)
+    if "-A" in sys.argv:   # the device opened, its options read
+        if os.environ.get("FAKE_A_FAILS"):
+            print("scanimage: open of device %s failed: Error during device I/O" % sys.argv[sys.argv.index("-d") + 1], file=sys.stderr)
+            sys.exit(1)
+        print("Options specific to device ...")
+        sys.exit(0)
     runs = json.load(open(os.environ["FAKE_RUNS"]))
     run, rest = runs[0], runs[1:]
     json.dump(rest, open(os.environ["FAKE_RUNS"], "w"))
@@ -224,7 +233,8 @@ class Dienst(unittest.TestCase):
 
     def tearDown(self):
         scan.ocr, scan.osd, scan.melde, scan.pdf_aus_bildern, scan.run = self.alt
-        os.environ.pop("FAKE_RUNS", None)
+        for k in ("FAKE_RUNS", "FAKE_LIST", "FAKE_A_FAILS"):
+            os.environ.pop(k, None)
 
     def runs(self, *runs):
         p = os.path.join(self.d, "runs.json")
@@ -369,6 +379,55 @@ class Dienst(unittest.TestCase):
         self.assertEqual(len(self.meldungen), 3)
 
 
+    def test_the_search_lists_the_networks_scanners_and_keeps_them_through_a_stack(self):
+        os.environ["FAKE_LIST"] = ("device `epson2:net:192.0.2.7' is a Epson PID 0899 flatbed scanner\n"
+                                   "device `airscan:e0:Brother ADS-4300N' is a eSCL Brother ADS-4300N ip=192.0.2.9\n"
+                                   "No scanners were identified. If you were expecting something different,")
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "suchen")
+        s = self.status()
+        self.assertEqual(s["zustand"], "bereit")
+        self.assertEqual(s["suche"]["zustand"], "fertig")
+        self.assertEqual(s["suche"]["funde"], [{"geraet": "epson2:net:192.0.2.7", "name": "Epson PID 0899 flatbed scanner"},
+                                               {"geraet": "airscan:e0:Brother ADS-4300N", "name": "eSCL Brother ADS-4300N ip=192.0.2.9"}])
+        self.runs(([leer(61), vorne(62, BRIEF_A1)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst.verarbeiten = lambda stapel, frage=None, v=dienst.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}]))
+        self.auftrag(dienst, "start")
+        self.assertEqual(self.status()["zustand"], "fertig")
+        self.assertEqual(len(self.status()["suche"]["funde"]), 2, "a stack wiped the search")
+        self.assertEqual(len(scan.Dienst(self.cfg).suche["funde"]), 2, "a restart wiped the search")
+
+    def test_nothing_found_says_what_to_do(self):
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "suchen")
+        self.assertIn("von Hand", self.status()["suche"]["detail"])
+
+    def test_a_new_scanner_is_checked_at_once_and_a_dead_one_says_why(self):
+        dienst = scan.Dienst(self.cfg)
+        dienst.tick()
+        p = self.status()["pruefung"]
+        self.assertEqual((p["geraet"], p["ok"], p["detail"]), ("epson2:net:192.0.2.7", True, "Scanner antwortet"))
+        os.environ["FAKE_A_FAILS"] = "1"
+        dienst.tick()
+        self.assertTrue(self.status()["pruefung"]["ok"], "checked once per device, not on every tick")
+        self.auftrag(dienst, "pruefen")
+        p = self.status()["pruefung"]
+        self.assertFalse(p["ok"])
+        self.assertIn("Error during device I/O", p["detail"])
+        self.assertEqual(self.meldungen, [], "a check is no stack: no message")
+
+    def test_a_probe_sheet_is_read_and_never_filed(self):
+        self.runs(([vorne(71, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "probe")
+        p = self.status()["pruefung"]
+        self.assertTrue(p["ok"] and p["probe"], p)
+        self.assertTrue(p["detail"].startswith("Probeseite: %d Wörter gelesen" % scan.woerter(BRIEF_B)), p["detail"])
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.consume, "Stapel")))
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.data, "probe")))
+        self.assertEqual(self.meldungen, [])
+
+
 class Einrichtung(unittest.TestCase):
     def test_the_host_network_reaches_the_lease_on_loopback(self):
         cfg = scan.Config.from_env({"MODEL_URL": "http://host.containers.internal:11435/v1/", "MODEL_LEASE": "http://host.containers.internal:11435/api/model-lease",
@@ -385,6 +444,15 @@ class Einrichtung(unittest.TestCase):
                 scan.sane_netz("epson2:net:192.0.2.7", d)
             with open(os.path.join(d, "epson2.conf")) as f:
                 self.assertEqual(f.read().count("net 192.0.2.7"), 1)
+
+    def test_epson2_searches_the_network_once_told(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "epson2.conf"), "w") as f:
+                f.write("usb\n#net autodiscovery\n")
+            for _ in range(2):
+                scan.sane_suche(d)
+            with open(os.path.join(d, "epson2.conf")) as f:
+                self.assertEqual(f.read().count("\nnet autodiscovery\n"), 1)
 
     def test_the_scanner_reason_is_never_batch_terminated(self):
         err = "Scanned page 4. (scanner status = 5)\nscanimage: sane_start: Error during device I/O\nscanimage: Batch terminated, 5 pages scanned\n"
