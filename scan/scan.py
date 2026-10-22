@@ -19,7 +19,11 @@ put the rest in, then weiter, abschliessen or verwerfen), ABGEBROCHEN
 already). The state is the status file laib, Haus and the Operator read.
 
 Orders come as files in /data/auftrag/ (laib scan writes them): start,
-weiter, abschliessen, verwerfen, redo. Each stack is archived under
+weiter, abschliessen, verwerfen, redo; and for setting the scanner up
+(#571) suchen (scanimage -L: the network's scanners into the status's
+suche), pruefen (the device opened without paper, into pruefung; also on
+the first start with a new SCANNER) and probe (one sheet scanned and read,
+never filed). Each stack is archived under
 /data/<zeit>/ (the original or the raw pages, plan.json, log.txt) for
 SCAN_KEEP_DAYS; `laib scan redo --stapel <zeit>` splits it again.
 
@@ -506,6 +510,7 @@ class Dienst:
         self.gesehen = {}          # inbox file → (size, mtime, stable since)
         self.letzte = []
         self.status = {}
+        self.suche, self.pruefung = {}, {}   # the scanner's setup (#571), kept across every status
         self.aufgeraeumt = 0
         os.makedirs(os.path.join(cfg.data, "auftrag"), exist_ok=True)
         self.wieder_an()
@@ -515,7 +520,8 @@ class Dienst:
     def zustand(self, zustand, detail, stapel=None, **mehr):
         s = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "detail": detail,
              "zustand": zustand, "scanner": bool(self.cfg.scanner), "eingang": "scan-eingang",
-             "stapel": stapel.zeit if stapel else "", "person": stapel.person if stapel else "", "letzte": self.letzte}
+             "stapel": stapel.zeit if stapel else "", "person": stapel.person if stapel else "", "letzte": self.letzte,
+             "suche": self.suche, "pruefung": self.pruefung}
         s.update(mehr)
         if zustand == "fehler":
             s["findings"] = [{"severity": "gelb", "detail": "Der letzte Stapel ist fehlgeschlagen: " + detail,
@@ -571,6 +577,7 @@ class Dienst:
         except (OSError, ValueError):
             alt = {}
         self.letzte = alt.get("letzte") or []
+        self.suche, self.pruefung = alt.get("suche") or {}, alt.get("pruefung") or {}
         zeit = alt.get("stapel") or ""
         stapel = None
         if ZEIT.match(zeit):
@@ -602,6 +609,8 @@ class Dienst:
             time.sleep(self.cfg.poll_s)
 
     def tick(self):
+        if self.cfg.scanner and self.pruefung.get("geraet") != self.cfg.scanner and not self.offen:
+            self.pruefen()   # a new SCANNER: does it answer
         for pfad in sorted(glob.glob(os.path.join(self.cfg.data, "auftrag", "*.json"))):
             try:
                 with open(pfad) as f:
@@ -642,6 +651,12 @@ class Dienst:
                 self.ende(stapel, "abgebrochen", "Scan verworfen: %d Blatt gescannt, nichts abgelegt." % stapel.blatt)
         elif akt == "redo" and ZEIT.match(a.get("stapel") or "") and not self.offen:
             self.neu(a["stapel"], person)
+        elif akt == "suchen":
+            self.suchen()
+        elif akt == "pruefen":
+            self.pruefen()
+        elif akt == "probe" and not self.offen:
+            self.probe()
         else:
             log("auftrag %s: nichts zu tun (offen: %s)" % (akt, bool(self.offen)))
 
@@ -780,6 +795,70 @@ class Dienst:
             self.offen = None
             self.ende(stapel, "abgebrochen", "Scan verworfen: der Stapel hat einen Tag auf den Rest gewartet (%d Blatt gescannt), nichts abgelegt." % stapel.blatt)
 
+    # setting the scanner up (#571)
+
+    def zeige(self):
+        """the status as it stands, with the setup's news"""
+        alt = dict(self.status) or {"zustand": "bereit", "detail": "bereit"}
+        mehr = {k: v for k, v in alt.items() if k in ("seite", "blatt", "grund")}
+        stapel = self.offen
+        self.zustand(alt.get("zustand", "bereit"), alt.get("detail", "bereit"), stapel, **mehr)
+
+    def suchen(self):
+        self.suche = {"zustand": "läuft", "at": jetzt(), "funde": []}
+        self.zeige()
+        try:
+            r = run([self.cfg.scanimage, "-L"], timeout=90)
+            funde = [{"geraet": m.group(1), "name": m.group(2).strip()}
+                     for m in re.finditer(r"device [`'‘](.+?)['’] is an? (.+)", r.stdout)]
+            self.suche = {"zustand": "fertig", "at": jetzt(), "funde": funde,
+                          "detail": "%d Scanner gefunden" % len(funde) if funde else "kein Scanner gefunden: das Gerät an, im selben Netz? Sonst die Adresse von Hand, epson2:net:<ip>"}
+        except (OSError, subprocess.SubprocessError) as e:
+            self.suche = {"zustand": "fehler", "at": jetzt(), "funde": [], "detail": "die Suche lief nicht: %s" % e}
+        self.zeige()
+
+    def pruefen(self):
+        """the device opened without paper: its options read, nothing scanned"""
+        geraet = self.cfg.scanner
+        if not geraet:
+            self.pruefung = {"geraet": "", "ok": False, "at": jetzt(), "detail": "kein Scanner eingerichtet (SCANNER ist leer)"}
+        else:
+            try:
+                r = run([self.cfg.scanimage, "-d", geraet, "-A"], timeout=60)
+                ok = r.returncode == 0
+                self.pruefung = {"geraet": geraet, "ok": ok, "at": jetzt(),
+                                 "detail": "Scanner antwortet" if ok else "antwortet nicht: " + scanner_grund(r.stderr or r.stdout or "")}
+            except (OSError, subprocess.SubprocessError) as e:
+                self.pruefung = {"geraet": geraet, "ok": False, "at": jetzt(), "detail": "antwortet nicht: %s" % e}
+        self.zeige()
+
+    def probe(self):
+        """one sheet from the feeder, read and judged, never filed"""
+        if not self.cfg.scanner:
+            return self.pruefen()
+        ordner = os.path.join(self.cfg.data, "probe")
+        shutil.rmtree(ordner, ignore_errors=True)
+        os.makedirs(ordner)
+        w, h = self.cfg.area
+        cmd = [self.cfg.scanimage, "-d", self.cfg.scanner, "--source", "Automatic Document Feeder", "--adf-mode", "Simplex",
+               "--resolution", str(self.cfg.dpi), "--mode", self.cfg.mode, "-x", "%g" % w, "-y", "%g" % h, "--auto-eject=yes",
+               "--format=pnm", "--batch=" + os.path.join(ordner, "bild-%04d.pnm"), "--batch-start=1", "--batch-count=1"]
+        try:
+            r = run(cmd, timeout=180)
+            bilder = sorted(glob.glob(os.path.join(ordner, "bild-*.pnm")))
+            if not bilder:
+                detail, ok = "Probeseite: keine Seite (Scanner: %s). Ein Blatt in den Einzug legen." % scanner_grund(r.stderr or ""), False
+            else:
+                s = pruefe_seite(bilder[0], 1)
+                ok = s.woerter >= LEER_WOERTER
+                detail = "Probeseite: %d Wörter gelesen%s, Helligkeit %d %%%s" % (
+                    s.woerter, ", um %d° gedreht" % s.drehung if s.drehung else "", round(s.hell * 100), "" if ok else ": leer oder unlesbar, richtig herum eingelegt?")
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            detail, ok = "Probeseite fehlgeschlagen: %s" % e, False
+        shutil.rmtree(ordner, ignore_errors=True)
+        self.pruefung = {"geraet": self.cfg.scanner, "ok": ok, "at": jetzt(), "detail": detail, "probe": True}
+        self.zeige()
+
     # one way through
 
     def seiten(self, stapel):
@@ -887,6 +966,10 @@ class Dienst:
                 shutil.rmtree(pfad, ignore_errors=True)
 
 
+def jetzt():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def scanner_grund(stderr):
     """the scanner's own reason, the last error line that is not the closing "Batch terminated" """
     zeilen = [z.strip() for z in stderr.splitlines() if z.strip() and "batch terminated" not in z.lower()
@@ -914,6 +997,18 @@ def sane_netz(scanner, etc="/etc/sane.d"):
         f.write("\nnet %s\n" % m.group(2))
 
 
+def sane_suche(etc="/etc/sane.d"):
+    """epson2 searches the network itself only when told: net autodiscovery (#571)"""
+    conf = os.path.join(etc, "epson2.conf")
+    if not os.path.exists(conf):
+        return
+    with open(conf) as f:
+        if re.search(r"(?m)^net\s+autodiscovery\s*$", f.read()):
+            return
+    with open(conf, "a") as f:
+        f.write("\nnet autodiscovery\n")
+
+
 def main(argv):
     cfg = Config.from_env(os.environ)
     if argv[1:2] == ["redo"] and len(argv) == 3 and ZEIT.match(argv[2]):
@@ -929,6 +1024,7 @@ def main(argv):
     for d in (cfg.data, cfg.eingang):
         os.makedirs(d, exist_ok=True)
     sane_netz(cfg.scanner)
+    sane_suche()
     log("bereit: Eingang %s, Scanner %s, Modell %s" % (cfg.eingang, cfg.scanner or "keiner", cfg.model_name or "keins"))
     Dienst(cfg).schleife()
     return 0
