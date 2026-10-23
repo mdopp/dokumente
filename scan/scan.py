@@ -20,8 +20,8 @@ already). The state is the status file laib, Haus and the Operator read.
 
 Orders come as files in /data/auftrag/ (laib scan writes them): start,
 weiter, abschliessen, verwerfen, redo; and for setting the scanner up
-(#571) suchen (scanimage -L: the network's scanners into the status's
-suche), pruefen (the device opened without paper, into pruefung; also on
+(#571) suchen (scanimage -L, and the LAN's neighbours asked on 1865 and
+eSCL, #589: the network's scanners into the status's suche), pruefen (the device opened without paper, into pruefung; also on
 the first start with a new SCANNER) and probe (one sheet scanned and read,
 never filed). Each stack is archived under
 /data/<zeit>/ (the original or the raw pages, plan.json, log.txt) for
@@ -31,7 +31,7 @@ Stdlib only, apart from Pillow and img2pdf for images and PDFs; the
 command-line tools (scanimage, tesseract, pdftoppm, pdftotext, qpdf) come
 with the image (scan/Containerfile).
 """
-import datetime, glob, json, os, re, shutil, subprocess, sys, time, traceback, urllib.request
+import concurrent.futures, datetime, glob, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.request
 from dataclasses import dataclass, field
 
 ZEIT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
@@ -41,6 +41,7 @@ UNFERTIG = (".part", ".tmp", ".crdownload", ".partial", "~")
 HELL = 0.94         # a blank page's mean brightness: blank backs 95-97 %, a printed front 92 % (#568)
 LEER_WOERTER = 4    # fewer words than this on a bright page: blank
 FENSTER, SCHRITT, AB_FENSTER = 30, 25, 40   # big stacks go to the model in overlapping windows
+EPSON2 = 1865       # the epson2 backend's network port (#589)
 
 
 @dataclass
@@ -70,6 +71,9 @@ class Config:
     drop_s: float = 86400        # and dropped after a day
     model_wait_s: float = 1800   # the card lent to another mode: wait this long, then unsorted
     owner: tuple = (1000, 1000)  # Paperless' user (paperless.container USERMAP_UID): it removes what it filed
+    suche_s: float = 3.0         # the direct search's whole budget, after the wake (#589)
+    weck_s: float = 1.5          # the wake's wait for ARP answers
+    tcp_s: float = 1.5           # one knock on one port
 
     @classmethod
     def from_env(cls, env):
@@ -776,7 +780,10 @@ class Dienst:
             stapel.bilder = stapel.bilder[:-1]
         stapel.blatt = len(stapel.bilder) // 2 if self.cfg.duplex else len(stapel.bilder)
         if not stapel.bilder:
-            self.ende(stapel, "fehler", "Scan fehlgeschlagen: der Scanner hat kein Blatt geliefert (Scanner: %s). In Paperless liegt nichts davon." % grund)
+            ziel = adresse(self.cfg.scanner)
+            aus = ziel and tcp(ziel[0], ziel[1], self.cfg.tcp_s)
+            warum = aus_text(ziel[0]) if aus else "Der Scanner hat kein Blatt geliefert."
+            self.ende(stapel, "fehler", "Scan fehlgeschlagen: %s In Paperless liegt nichts davon." % warum, einzelheiten=grund)
             return
         stapel.grund, stapel.seit, stapel.erinnert = grund, self.now(), False
         self.offen = stapel
@@ -805,37 +812,67 @@ class Dienst:
         self.zustand(alt.get("zustand", "bereit"), alt.get("detail", "bereit"), stapel, **mehr)
 
     def suchen(self):
+        """SANE's own search, and the LAN's neighbours asked directly on the two scanner ports (#589)"""
         self.suche = {"zustand": "läuft", "at": jetzt(), "funde": []}
         self.zeige()
+        lan = nachbarn()
+        wecken(lan, self.cfg.weck_s)
+        lan = list(dict.fromkeys(lan + nachbarn()))
+        direkt = direkt_suchen(lan, self.cfg.suche_s, self.cfg.tcp_s)
         try:
             r = run([self.cfg.scanimage, "-L"], timeout=90)
-            funde = [{"geraet": m.group(1), "name": m.group(2).strip()}
-                     for m in re.finditer(r"device [`'‘](.+?)['’] is an? (.+)", r.stdout)]
-            self.suche = {"zustand": "fertig", "at": jetzt(), "funde": funde,
-                          "detail": "%d Scanner gefunden" % len(funde) if funde else "kein Scanner gefunden: das Gerät an, im selben Netz? Sonst die Adresse von Hand, epson2:net:<ip>"}
         except (OSError, subprocess.SubprocessError) as e:
-            self.suche = {"zustand": "fehler", "at": jetzt(), "funde": [], "detail": "die Suche lief nicht: %s" % e}
+            self.suche = {"zustand": "fehler", "at": jetzt(), "funde": [], "gefragt": len(lan),
+                          "detail": "Die Suche lief nicht durch – bitte noch einmal versuchen.", "einzelheiten": str(e)}
+            return self.zeige()
+        funde = [{"geraet": m.group(1), "name": m.group(2).strip()}
+                 for m in re.finditer(r"device [`'‘](.+?)['’] is an? (.+)", r.stdout)]
+        for f in direkt:
+            ip = adresse(f["geraet"])[0]
+            if f["geraet"] in [g["geraet"] for g in funde]:
+                continue
+            if f["geraet"].startswith("escl:") and any(g["geraet"].startswith("airscan:") and re.search(r"\bip=%s\b" % re.escape(ip), g["name"]) for g in funde):
+                continue   # sane-airscan knows it: its device, not a second find
+            funde.append(f)
+        self.suche = {"zustand": "fertig", "at": jetzt(), "funde": funde, "gefragt": len(lan),
+                      "detail": "%d Scanner gefunden" % len(funde) if funde else "kein Scanner gefunden: das Gerät an, im selben Netz? Sonst die Adresse von Hand, epson2:net:<ip>"}
         self.zeige()
+
+    def erreicht(self, probe=False):
+        """the device's port first: one that is off is asked about, not shown SANE's words (#589)"""
+        ziel = adresse(self.cfg.scanner)
+        warum = ziel and tcp(ziel[0], ziel[1], self.cfg.tcp_s)
+        if not warum:
+            return True
+        self.pruefung = {"geraet": self.cfg.scanner, "ok": False, "at": jetzt(), "detail": aus_text(ziel[0]),
+                         "einzelheiten": "TCP %s:%d: %s" % (ziel[0], ziel[1], warum), **({"probe": True} if probe else {})}
+        self.zeige()
+        return False
 
     def pruefen(self):
         """the device opened without paper: its options read, nothing scanned"""
         geraet = self.cfg.scanner
         if not geraet:
             self.pruefung = {"geraet": "", "ok": False, "at": jetzt(), "detail": "kein Scanner eingerichtet (SCANNER ist leer)"}
+        elif not self.erreicht():
+            return
         else:
             try:
                 r = run([self.cfg.scanimage, "-d", geraet, "-A"], timeout=60)
                 ok = r.returncode == 0
-                self.pruefung = {"geraet": geraet, "ok": ok, "at": jetzt(),
-                                 "detail": "Scanner antwortet" if ok else "antwortet nicht: " + scanner_grund(r.stderr or r.stdout or "")}
+                self.pruefung = {"geraet": geraet, "ok": ok, "at": jetzt(), "detail": "Scanner antwortet" if ok else zu_text(geraet)}
+                if not ok:
+                    self.pruefung["einzelheiten"] = scanner_grund(r.stderr or r.stdout or "")
             except (OSError, subprocess.SubprocessError) as e:
-                self.pruefung = {"geraet": geraet, "ok": False, "at": jetzt(), "detail": "antwortet nicht: %s" % e}
+                self.pruefung = {"geraet": geraet, "ok": False, "at": jetzt(), "detail": zu_text(geraet), "einzelheiten": str(e)}
         self.zeige()
 
     def probe(self):
         """one sheet from the feeder, read and judged, never filed"""
         if not self.cfg.scanner:
             return self.pruefen()
+        if not self.erreicht(probe=True):
+            return
         ordner = os.path.join(self.cfg.data, "probe")
         shutil.rmtree(ordner, ignore_errors=True)
         os.makedirs(ordner)
@@ -843,20 +880,23 @@ class Dienst:
         cmd = [self.cfg.scanimage, "-d", self.cfg.scanner, "--source", "Automatic Document Feeder", "--adf-mode", "Simplex",
                "--resolution", str(self.cfg.dpi), "--mode", self.cfg.mode, "-x", "%g" % w, "-y", "%g" % h, "--auto-eject=yes",
                "--format=pnm", "--batch=" + os.path.join(ordner, "bild-%04d.pnm"), "--batch-start=1", "--batch-count=1"]
+        roh = ""
         try:
             r = run(cmd, timeout=180)
             bilder = sorted(glob.glob(os.path.join(ordner, "bild-*.pnm")))
             if not bilder:
-                detail, ok = "Probeseite: keine Seite (Scanner: %s). Ein Blatt in den Einzug legen." % scanner_grund(r.stderr or ""), False
+                detail, ok, roh = "Probeseite: keine Seite. Ein Blatt in den Einzug legen.", False, scanner_grund(r.stderr or "")
             else:
                 s = pruefe_seite(bilder[0], 1)
                 ok = s.woerter >= LEER_WOERTER
                 detail = "Probeseite: %d Wörter gelesen%s, Helligkeit %d %%%s" % (
                     s.woerter, ", um %d° gedreht" % s.drehung if s.drehung else "", round(s.hell * 100), "" if ok else ": leer oder unlesbar, richtig herum eingelegt?")
         except (OSError, subprocess.SubprocessError, ValueError) as e:
-            detail, ok = "Probeseite fehlgeschlagen: %s" % e, False
+            detail, ok, roh = "Probeseite fehlgeschlagen: der Scanner hat das Blatt nicht geliefert.", False, str(e)
         shutil.rmtree(ordner, ignore_errors=True)
         self.pruefung = {"geraet": self.cfg.scanner, "ok": ok, "at": jetzt(), "detail": detail, "probe": True}
+        if roh:
+            self.pruefung["einzelheiten"] = roh
         self.zeige()
 
     # one way through
@@ -976,6 +1016,120 @@ def scanner_grund(stderr):
               and re.search(r"error|jam|fail|sane_|invalid|cover|refused", z, re.I)]
     grund = zeilen[-1] if zeilen else "ohne Angabe"
     return re.sub(r"^scanimage:\s*", "", grund)[:200]
+
+
+def aus_text(host):
+    return "Der Scanner unter %s antwortet nicht – ist er an?" % host
+
+
+def zu_text(geraet):
+    ziel = adresse(geraet)
+    return ("Der Scanner%s antwortet, lässt sich aber nicht öffnen – scannt gerade jemand anders? Sonst ihn aus- und "
+            "wieder einschalten." % (" unter " + ziel[0] if ziel else ""))
+
+
+def adresse(geraet):
+    """where a SANE device listens: epson2:net:<host> on 1865, escl:<url> on its URL's port; None when its name does not say"""
+    m = re.fullmatch(r"epson2:net:([\w.-]+)", geraet or "")
+    if m:
+        return m.group(1), EPSON2
+    m = re.match(r"escl:(https?)://([\w.-]+)(?::(\d+))?", geraet or "")
+    if m:
+        return m.group(2), int(m.group(3) or (443 if m.group(1) == "https" else 80))
+    return None
+
+
+def tcp(host, port, timeout):
+    """"" when the port takes a connection, else why not"""
+    try:
+        socket.create_connection((host, port), timeout).close()
+        return ""
+    except OSError as e:
+        return str(e) or type(e).__name__
+
+
+def hole(url, timeout):
+    """an eSCL answer, at most 64 KiB; a printer's certificate is its own, never one a CA signed"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "laib-scan"}), timeout=timeout, context=ctx) as r:
+        return r.read(65536)
+
+
+def nachbarn(arp="/proc/net/arp", route="/proc/net/route"):
+    """the LAN's neighbours: the host's table (the service runs on the host network, so this is the host's,
+    as `laib net geraete` reads it, #577), complete IPv4 entries on the default route's interface"""
+    try:
+        with open(arp) as f:
+            zeilen = f.read().splitlines()[1:]
+    except OSError:
+        return []
+    lan = set()
+    try:
+        with open(route) as f:
+            lan = {z.split()[0] for z in f.read().splitlines()[1:] if len(z.split()) > 1 and z.split()[1] == "00000000"}
+    except OSError:
+        pass
+    out = []
+    for z in zeilen:
+        f = z.split()
+        try:
+            ok = len(f) >= 6 and int(f[2], 0) & 2 and len(f[3]) == 17 and f[3] != "00:00:00:00:00:00"
+            ip = ipaddress.IPv4Address(f[0]) if ok else None
+        except ValueError:
+            continue
+        if ip and ip.is_private and not ip.is_link_local and (not lan or f[5] in lan) and f[0] not in out:
+            out.append(f[0])
+    return out[:254]
+
+
+def wecken(ips, warte):
+    """one UDP datagram to the discard port of each address of the neighbours' /24s, as `laib net geraete
+    --wecken` knocks (#577): a sleeping scanner answers the kernel's ARP and lands in the table"""
+    netze = {ipaddress.IPv4Network(ip + "/24", strict=False) for ip in ips}
+    if not netze:
+        return
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        for netz in list(netze)[:4]:
+            for a in netz.hosts():
+                try:
+                    s.sendto(b"\0", (str(a), 9))
+                except OSError:
+                    pass
+    time.sleep(warte)
+
+
+def escl_name(ip, timeout):
+    """an eSCL scanner's base URL and its MakeAndModel, from ScannerCapabilities on 80, else 443"""
+    for schema, port in (("http", 80), ("https", 443)):
+        try:
+            body = hole("%s://%s/eSCL/ScannerCapabilities" % (schema, ip), timeout)
+        except (OSError, ValueError):
+            continue
+        if b"ScannerCapabilities" in body:
+            m = re.search(rb"<(?:\w+:)?MakeAndModel>([^<]{1,80})<", body)
+            return "escl:%s://%s:%d" % (schema, ip, port), m.group(1).decode("utf-8", "replace").strip() if m else ""
+    return None
+
+
+def direkt_suchen(ips, frist, timeout):
+    """the neighbours asked in parallel on 1865 (epson2) and eSCL, within frist seconds all told: two known
+    scanner ports, no port scan; what has not answered by then is not a find"""
+    if not ips:
+        return []
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(64, 2 * len(ips)))
+    epson = {pool.submit(tcp, ip, EPSON2, timeout): ip for ip in ips}
+    escl = {pool.submit(escl_name, ip, timeout): ip for ip in ips}
+    fertig, _ = concurrent.futures.wait(list(epson) + list(escl), timeout=frist)
+    pool.shutdown(wait=False, cancel_futures=True)
+    namen = {escl[f]: f.result() for f in escl if f in fertig and f.result()}
+    out = []
+    for f, ip in epson.items():
+        if f in fertig and f.result() == "":
+            name = namen.get(ip, ("", ""))[1]
+            out.append({"geraet": "epson2:net:" + ip, "name": name or "Epson-Scanner unter " + ip})
+    out += [{"geraet": url, "name": name or "eSCL-Scanner unter " + ip} for ip, (url, name) in namen.items()]
+    return out
 
 
 def wartet_text(stapel):

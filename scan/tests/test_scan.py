@@ -226,15 +226,26 @@ class Dienst(unittest.TestCase):
             f.write(FAKE_SCANIMAGE)
         os.chmod(self.cfg.scanimage, 0o755)
         self.meldungen = []
-        self.alt = scan.ocr, scan.osd, scan.melde, scan.pdf_aus_bildern, scan.run
+        self.alt = scan.ocr, scan.osd, scan.melde, scan.pdf_aus_bildern, scan.run, scan.tcp, scan.hole, scan.nachbarn, scan.wecken
         scan.ocr, scan.osd = fake_ocr, fake_osd
+        # the LAN as the tests set it: every port answers, no neighbour, no wake
+        self.zu, self.escl, self.lan, self.geweckt = {}, {}, [], []
+        scan.tcp = lambda host, port, timeout: self.zu.get((host, port), "")
+        scan.hole = self.hole
+        scan.nachbarn = lambda: list(self.lan)
+        scan.wecken = lambda ips, warte: self.geweckt.append(list(ips))
         scan.melde = lambda cfg, person, text: self.meldungen.append((person, text)) or True
         scan.pdf_aus_bildern = lambda cfg, bilder, ziel: schreib(ziel, b"%%PDF %d" % len(bilder))
 
     def tearDown(self):
-        scan.ocr, scan.osd, scan.melde, scan.pdf_aus_bildern, scan.run = self.alt
+        scan.ocr, scan.osd, scan.melde, scan.pdf_aus_bildern, scan.run, scan.tcp, scan.hole, scan.nachbarn, scan.wecken = self.alt
         for k in ("FAKE_RUNS", "FAKE_LIST", "FAKE_A_FAILS"):
             os.environ.pop(k, None)
+
+    def hole(self, url, timeout):
+        if url not in self.escl:
+            raise OSError("[Errno 111] Connection refused")
+        return self.escl[url]
 
     def runs(self, *runs):
         p = os.path.join(self.d, "runs.json")
@@ -413,8 +424,66 @@ class Dienst(unittest.TestCase):
         self.auftrag(dienst, "pruefen")
         p = self.status()["pruefung"]
         self.assertFalse(p["ok"])
-        self.assertIn("Error during device I/O", p["detail"])
+        self.assertNotIn("Error during device I/O", p["detail"], "SANE's words only in einzelheiten (#589)")
+        self.assertIn("lässt sich aber nicht öffnen", p["detail"])
+        self.assertIn("Error during device I/O", p["einzelheiten"])
         self.assertEqual(self.meldungen, [], "a check is no stack: no message")
+
+    def test_a_scanner_that_is_off_is_asked_whether_it_is_on_not_shown_sanes_error(self):
+        # the WF-3540 off: no answer on 1865, and SANE would say "Invalid argument" (#589)
+        os.environ["FAKE_A_FAILS"] = "1"
+        self.zu[("192.0.2.7", 1865)] = "timed out"
+        dienst = scan.Dienst(self.cfg)
+        for aktion in ("pruefen", "probe"):
+            self.auftrag(dienst, aktion)
+            p = self.status()["pruefung"]
+            self.assertFalse(p["ok"])
+            self.assertEqual(p["detail"], "Der Scanner unter 192.0.2.7 antwortet nicht – ist er an?")
+            self.assertIn("192.0.2.7:1865", p["einzelheiten"])
+            self.assertIn("timed out", p["einzelheiten"])
+        self.assertTrue(p["probe"])
+        self.assertEqual(self.meldungen, [])
+
+    def test_a_stack_on_a_scanner_that_is_off_asks_whether_it_is_on(self):
+        self.runs(([], "scanimage: open of device epson2:net:192.0.2.7 failed: Invalid argument"))
+        self.zu[("192.0.2.7", 1865)] = "[Errno 113] No route to host"
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "start")
+        (person, text), = self.meldungen
+        self.assertIn("Der Scanner unter 192.0.2.7 antwortet nicht – ist er an?", text)
+        self.assertNotIn("Invalid argument", text)
+        self.assertIn("Invalid argument", self.status()["letzte"][0]["einzelheiten"])
+
+    def test_the_search_asks_the_lans_neighbours_on_the_two_scanner_ports(self):
+        # sane's own search misses the WF-3540; it answers on 1865 (#589)
+        self.lan = ["192.0.2.87", "192.0.2.9", "192.0.2.50"]
+        self.zu = {(ip, 1865): "Connection refused" for ip in ("192.0.2.9", "192.0.2.50")}
+        self.escl["http://192.0.2.9/eSCL/ScannerCapabilities"] = (
+            b'<?xml version="1.0"?><scan:ScannerCapabilities xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">'
+            b'<pwg:Version>2.6</pwg:Version><pwg:MakeAndModel>Brother ADS-4300N</pwg:MakeAndModel></scan:ScannerCapabilities>')
+        self.escl["http://192.0.2.50/eSCL/ScannerCapabilities"] = b"<html>router</html>"
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "suchen")
+        s = self.status()["suche"]
+        self.assertEqual(self.geweckt, [["192.0.2.87", "192.0.2.9", "192.0.2.50"]], "one gentle wake first")
+        self.assertEqual(s["funde"], [{"geraet": "epson2:net:192.0.2.87", "name": "Epson-Scanner unter 192.0.2.87"},
+                                      {"geraet": "escl:http://192.0.2.9:80", "name": "Brother ADS-4300N"}])
+        self.assertEqual(s["gefragt"], 3)
+        self.assertIn("2 Scanner gefunden", s["detail"])
+        # sane-airscan knows the eSCL one: its device, not a second find
+        os.environ["FAKE_LIST"] = "device `airscan:e0:Brother ADS-4300N' is a eSCL Brother ADS-4300N ip=192.0.2.9\n"
+        self.auftrag(dienst, "suchen")
+        self.assertEqual([f["geraet"] for f in self.status()["suche"]["funde"]], ["airscan:e0:Brother ADS-4300N", "epson2:net:192.0.2.87"])
+
+    def test_the_direct_search_stays_within_its_seconds(self):
+        self.cfg.suche_s, self.cfg.scanner = 0.3, ""   # no first-tick check of a device
+        self.lan = ["192.0.2.%d" % i for i in range(1, 60)]
+        scan.tcp = lambda host, port, timeout: time.sleep(1) or ""
+        dienst = scan.Dienst(self.cfg)
+        t = time.monotonic()
+        self.auftrag(dienst, "suchen")
+        self.assertLess(time.monotonic() - t, 0.9, "the search waited for the slow knocks")
+        self.assertEqual((self.status()["suche"]["zustand"], self.status()["suche"]["funde"]), ("fertig", []), "late is no find")
 
     def test_a_probe_sheet_is_read_and_never_filed(self):
         self.runs(([vorne(71, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
@@ -453,6 +522,28 @@ class Einrichtung(unittest.TestCase):
                 scan.sane_suche(d)
             with open(os.path.join(d, "epson2.conf")) as f:
                 self.assertEqual(f.read().count("\nnet autodiscovery\n"), 1)
+
+    def test_the_lans_neighbours_are_the_complete_entries_on_the_default_route(self):
+        with tempfile.TemporaryDirectory() as d:
+            schreib(os.path.join(d, "arp"), (
+                "IP address       HW type     Flags       HW address            Mask     Device\n"
+                "192.0.2.87       0x1         0x2         64:eb:8c:00:00:01     *        eth0\n"
+                "192.0.2.1        0x1         0x2         00:00:5e:00:53:01     *        eth0\n"
+                "192.0.2.99       0x1         0x0         00:00:00:00:00:00     *        eth0\n"
+                "10.88.0.5        0x1         0x2         0a:58:0a:58:00:05     *        podman0\n"
+                "192.0.2.87       0x1         0x2         64:eb:8c:00:00:01     *        eth0\n").encode())
+            schreib(os.path.join(d, "route"), (
+                "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n"
+                "eth0\t00000000\t010200C0\t0003\t0\t0\t100\t00000000\n"
+                "podman0\t0000580A\t00000000\t0001\t0\t0\t0\t0000FFFF\n").encode())
+            self.assertEqual(scan.nachbarn(os.path.join(d, "arp"), os.path.join(d, "route")), ["192.0.2.87", "192.0.2.1"])
+            self.assertEqual(scan.nachbarn(os.path.join(d, "fehlt"), os.path.join(d, "route")), [])
+
+    def test_a_device_names_where_to_knock(self):
+        self.assertEqual(scan.adresse("epson2:net:192.0.2.87"), ("192.0.2.87", 1865))
+        self.assertEqual(scan.adresse("escl:https://192.0.2.9:443"), ("192.0.2.9", 443))
+        self.assertEqual(scan.adresse("escl:http://192.0.2.9"), ("192.0.2.9", 80))
+        self.assertIsNone(scan.adresse("airscan:e0:Brother ADS-4300N"))
 
     def test_the_scanner_reason_is_never_batch_terminated(self):
         err = "Scanned page 4. (scanner status = 5)\nscanimage: sane_start: Error during device I/O\nscanimage: Batch terminated, 5 pages scanned\n"
