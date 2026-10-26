@@ -44,8 +44,10 @@ def body_of(h):
 class Paperless:
     """documents with custom fields and tags, document types, tags, notes: in memory"""
 
-    def __init__(self, docs, types=None, tags=None):
+    def __init__(self, docs, types=None, tags=None, users=None, correspondents=None):
         self.docs, self.calls, self.notes, self.bulk, self.v3 = docs, [], {}, [], True
+        self.users = users if users is not None else [{"id": 1, "username": "admin", "first_name": "", "last_name": ""}]
+        self.correspondents = correspondents if correspondents is not None else []
         self.types = types if types is not None else [{"id": 1, "name": "Vertrag"}, {"id": 2, "name": "Rechnung"}]
         self.tags = tags if tags is not None else [{"id": 1, "name": "Versicherung"}]
         self.fields = [{"id": F[n], "name": n, "data_type": k} for n, k in zip(NAMES, KINDS)] + [
@@ -69,6 +71,13 @@ class Paperless:
                     return reply(self, 200, {"next": None, "results": fake.types})
                 if method == "GET" and path == "/api/tags/":
                     return reply(self, 200, {"next": None, "results": fake.tags})
+                if method == "GET" and path == "/api/users/":
+                    if fake.users is None:
+                        return reply(self, 403, {"detail": "no"})
+                    return reply(self, 200, {"next": None, "results": fake.users})
+                if method == "GET" and path == "/api/correspondents/":   # Paperless counts a correspondent's documents
+                    return reply(self, 200, {"next": None, "results": [
+                        {**c, "document_count": sum(1 for d in fake.docs if d.get("correspondent") == c["id"])} for c in fake.correspondents]})
                 if method == "POST" and path == "/api/tags/":
                     t = {**body, "id": 100 + len(fake.tags)}
                     fake.tags.append(t)
@@ -109,6 +118,9 @@ class Paperless:
 
             def do_PATCH(self):
                 self.any("PATCH")
+
+            def do_DELETE(self):
+                self.any("DELETE")
 
         self.srv, self.url = serve(H)
 
@@ -165,8 +177,8 @@ class Haus:
         return [c["params"]["arguments"] for c in self.calls if c["params"]["name"] == "erinnerung_anlegen"]
 
 
-def vertrag(i=1, fields=None, typ=1, tags=None, text=TEXT, title="Stromvertrag"):
-    return {"id": i, "title": title, "content": text, "document_type": typ, "tags": tags or [],
+def vertrag(i=1, fields=None, typ=1, tags=None, text=TEXT, title="Stromvertrag", correspondent=None):
+    return {"id": i, "title": title, "content": text, "document_type": typ, "tags": tags or [], "correspondent": correspondent,
             "custom_fields": [{"field": k, "value": v} for k, v in (fields or {}).items()]}
 
 
@@ -321,6 +333,8 @@ class Vertraege(unittest.TestCase):
         self.assertTrue((DIR / "paperless-vertraege.timer").exists())
         sh = (DIR / "paperless-vertraege.sh").read_text()
         self.assertIn("-e HAUSHALT_TOKEN ", sh)
+        self.assertIn("-e HAUSHALT_NAMEN ", sh)
+        self.assertIn("Environment=HAUSHALT_NAMEN=${HAUSHALT_NAMEN}", unit)
         self.assertIn("--user paperless", sh)
         self.assertNotIn("$HAUSHALT_TOKEN", sh)
 
@@ -449,6 +463,92 @@ class Vertraege(unittest.TestCase):
         self.assertEqual(meldungen(r.stdout), [], "once per notice date")
         r = self.run_job(Paperless([vertrag(fields=fields)]), ai="false", heute="2027-01-02")
         self.assertEqual(meldungen(r.stdout), [], "after the notice had to be in: too late, nothing")
+
+
+# #737: the household's own people are never a document's correspondent by the AI's doing.
+# Invented names only (the Duden's Mustermann family), never the box's.
+USERS = [{"id": 1, "username": "admin", "first_name": "", "last_name": ""},
+         {"id": 2, "username": "erika", "first_name": "Erika", "last_name": "Mustermann"},   # from Authelia's name claim
+         {"id": 3, "username": "joerg", "first_name": "Jörg", "last_name": "Beispiel-Weiß"},
+         {"id": 4, "username": "kim", "first_name": "", "last_name": ""}]                    # no display name: the login only
+KORR = [{"id": 1, "name": "Erika Mustermann"}, {"id": 2, "name": "Stadtwerke Beispielstadt"},
+        {"id": 3, "name": "Mustermann, Erika"}, {"id": 4, "name": "Familie Mustermann"}, {"id": 5, "name": "JOERG BEISPIEL-WEISS"},
+        {"id": 6, "name": "Kim"}, {"id": 7, "name": "Erika Mustermann Immobilien GmbH"}, {"id": 8, "name": "Erika"},
+        {"id": 9, "name": "Frau Lena Mustermann"}, {"id": 10, "name": "Herrn Dr. Jörg Beispiel-Weiß"}]
+OK_TAG = 50
+
+
+class Korrespondenten(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.record = os.path.join(self.tmp, "laib-vertraege.json")
+
+    def run_job(self, p, **extra):
+        return Vertraege.run_job(self, p, ai="false", **extra)
+
+    def brief(self, i, korr, tags=None):
+        return vertrag(i, typ=2, title="Brief %d" % i, text=BRIEF, correspondent=korr, tags=tags)
+
+    def test_a_household_name_is_cleared_with_a_note_the_sender_stays_and_a_second_run_does_nothing(self):
+        alt = self.brief(1, 1)   # set before the pass first ran: the owner's archive
+        p = Paperless([alt], users=USERS, correspondents=KORR, tags=[{"id": OK_TAG, "name": "Korrespondent-OK"}])
+        r = self.run_job(p, HAUSHALT_NAMEN="Lena Mustermann")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.doc(1)["correspondent"], 1, "a correspondent set before the pass existed stays")
+        self.assertEqual(p.notes, {})
+        with open(self.record) as f:
+            self.assertIn("seit", json.load(f)["korrespondenten"], "the first run is recorded")
+        # afterwards the AI files new ones
+        p.docs += [self.brief(i, k) for i, k in ((2, 1), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6), (8, 7), (9, 8), (10, 9), (11, 10))]
+        p.docs.append(self.brief(12, 1, tags=[OK_TAG]))
+        r = self.run_job(p, HAUSHALT_NAMEN="Lena Mustermann")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        cleared = sorted(d["id"] for d in p.docs if d.get("correspondent") is None)
+        self.assertEqual(cleared, [2, 4, 5, 6, 7, 9, 10, 11],
+                         "full name either order, Familie + surname, umlauts and case folded, a first name or a login as the whole name, "
+                         "a name from HAUSHALT_NAMEN, salutations and titles dropped")
+        self.assertEqual(p.doc(3)["correspondent"], 2, "the real sender stays")
+        self.assertEqual(p.doc(8)["correspondent"], 7, "a company that carries a person's name is no person")
+        self.assertEqual(p.doc(12)["correspondent"], 1, "the skip tag keeps it, whatever the case")
+        self.assertEqual(p.doc(1)["correspondent"], 1)
+        [note] = p.notes[2]
+        self.assertIn("„Erika Mustermann“", note)
+        self.assertIn("Haushalt", note)
+        self.assertIn("korrespondent-ok", note.casefold(), "the note says how to keep it")
+        patches = [c for c in p.calls if c[0] == "PATCH"]
+        self.assertTrue(all(c[3] == {"correspondent": None} for c in patches), patches)
+        self.assertFalse([c for c in p.calls if c[0] == "DELETE"], "a correspondent is never deleted")
+        # a second run does nothing
+        n = len(p.calls)
+        r = self.run_job(p, HAUSHALT_NAMEN="Lena Mustermann")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse([c for c in p.calls[n:] if c[0] in ("PATCH", "POST")], p.calls[n:])
+        self.assertEqual([len(v) for v in p.notes.values()], [1] * 8)
+
+    def test_the_skip_tag_is_made_for_the_family_and_correspondents_left_empty_are_listed_not_deleted(self):
+        p = Paperless([], users=USERS, correspondents=KORR)
+        self.run_job(p)
+        p.docs += [self.brief(2, 4), self.brief(3, 1), self.brief(4, 1, tags=[]), self.brief(5, 2)]
+        r = self.run_job(p)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tag = next(t for t in p.tags if t["name"] == "korrespondent-ok")
+        self.assertEqual(tag["matching_algorithm"], 0, "the tag never files a document by itself")
+        self.assertIsNone(tag["owner"], "the family sees the tag")
+        with open(self.record) as f:
+            leer = json.load(f)["korrespondenten"]["leer"]
+        self.assertEqual(leer, ["Erika Mustermann", "Familie Mustermann"],
+                         "household correspondents without documents, for the owner to delete: Paperless marks none as the AI's")
+        self.assertNotIn("Mustermann, Erika", leer, "one with no document before is not the pass's doing")
+        self.assertIn("Familie Mustermann", r.stdout)
+        self.assertFalse([c for c in p.calls if c[0] == "DELETE"])
+
+    def test_without_the_users_api_the_pass_says_so_and_the_rest_runs(self):
+        p = Paperless([self.brief(1, 1)], users=USERS, correspondents=KORR)
+        p.users = None
+        r = self.run_job(p)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Haushalt", r.stdout)
+        self.assertEqual(p.doc(1)["correspondent"], 1)
 
 
 def meldungen(out):

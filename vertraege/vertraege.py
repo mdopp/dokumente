@@ -45,10 +45,24 @@ Haushalt URL and token come from the unit. The standard library only.
    tokens) is recognised again through Paperless' own reprocess, once, at
    most OCR_PRO_LAUF a run, with a note; still salad a day later: the tag
    `prüfen` and a note to scan it again. A contract of salad is not read.
+6. The household's own people (#737). Paperless' AI names the people a
+   letter mentions as its correspondent, so a letter to a family member
+   gets that member as its sender. A correspondent whose name is a
+   household person's (Paperless' users: first and last name, which
+   allauth takes from Authelia's name claim on the first login, else the
+   login as a whole name; plus HAUSHALT_NAMEN for people without a login)
+   is cleared off a document, with a note: the full name in either order
+   ("Muster, Anna"), "Familie" and the surname, a first name or a login as
+   the correspondent's whole name; case, umlauts, accents, salutations and
+   titles do not count. Never a document with the tag korrespondent-ok, and
+   never a correspondent a document had when the pass first ran (the
+   first run records them). The correspondent itself stays (Paperless marks
+   none as the AI's); one left without documents is listed in the record,
+   and paperless-mail.py check says so in laib's status.
 
 What it filled and reminded is kept in laib-vertraege.json in Paperless' data
 folder (backed up), so a run never asks or reminds twice."""
-import base64, calendar, hashlib, json, os, re, sys, time, urllib.error, urllib.request
+import base64, calendar, hashlib, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
 from datetime import date, timedelta
 
 E = os.environ
@@ -56,6 +70,10 @@ PRO_LAUF = 10                  # documents read a run: the household model is sh
 ZEICHEN = 16000                # of a document's text: a contract's data is on its first pages
 OCR_PRO_LAUF = 3               # documents recognised again a run: OCR is the box's CPU
 PRUEFEN = "prüfen"
+BEHALTEN = "korrespondent-ok"   # the family's tag: this document's correspondent stays (#737)
+# words before a name that are no part of it; the first three name a family by its surname
+FAMILIE = {"familie", "fam", "eheleute"}
+ANREDE = FAMILIE | {"herr", "herrn", "frau", "hr", "fr", "dr", "prof", "med", "dipl", "ing"}
 # the contract fields, as paperless-mail.py's CONTRACT makes them, with what the model is told
 FELDER = {"Anbieter": "die Firma, Versicherung oder Behörde, mit der der Vertrag besteht; nie der Haushalt, der den Brief bekommt",
           "Vertragsnummer": "Vertrags-, Kunden- oder Versicherungsnummer",
@@ -324,6 +342,95 @@ def textschicht(api, rec, heute, prüfen_tag):
     return salat
 
 
+def worte(name):
+    """a name as words to compare: case, umlauts, accents and punctuation folded;
+    "Muster, Anna" is anna muster"""
+    s = str(name or "")
+    if "," in s:
+        a, _, b = s.partition(",")
+        s = b + " " + a
+    s = unicodedata.normalize("NFKD", s.casefold().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue"))
+    return re.findall(r"[a-z0-9]+", "".join(c for c in s if not unicodedata.combining(c)))
+
+
+def haushalt(users, namen, admin):
+    """the household's people as (given, surname) word lists; a login without a name is a
+    given name only, so it matches only as a correspondent's whole name"""
+    out = []
+    for u in users:
+        g, n = worte(u.get("first_name")), worte(u.get("last_name"))
+        if g or n:
+            out.append((g, n))
+        login = str(u.get("username") or "")
+        if login.isalpha() and login != admin:   # "m.muster", "admin": no name
+            out.append((worte(login), []))
+    for n in namen.split(","):
+        w = worte(n)
+        if w:
+            out.append((w[:-1], w[-1:]) if len(w) > 1 else (w, []))
+    return out
+
+
+def eigener(name, personen):
+    """whether a correspondent's name is a household person's"""
+    w = worte(name)
+    familie = False
+    while w and w[0] in ANREDE:
+        familie |= w[0] in FAMILIE
+        w = w[1:]
+    for g, n in personen:
+        voll = g + n
+        if w and (w == voll or (n and w == n + g) or (g and w == g) or (familie and w == voll[-len(w):])):
+            return True
+    return False
+
+
+def absender(api, rec, tags):
+    """a household person cleared off the documents the AI gave them as correspondent (#737)"""
+    try:
+        users = api.all("/api/users/")
+    except urllib.error.HTTPError as e:
+        print("vertraege: Paperless nennt seine Benutzer nicht (%d): Absender aus dem Haushalt nicht geprüft" % e.code)
+        return
+    personen = haushalt(users, E.get("HAUSHALT_NAMEN", ""), E.get("PAPERLESS_ADMIN_USER", "admin"))
+    eigen = {c["id"]: c["name"] for c in api.all("/api/correspondents/") if eigener(c["name"], personen)}
+    docs = api.all("/api/documents/?fields=id,title,correspondent,tags")
+    k = rec.get("korrespondenten")
+    if k is None:   # the first run: every correspondent set now is the owner's, never touched
+        rec["korrespondenten"] = {"seit": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "geleert": [], "leer": [],
+                                  "bestand": {str(d["id"]): d["correspondent"] for d in docs if d.get("correspondent")}}
+        print("vertraege: Absender aus dem Haushalt: ab jetzt geprüft, %d gesetzte bleiben" % len(rec["korrespondenten"]["bestand"]))
+        return
+    tag = [next((t["id"] for t in tags if t["name"].casefold() == BEHALTEN), None)]
+
+    def behalten():
+        if tag[0] is None:   # made when first needed, so the note's advice works; never files by itself
+            tag[0] = api("POST", "/api/tags/", {"name": BEHALTEN, "matching_algorithm": 0, "owner": None})["id"]
+        return tag[0]
+
+    for d in sorted(docs, key=lambda d: d["id"]):
+        c = d.get("correspondent")
+        if c not in eigen or k["bestand"].get(str(d["id"])) == c or (tag[0] is not None and tag[0] in (d.get("tags") or [])):
+            continue
+        d = api("GET", "/api/documents/%d/" % d["id"])   # fresh: the family may have changed it since
+        if d.get("correspondent") != c or (tag[0] is not None and tag[0] in (d.get("tags") or [])):
+            continue
+        behalten()
+        api("PATCH", "/api/documents/%d/" % d["id"], {"correspondent": None})
+        api("POST", "/api/documents/%d/notes/" % d["id"], {"note": "Absender „%s“ entfernt (laib): er gehört zum Haushalt und ist bei "
+            "diesem Dokument wohl der Empfänger. War er richtig, ihn wieder eintragen und den Tag „%s“ setzen, dann bleibt er."
+            % (eigen[c], next((t["name"] for t in tags if t["id"] == tag[0]), BEHALTEN))})
+        k["geleert"] = sorted(set(k["geleert"]) | {c})
+        print("vertraege: %s (%d): Absender „%s“ gehört zum Haushalt, entfernt" % (d.get("title"), d["id"], eigen[c]))
+    leer = sorted(c["name"] for c in api.all("/api/correspondents/") if c["id"] in eigen and c["id"] in k["geleert"]
+                  and not c.get("document_count")) if k["geleert"] else []
+    if leer != k["leer"]:
+        for n in sorted(set(leer) - set(k["leer"])):
+            print("vertraege: Absender „%s“ gehört zum Haushalt und hat keine Dokumente mehr: in Paperless löschen, "
+                  "wenn ihn niemand braucht" % n)
+        k["leer"] = leer
+
+
 def erinnern(text, wann):
     """erinnerung_anlegen in Haus's Haushalt; True when Haus took it"""
     r = urllib.request.Request(E["HAUSHALT_URL"], method="POST", data=json.dumps(
@@ -399,6 +506,7 @@ def main():
         return tag[0]
 
     salat = textschicht(api, rec, heute, prüfen_tag)
+    absender(api, rec, tags)
     ki = E.get("PAPERLESS_AI_ENABLED", "").strip().lower() == "true" and E.get("PAPERLESS_AI_LLM_ENDPOINT")
     gelesen = 0
     for d in sorted(docs.values(), key=lambda d: d["id"]) if ki else []:
