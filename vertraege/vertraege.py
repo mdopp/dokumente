@@ -27,6 +27,24 @@ Haushalt URL and token come from the unit. The standard library only.
    calendar, on every phone). Made as soon as both fields are there, once per
    document and notice date; already due: today; the notice date minus the
    period past: none. Without Haus nothing is made and nothing recorded.
+   "zum Monats-/Quartals-/Jahresende" (#721): with a notice date at such an
+   end, the notice must be in by the end of the month the period reaches
+   back to; a notice date that is no such end is marked `prüfen` and counted
+   back by the day, never moved later.
+3. Renewing (#721). A notice date that passed moves on by the renewal the
+   text names ("verlängert sich jeweils um 12 Monate", "um ein weiteres
+   Jahr"), term by term until it lies ahead, a month's end kept; the note
+   quotes the words. A text that names none, or two, changes nothing: the
+   tag `prüfen` and a note, once per date.
+4. Telling (#721). On the reminder day, and until the notice must be in,
+   one line `meldung {json}` on stdout per document and notice date:
+   paperless-vertraege.sh, the unit's host part, hands it to laib-notify's
+   eingang/ (#703), which tells the owner through the Bote, else by mail.
+5. The text layer (#721). A document whose text is letter salad (few
+   word-shaped tokens, or almost no common German or English words in short
+   tokens) is recognised again through Paperless' own reprocess, once, at
+   most OCR_PRO_LAUF a run, with a note; still salad a day later: the tag
+   `prüfen` and a note to scan it again. A contract of salad is not read.
 
 What it filled and reminded is kept in laib-vertraege.json in Paperless' data
 folder (backed up), so a run never asks or reminds twice."""
@@ -36,20 +54,36 @@ from datetime import date, timedelta
 E = os.environ
 PRO_LAUF = 10                  # documents read a run: the household model is shared
 ZEICHEN = 16000                # of a document's text: a contract's data is on its first pages
+OCR_PRO_LAUF = 3               # documents recognised again a run: OCR is the box's CPU
 PRUEFEN = "prüfen"
 # the contract fields, as paperless-mail.py's CONTRACT makes them, with what the model is told
 FELDER = {"Anbieter": "die Firma, Versicherung oder Behörde, mit der der Vertrag besteht; nie der Haushalt, der den Brief bekommt",
           "Vertragsnummer": "Vertrags-, Kunden- oder Versicherungsnummer",
           "Vertragsbeginn": "JJJJ-MM-TT",
           "Vertragsende": "JJJJ-MM-TT, das Ende der (Mindest-)Laufzeit",
-          "Kündigungsfrist": "Zahl und Einheit, z. B. \"3 Monate\", \"6 Wochen\", \"14 Tage\"",
+          "Kündigungsfrist": "Zahl und Einheit, z. B. \"3 Monate\", \"6 Wochen\", \"14 Tage\", mit \"zum Monatsende\", \"zum Quartalsende\" oder \"zum Jahresende\", wenn der Text das sagt",
           "Nächster Kündigungstermin": "JJJJ-MM-TT, der nächste Tag, zu dem gekündigt werden kann",
           "Betrag": "der regelmäßige Betrag in Euro als Zahl, z. B. 84.50",
           "Zahlungsintervall": "monatlich, vierteljährlich, halbjährlich, jährlich oder einmalig"}
 INTERVALLE = {"monatlich", "vierteljährlich", "halbjährlich", "jährlich", "einmalig"}
 ZAHLEN = {"ein": 1, "eine": 1, "einen": 1, "einem": 1, "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "sechs": 6,
           "sieben": 7, "acht": 8, "neun": 9, "zehn": 10, "elf": 11, "zwölf": 12}
-FRIST = re.compile(r"(\d{1,3}|%s)\s*(tag|woche|monat|jahr)" % "|".join(sorted(ZAHLEN, key=len, reverse=True)), re.I)
+ZAHL = "|".join(sorted(ZAHLEN, key=len, reverse=True))
+FRIST = re.compile(r"(\d{1,3}|%s)\s*(tag|woche|monat|jahr)" % ZAHL, re.I)
+# "zum Monatsende", "zum Ende eines Kalendervierteljahres", "zum Schluss des Kalenderjahres"
+ENDE = re.compile(r"\bzu[mr]?\s+(?:(?:ende|schluss|ablauf)\s+(?:eines|des|einer|der|jedes|jeden)\s+(?:kalender)?"
+                  r"(monat|quartal|vierteljahr|halbjahr|jahr)|(?:kalender)?(monat|quartal|vierteljahr|halbjahr|jahr)e?s?(?:ende|schluss))", re.I)
+ENDEN = {"monat": (1, "Monatsende"), "quartal": (3, "Quartalsende"), "vierteljahr": (3, "Quartalsende"),
+         "halbjahr": (6, "Halbjahresende"), "jahr": (12, "Jahresende")}
+# "verlängert sich jeweils um 12 Monate", "Verlängerung um ein weiteres Jahr"
+UM = r"\bum\s+(?:jeweils\s+)?(?:weitere\s+)?(\d{1,2}|%s)\s+(?:weitere[snm]?\s+)?(monat|jahr)\w*" % ZAHL
+VERLAENGERT = re.compile(r"verlänger\w*[^.;]{0,100}?" + UM, re.I)
+# the text layer (#721): word-shaped tokens, and the short words every German or English text has
+WORT = re.compile(r"[a-zäöüß]{2,}|[A-ZÄÖÜ][a-zäöüß]+|[A-ZÄÖÜ]{2,}")
+NEUTRAL = re.compile(r"[\d.,:;/%€+=*#&|\-–—()\[\]{}'\"„“”‚‘»«]+")
+HAEUFIG = set("der die das und ist in zu den dem des ein eine einer eines einem einen mit von für auf im an als bei nicht "
+              "sie ihr ihre ihren wir sich es ich oder auch nach bis zum zur wird werden sind wurde aus über vom am sowie "
+              "uns dass durch kann the and of to for is on with you your this that are".split())
 
 
 class API:
@@ -91,18 +125,40 @@ def datum(s):
 
 
 def frist(s):
-    """a notice period as (number, unit) from free text, None when it names none"""
+    """a notice period as (number, unit, end) from free text, None when it names none;
+    end is the months of "zum Monats-/Quartals-/Halbjahres-/Jahresende", else 0"""
     m = FRIST.search(str(s or ""))
     if not m:
         return None
-    n = m.group(1).lower()
-    return (int(n) if n.isdigit() else ZAHLEN[n]), m.group(2).lower()
+    n, e = m.group(1).lower(), ENDE.search(str(s))
+    return (int(n) if n.isdigit() else ZAHLEN[n]), m.group(2).lower(), ENDEN[(e.group(1) or e.group(2)).lower()][0] if e else 0
 
 
-def minus(d, n, unit):
+def monatsende(d):
+    return d.day == calendar.monthrange(d.year, d.month)[1]
+
+
+def periodenende(d, monate):
+    """whether d is the last day of a month, quarter, half year or year (1, 3, 6, 12)"""
+    return monatsende(d) and d.month % monate == 0
+
+
+def monate(d, n):
+    """d moved by n months; the end of a month stays the end of a month"""
+    y, m = divmod(d.year * 12 + d.month - 1 + n, 12)
+    last = calendar.monthrange(y, m + 1)[1]
+    return date(y, m + 1, last if monatsende(d) else min(d.day, last))
+
+
+def minus(d, n, unit, ende=0):
+    """when the notice must be in for the notice date d. To a period's end with d at
+    that end, a month's period reaches back to a month's end (31.01. for 28.02.);
+    else by the day, which is never later than the true day"""
     if unit in ("monat", "jahr"):
-        months = d.year * 12 + d.month - 1 - n * (12 if unit == "jahr" else 1)
-        y, m = divmod(months, 12)
+        k = n * (12 if unit == "jahr" else 1)
+        if ende and periodenende(d, ende):
+            return monate(d, -k)
+        y, m = divmod(d.year * 12 + d.month - 1 - k, 12)
         return date(y, m + 1, min(d.day, calendar.monthrange(y, m + 1)[1]))
     return d - timedelta(days=n * (7 if unit == "woche" else 1))
 
@@ -125,9 +181,10 @@ def wert(name, kind, v):
         f = frist(s)
         if not f:
             return None
-        n, unit = f
-        return "%d %s" % (n, {"tag": "Tag", "woche": "Woche", "monat": "Monat", "jahr": "Jahr"}[unit] + (
-            "" if n == 1 else {"tag": "e", "woche": "n", "monat": "e", "jahr": "e"}[unit]))
+        n, unit, ende = f
+        return "%d %s%s" % (n, {"tag": "Tag", "woche": "Woche", "monat": "Monat", "jahr": "Jahr"}[unit] + (
+            "" if n == 1 else {"tag": "e", "woche": "n", "monat": "e", "jahr": "e"}[unit]),
+            " zum " + next(name for k, name in ENDEN.values() if k == ende) if ende else "")
     if name == "Zahlungsintervall":
         return s.lower() if s.lower() in INTERVALLE else None
     return s[:128] or None
@@ -196,6 +253,77 @@ def lesen(api, doc, antwort, felder, prüfen_tag):
     return gefuellt, verworfen
 
 
+def lesbar(text):
+    """the text layer's verdict: None when too short to judge, else (readable, share of word-shaped tokens)"""
+    toks = [t.strip(".,;:!?()[]\"'„“”‚‘»«*-–") for t in str(text or "").split()]
+    toks = [t for t in toks if t and not NEUTRAL.fullmatch(t)]
+    if len(toks) < 30:
+        return None
+    worte = sum(1 for t in toks if WORT.fullmatch(t.replace("-", "")) and re.search(r"[aeiouyäöü]", t, re.I))
+    haeufig = sum(1 for t in toks if t.casefold() in HAEUFIG)
+    laenge = sum(map(len, toks)) / len(toks)
+    anteil = worte / len(toks)
+    return not (anteil < 0.5 or (haeufig / len(toks) < 0.05 and laenge < 3.5)), anteil
+
+
+def verlaengerung(text):
+    """the renewal a contract's text names, as (months, the words), None when it names none or two"""
+    found, text = {}, str(text or "")
+    for m in VERLAENGERT.finditer(text):
+        rest = re.split(r"[.;]", text[m.end():], maxsplit=1)[0]   # "um 12 oder um 24 Monate": two
+        for x in [m] + list(re.finditer(UM, rest, re.I)):
+            n = x.group(1).lower()
+            found.setdefault((int(n) if n.isdigit() else ZAHLEN[n]) * (12 if x.group(2).lower() == "jahr" else 1), re.sub(r"\s+", " ", m.group(0)))
+    return next(iter(found.items())) if len(found) == 1 and 0 < next(iter(found)) <= 60 else None
+
+
+def markieren(api, doc_id, note, prüfen_tag):
+    """the tag prüfen and a note on a document"""
+    d = api("GET", "/api/documents/%d/" % doc_id)
+    if prüfen_tag() not in (d.get("tags") or []):
+        api("PATCH", "/api/documents/%d/" % doc_id, {"tags": (d.get("tags") or []) + [prüfen_tag()]})
+    api("POST", "/api/documents/%d/notes/" % doc_id, {"note": note})
+
+
+def textschicht(api, rec, heute, prüfen_tag):
+    """letter salad recognised again through Paperless' reprocess, once, a few a run; still salad
+    a day after: prüfen. The ids whose text is salad now"""
+    texte, salat, neu = rec.setdefault("texte", {}), set(), []
+    for d in sorted(api.all("/api/documents/"), key=lambda d: d["id"]):
+        sha = hashlib.sha256((d.get("content") or "").encode()).hexdigest()[:16]
+        e = texte.get(str(d["id"]), {})
+        if e.get("text") == sha and e.get("lesbar", True):
+            continue
+        urteil = lesbar(d.get("content")) if e.get("text") != sha else (False, e.get("anteil", 0))
+        if urteil is None or urteil[0]:
+            texte[str(d["id"])] = {"text": sha, "lesbar": True}
+            continue
+        salat.add(d["id"])
+        if e.get("gemeldet") or (e.get("neu") and e["neu"] >= heute.isoformat()):
+            continue
+        if e.get("neu"):   # recognised again a day ago or more, and salad still
+            markieren(api, d["id"], "Auch neu erkannt ist der Text dieses Dokuments kaum lesbar (laib). Bitte das Original neu scannen "
+                      "und hochladen, gerade und mit mindestens 300 dpi; dann dieses Dokument löschen.", prüfen_tag)
+            texte[str(d["id"])] = {**e, "text": sha, "gemeldet": True}
+            print("vertraege: %s (%d): auch neu erkannt Buchstabensalat, prüfen" % (d.get("title"), d["id"]))
+        elif len(neu) < OCR_PRO_LAUF:
+            neu.append(d["id"])
+            texte[str(d["id"])] = {"text": sha, "lesbar": False, "anteil": round(urteil[1], 2), "neu": heute.isoformat()}
+        else:
+            print("vertraege: weitere unlesbare Texte im nächsten Lauf")
+    if neu:
+        try:   # Paperless 3.0's own endpoint; bulk_edit's reprocess is 2.x's
+            api("POST", "/api/documents/reprocess/", {"documents": neu})
+        except urllib.error.HTTPError as e:
+            if e.code not in (404, 405):
+                raise
+            api("POST", "/api/documents/bulk_edit/", {"documents": neu, "method": "reprocess", "parameters": {}})
+        for i in neu:
+            api("POST", "/api/documents/%d/notes/" % i, {"note": "Der Text dieses Dokuments ist Buchstabensalat; laib lässt es neu erkennen."})
+            print("vertraege: Dokument %d: Buchstabensalat (%d %% Wörter), wird neu erkannt" % (i, texte[str(i)]["anteil"] * 100))
+    return salat
+
+
 def erinnern(text, wann):
     """erinnerung_anlegen in Haus's Haushalt; True when Haus took it"""
     r = urllib.request.Request(E["HAUSHALT_URL"], method="POST", data=json.dumps(
@@ -208,6 +336,33 @@ def erinnern(text, wann):
         print("vertraege: Haus nimmt die Erinnerung nicht:", (res.get("error") or {}).get("message") or out.get("content"))
         return False
     return True
+
+
+def verlaengern(api, d, fid, termin, heute, markiert, prüfen_tag):
+    """a notice date that passed, moved on by the renewal the text names; None without one"""
+    v = verlaengerung(d.get("content"))
+    key = "vorbei:%d@%s" % (d["id"], termin.isoformat())
+    if not v:
+        if key not in markiert:
+            markieren(api, d["id"], "Der Kündigungstermin %s ist vorbei, und der Text sagt nicht eindeutig, um wie lange sich der "
+                      "Vertrag verlängert (laib). Bitte den nächsten Kündigungstermin eintragen, oder das Feld leeren, wenn der "
+                      "Vertrag gekündigt ist." % termin.strftime("%d.%m.%Y"), prüfen_tag)
+            markiert[key] = heute.isoformat()
+            print("vertraege: %s (%d): Kündigungstermin %s vorbei, keine Verlängerung im Text, prüfen" % (d.get("title"), d["id"], termin))
+        return None
+    neu = termin
+    while neu < heute:
+        neu = monate(neu, v[0])
+    doc = api("GET", "/api/documents/%d/" % d["id"])   # fresh: the owner may have typed since
+    have = {c["field"]: c.get("value") for c in doc.get("custom_fields") or []}
+    if datum(have.get(fid)) != termin:   # changed meanwhile: the next run reads it
+        return None
+    have[fid] = neu.isoformat()
+    api("PATCH", "/api/documents/%d/" % d["id"], {"custom_fields": [{"field": f, "value": x} for f, x in have.items()]})
+    api("POST", "/api/documents/%d/notes/" % d["id"], {"note": "Nächster Kündigungstermin von %s auf %s verlegt (laib): laut Text „%s“. "
+        "Ist der Vertrag gekündigt, das Feld leeren." % (termin.strftime("%d.%m.%Y"), neu.strftime("%d.%m.%Y"), v[1])})
+    print("vertraege: %s (%d): Kündigungstermin %s vorbei, verlängert auf %s" % (d.get("title"), d["id"], termin, neu))
+    return neu
 
 
 def main():
@@ -243,13 +398,14 @@ def main():
             tag[0] = api("POST", "/api/tags/", {"name": PRUEFEN, "matching_algorithm": 0, "owner": None})["id"]
         return tag[0]
 
+    salat = textschicht(api, rec, heute, prüfen_tag)
     ki = E.get("PAPERLESS_AI_ENABLED", "").strip().lower() == "true" and E.get("PAPERLESS_AI_LLM_ENDPOINT")
     gelesen = 0
     for d in sorted(docs.values(), key=lambda d: d["id"]) if ki else []:
         vals = {c["field"]: c.get("value") for c in d.get("custom_fields") or []}
         sha = hashlib.sha256((d.get("content") or "").encode()).hexdigest()[:16]
         if not (d.get("content") or "").strip() or all(not leer(vals.get(fid)) for fid, _ in felder.values()) \
-                or rec["dokumente"].get(str(d["id"]), {}).get("text") == sha:
+                or rec["dokumente"].get(str(d["id"]), {}).get("text") == sha or d["id"] in salat:
             continue
         if gelesen >= PRO_LAUF:
             print("vertraege: weitere Verträge im nächsten Lauf")
@@ -268,35 +424,56 @@ def main():
 
     vorlauf = int(E.get("VERTRAG_VORLAUF_TAGE") or 28)
     haus = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
+    gemeldet, markiert = rec.setdefault("meldungen", {}), rec.setdefault("markiert", {})
     for d in sorted(docs.values(), key=lambda d: d["id"]):
         d = api("GET", "/api/documents/%d/" % d["id"]) if gelesen else d
         vals = {c["field"]: c.get("value") for c in d.get("custom_fields") or []}
-        termin, f = datum(vals.get(felder["Nächster Kündigungstermin"][0])), vals.get(felder["Kündigungsfrist"][0])
-        if not termin or leer(f):
+        tfid = felder["Nächster Kündigungstermin"][0]
+        termin, f = datum(vals.get(tfid)), vals.get(felder["Kündigungsfrist"][0])
+        if not termin:
+            continue
+        if termin < heute:
+            termin = verlaengern(api, d, tfid, termin, heute, markiert, prüfen_tag)
+            if not termin:
+                continue
+        if leer(f):
             continue
         key = "%d@%s" % (d["id"], termin.isoformat())
-        if key in rec["erinnerungen"]:
-            continue
         nf = frist(f)
         if not nf:
-            print("vertraege: %s (%d): die Kündigungsfrist %r nennt keine Zeit, keine Erinnerung" % (d.get("title"), d["id"], f))
+            if key not in rec["erinnerungen"]:
+                print("vertraege: %s (%d): die Kündigungsfrist %r nennt keine Zeit, keine Erinnerung" % (d.get("title"), d["id"], f))
             continue
+        if nf[2] and not periodenende(termin, nf[2]) and "ende:" + key not in markiert:
+            ende = next(name for k, name in ENDEN.values() if k == nf[2])
+            markieren(api, d["id"], "Die Kündigungsfrist gilt zum %s, der Kündigungstermin %s ist aber kein %s (laib). Die Erinnerung "
+                      "rechnet vom eingetragenen Tag zurück; bitte den Kündigungstermin prüfen." % (ende, termin.strftime("%d.%m.%Y"), ende), prüfen_tag)
+            markiert["ende:" + key] = heute.isoformat()
         bis = minus(termin, *nf)
         if bis < heute:
             continue
-        if not haus:
-            print("vertraege: %s (%d): kündigen bis %s, aber ohne Haus keine Erinnerung" % (d.get("title"), d["id"], bis.strftime("%d.%m.%Y")))
-            continue
         anbieter = vals.get(felder["Anbieter"][0])
-        text = "Kündigung prüfen: %s%s. Kündigen bis %s (Kündigungstermin %s). %s/documents/%d/details" % (
-            (d.get("title") or "Vertrag")[:120], " (%s)" % str(anbieter)[:80] if anbieter else "", bis.strftime("%d.%m.%Y"),
+        titel = (d.get("title") or "Vertrag")[:120]
+        was = "%s%s. Kündigen bis %s (Kündigungstermin %s). %s/documents/%d/details" % (
+            titel, " (%s)" % str(anbieter)[:80] if anbieter else "", bis.strftime("%d.%m.%Y"),
             termin.strftime("%d.%m.%Y"), E.get("PAPERLESS_URL", "").rstrip("/"), d["id"])
-        wann = max(bis - timedelta(days=vorlauf), heute).isoformat()
+        erinnerungstag = bis - timedelta(days=vorlauf)
+        if erinnerungstag <= heute and key not in gemeldet:   # the reminder day: the owner through the Bote (#721)
+            print("meldung " + json.dumps({"an": "", "betreff": "Kündigung prüfen: " + titel, "text": was, "at": int(time.time())}, ensure_ascii=False))
+            gemeldet[key] = heute.isoformat()
+        if key in rec["erinnerungen"]:
+            continue
+        if not haus:
+            print("vertraege: %s (%d): kündigen bis %s, aber ohne Haus keine Erinnerung im Kalender" % (d.get("title"), d["id"], bis.strftime("%d.%m.%Y")))
+            continue
+        text = "Kündigung prüfen: " + was
+        wann = max(erinnerungstag, heute).isoformat()
         try:
             ok = erinnern(text, wann)
         except (OSError, ValueError) as e:
             print("vertraege: Haus antwortet nicht (%s), der nächste Lauf versucht es wieder" % e)
-            break
+            haus = None
+            continue
         if ok:
             rec["erinnerungen"][key] = {"wann": wann, "bis": bis.isoformat()}
             print("vertraege: Erinnerung am %s: %s" % (wann, text))

@@ -45,7 +45,7 @@ class Paperless:
     """documents with custom fields and tags, document types, tags, notes: in memory"""
 
     def __init__(self, docs, types=None, tags=None):
-        self.docs, self.calls, self.notes = docs, [], {}
+        self.docs, self.calls, self.notes, self.bulk, self.v3 = docs, [], {}, [], True
         self.types = types if types is not None else [{"id": 1, "name": "Vertrag"}, {"id": 2, "name": "Rechnung"}]
         self.tags = tags if tags is not None else [{"id": 1, "name": "Versicherung"}]
         self.fields = [{"id": F[n], "name": n, "data_type": k} for n, k in zip(NAMES, KINDS)] + [
@@ -73,6 +73,12 @@ class Paperless:
                     t = {**body, "id": 100 + len(fake.tags)}
                     fake.tags.append(t)
                     return reply(self, 201, t)
+                if method == "POST" and path == "/api/documents/reprocess/" and fake.v3:   # Paperless 3.0
+                    fake.bulk.append({**body, "method": "reprocess"})
+                    return reply(self, 200, {"result": "OK"})
+                if method == "POST" and path == "/api/documents/bulk_edit/" and not fake.v3:   # 2.x
+                    fake.bulk.append(body)
+                    return reply(self, 200, {"result": "OK"})
                 if method == "GET" and path == "/api/documents/":
                     out = fake.docs
                     if "document_type__id__in" in q:
@@ -83,7 +89,7 @@ class Paperless:
                         out = [d for d in out if ids & set(d.get("tags") or [])]
                     return reply(self, 200, {"next": None, "results": out})
                 parts = path.strip("/").split("/")
-                if parts[:2] == ["api", "documents"] and len(parts) >= 3:
+                if parts[:2] == ["api", "documents"] and len(parts) >= 3 and parts[2].isdigit():
                     d = next(d for d in fake.docs if d["id"] == int(parts[2]))
                     if len(parts) == 4 and parts[3] == "notes" and method == "POST":
                         fake.notes.setdefault(d["id"], []).append(body["note"])
@@ -309,11 +315,188 @@ class Vertraege(unittest.TestCase):
     def test_the_unit_hands_the_token_by_name_never_on_argv(self):
         unit = (DIR / "paperless-vertraege.service").read_text()
         exec_line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
-        self.assertIn("-e HAUSHALT_TOKEN ", exec_line)
+        self.assertIn("paperless-vertraege.sh", exec_line)
         self.assertNotIn("${HAUSHALT_TOKEN}", exec_line)
-        self.assertIn("--user paperless", exec_line)
         self.assertIn("Environment=HAUSHALT_TOKEN=${HAUSHALT_TOKEN}", unit)
         self.assertTrue((DIR / "paperless-vertraege.timer").exists())
+        sh = (DIR / "paperless-vertraege.sh").read_text()
+        self.assertIn("-e HAUSHALT_TOKEN ", sh)
+        self.assertIn("--user paperless", sh)
+        self.assertNotIn("$HAUSHALT_TOKEN", sh)
+
+    # #721 (a): a notice date that passed moves on by the renewal the text names
+    def test_a_past_notice_date_moves_on_by_the_renewal_the_text_names(self):
+        text = TEXT + "\nDer Vertrag verlängert sich jeweils um 12 Monate, wenn er nicht fristgerecht gekündigt wird."
+        p, h = Paperless([vertrag(text=text, fields={F["Vertragsende"]: "2026-03-31", F["Kündigungsfrist"]: "3 Monate",
+                                                     F["Nächster Kündigungstermin"]: "2026-03-31"})]), Haus()
+        r = self.run_job(p, haus=h, ai="false")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Nächster Kündigungstermin"]), "2027-03-31")
+        self.assertEqual(p.value(1, F["Vertragsende"]), "2026-03-31", "only the notice date moves, not a field with the same day")
+        self.assertEqual(p.value(1, F["Kündigungsfrist"]), "3 Monate", "the other fields stay")
+        [note] = p.notes[1]
+        self.assertIn("31.03.2027", note)
+        self.assertIn("verlängert sich jeweils um 12 Monate", note, "the note quotes the text it stands on")
+        self.assertNotIn(PRUEFEN_ID, p.doc(1)["tags"])
+        [rem] = h.reminders()
+        self.assertEqual(rem["wann"], "2026-12-03", "the new notice date gets its reminder at once")
+        self.run_job(p, haus=h, ai="false")
+        self.assertEqual(len(p.notes[1]), 1, "moved once")
+        self.assertEqual(len(h.reminders()), 1)
+
+    def test_a_renewal_keeps_the_end_of_the_month_and_skips_terms_already_past(self):
+        text = TEXT + "\nDanach verlängert sich der Vertrag stillschweigend um ein weiteres Jahr."
+        p = Paperless([vertrag(text=text, fields={F["Kündigungsfrist"]: "1 Monat", F["Nächster Kündigungstermin"]: "2024-02-29"})])
+        r = self.run_job(p, ai="false")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Nächster Kündigungstermin"]), "2027-02-28", "29.02.2024 + 3 Jahre, each a month's end")
+
+    def test_a_past_notice_date_without_a_renewal_in_the_text_is_marked_once(self):
+        vague = TEXT + "\nDer Vertrag verlängert sich um 12 Monate oder um 24 Monate, je nach Tarif."
+        p = Paperless([vertrag(1, fields={F["Kündigungsfrist"]: "3 Monate", F["Nächster Kündigungstermin"]: "2026-03-31"}),
+                       vertrag(2, text=vague, fields={F["Kündigungsfrist"]: "3 Monate", F["Nächster Kündigungstermin"]: "2026-03-31"})])
+        r = self.run_job(p, ai="false")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tag = next(t for t in p.tags if t["name"] == "prüfen")
+        for i in (1, 2):
+            self.assertEqual(p.value(i, F["Nächster Kündigungstermin"]), "2026-03-31", "no evidence: no new date")
+            self.assertIn(tag["id"], p.doc(i)["tags"])
+            self.assertIn("31.03.2026", p.notes[i][0])
+        self.run_job(p, ai="false")
+        self.assertEqual([len(p.notes[i]) for i in (1, 2)], [1, 1], "said once")
+
+    # #721 (b): "zum Monats-/Quartals-/Jahresende"
+    def test_a_notice_period_to_the_end_of_a_month_quarter_or_year(self):
+        p, h = Paperless([
+            vertrag(1, fields={F["Kündigungsfrist"]: "1 Monat zum Monatsende", F["Nächster Kündigungstermin"]: "2027-02-28"}),
+            vertrag(2, fields={F["Kündigungsfrist"]: "3 Monate zum Ende eines Kalendervierteljahres", F["Nächster Kündigungstermin"]: "2027-06-30"}),
+            vertrag(3, fields={F["Kündigungsfrist"]: "6 Wochen zum Quartalsende", F["Nächster Kündigungstermin"]: "2027-06-30"}),
+            vertrag(4, fields={F["Kündigungsfrist"]: "3 Monate zum Jahresende", F["Nächster Kündigungstermin"]: "2027-12-31"}),
+            vertrag(5, fields={F["Kündigungsfrist"]: "3 Monate zum Quartalsende", F["Nächster Kündigungstermin"]: "2027-02-15"})]), Haus()
+        r = self.run_job(p, haus=h, ai="false")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        bis = {int(x["text"].split("/documents/")[1].split("/")[0]): x["text"].split("Kündigen bis ")[1][:10] for x in h.reminders()}
+        self.assertEqual(bis[1], "31.01.2027", "28.02. − 1 Monat zum Monatsende: the end of January, not the 28th")
+        self.assertEqual(bis[2], "31.03.2027")
+        self.assertEqual(bis[3], "19.05.2027", "weeks count back by the day")
+        self.assertEqual(bis[4], "30.09.2027")
+        self.assertEqual(bis[5], "15.11.2026", "a date that is no quarter's end is never moved later")
+        tag = next(t for t in p.tags if t["name"] == "prüfen")
+        self.assertIn(tag["id"], p.doc(5)["tags"])
+        self.assertIn("Quartal", p.notes[5][0])
+        self.assertEqual(sorted(p.notes), [5], "only the contradictory one is marked")
+
+    def test_the_model_keeps_the_end_of_period_rule(self):
+        text = TEXT.replace("3 Monate zum Ende der Laufzeit", "3 Monate zum Quartalsende")
+        answer = {**ANSWER, "Kündigungsfrist": {"wert": "drei Monate zum Quartalsende", "beleg": "Kündigungsfrist: 3 Monate zum Quartalsende"}}
+        p = Paperless([vertrag(text=text)])
+        r = self.run_job(p, Model(answer))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Kündigungsfrist"]), "3 Monate zum Quartalsende")
+
+    # #721 (c): a text layer that is letter salad is recognised again, a few a run
+    def test_letter_salad_is_recognised_again_once_and_marked_when_it_stays(self):
+        docs = [vertrag(i, typ=2, title="Scan %d" % i, text=SALAT) for i in range(1, 6)]
+        docs += [vertrag(6, typ=2, title="Brief", text=BRIEF), vertrag(7, typ=2, title="Rechnung", text=RECHNUNG),
+                 vertrag(8, title="Vertrag", text=SALAT)]
+        p, m = Paperless(docs), Model(ANSWER)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(m.asks, [], "a contract of letter salad is not read")
+        ids = [i for b in p.bulk for i in b["documents"]]
+        self.assertTrue(all(b["method"] == "reprocess" for b in p.bulk), p.bulk)
+        self.assertEqual(len(ids), 3, "three a run: OCR is the box's CPU")
+        self.assertNotIn(6, ids)
+        self.assertNotIn(7, ids, "an invoice of numbers is no salad")
+        self.run_job(p, m)
+        ids = [i for b in p.bulk for i in b["documents"]]
+        self.assertEqual(sorted(ids), [1, 2, 3, 4, 5, 8], "the next three the next run, none twice")
+        # recognised again: one reads now, the others are salad still
+        p.doc(1)["content"] = BRIEF
+        r = self.run_job(p, m, heute="2026-10-28")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len([i for b in p.bulk for i in b["documents"]]), 6, "no second recognition")
+        tag = next(t for t in p.tags if t["name"] == "prüfen")
+        self.assertNotIn(tag["id"], p.doc(1)["tags"])
+        self.assertIn(tag["id"], p.doc(2)["tags"], "still salad after it was recognised again: the family looks")
+        self.assertTrue(any("neu scannen" in n for n in p.notes[2]), p.notes)
+        self.assertEqual(m.asks, [], "the salad contract stays unread")
+        self.run_job(p, m, heute="2026-10-29")
+        self.assertEqual(len([n for n in p.notes[2] if "neu scannen" in n]), 1, "said once")
+
+    def test_an_older_paperless_reprocesses_through_bulk_edit(self):
+        p = Paperless([vertrag(1, typ=2, text=SALAT)])
+        p.v3 = False
+        r = self.run_job(p, ai="false")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.bulk, [{"documents": [1], "method": "reprocess", "parameters": {}}])
+
+    # #721 (d): the reminder day reaches the owner over the Bote, through laib-notify's eingang
+    def test_on_the_reminder_day_a_message_for_the_bote_once(self):
+        fields = {F["Anbieter"]: "Stadtwerke Beispielstadt GmbH", F["Kündigungsfrist"]: "3 Monate", F["Nächster Kündigungstermin"]: "2027-03-31"}
+        p = Paperless([vertrag(fields=fields)])
+        r = self.run_job(p, ai="false", heute="2026-11-20")
+        self.assertEqual(meldungen(r.stdout), [], "before the reminder day: nothing")
+        r = self.run_job(p, ai="false", heute="2026-12-03")
+        [m] = meldungen(r.stdout)
+        self.assertEqual(m["betreff"], "Kündigung prüfen: Stromvertrag")
+        self.assertIn("Kündigen bis 31.12.2026", m["text"])
+        self.assertIn("Stadtwerke Beispielstadt GmbH", m["text"])
+        self.assertIn("https://paperless.example.org/documents/1/details", m["text"])
+        self.assertEqual(m["an"], "")
+        self.assertIsInstance(m["at"], int)
+        r = self.run_job(p, ai="false", heute="2026-12-04")
+        self.assertEqual(meldungen(r.stdout), [], "once per notice date")
+        r = self.run_job(Paperless([vertrag(fields=fields)]), ai="false", heute="2027-01-02")
+        self.assertEqual(meldungen(r.stdout), [], "after the notice had to be in: too late, nothing")
+
+
+def meldungen(out):
+    return [json.loads(l[len("meldung "):]) for l in out.splitlines() if l.startswith("meldung ")]
+
+
+PRUEFEN_ID = 101
+BRIEF = ("Sehr geehrte Damen und Herren, vielen Dank für Ihr Schreiben vom 12. Mai. Wir bestätigen hiermit die Änderung "
+         "Ihres Vertrags zum 31.03.2027. Bitte beachten Sie, dass eine Kündigung schriftlich erfolgen muss. Der Betrag "
+         "wird Ihnen auf das bekannte Konto überwiesen. Für Rückfragen sind wir gerne für Sie da. Mit freundlichen Grüßen "
+         "Ihre Stadtwerke Beispielstadt GmbH Kundenservice")
+RECHNUNG = ("Rechnung Nr. 2026-0042 Datum 12.05.2026 Pos Menge Artikel Einzelpreis Gesamt 1 2 Druckerpatrone schwarz "
+            "19,90 39,80 2 1 Papier A4 500 Blatt 4,99 4,99 3 1 Versand 4,90 4,90 Zwischensumme 49,69 MwSt 19% 7,93 "
+            "Gesamtbetrag 57,62 EUR Zahlbar bis 26.05.2026 ohne Abzug Lieferdatum entspricht Rechnungsdatum Steuernummer "
+            "000/000/00000 Amtsgericht Beispielstadt Geschäftsführung Kundennummer Bestellnummer Zahlungsart Überweisung")
+# what Tesseract makes of an upside-down or blurred page (the box, #567)
+SALAT = ("ae Wu ZEN NIE aD TER cn Ta PEN ER ne nase Fe ri oa DE HE LE ne EEE Tre En Er ze ae Ze ae Br pr ee Er RE an "
+         "ee ee ae ae Sr Sn En Te ne ZZ ae ER ea ri ae ae Er Tue ae i ' Eee ; = NN — = rn DD . ‚ e7 = ae IE ee re")
+
+
+class Sender(unittest.TestCase):
+    """paperless-vertraege.sh, the host's part: runs the script in the container, hands its messages to laib-notify"""
+
+    def test_messages_go_to_eingang_logs_to_the_journal_and_the_exit_code_stays(self):
+        tmp = tempfile.mkdtemp()
+        podman = os.path.join(tmp, "podman")
+        with open(podman, "w") as f:
+            f.write("#!/bin/sh\necho \"$@\" >%s/argv\ncat >%s/stdin\necho 'vertraege: eine Zeile'\n"
+                    "echo 'meldung {\"an\": \"\", \"betreff\": \"Kündigung prüfen: Strom\", \"text\": \"Kündigen bis 31.12.2026\", \"at\": 1}'\n"
+                    "exit 3\n" % (tmp, tmp))
+        os.chmod(podman, 0o755)
+        skript = os.path.join(tmp, "skript.py")
+        with open(skript, "w") as f:
+            f.write("print('hallo')")
+        env = {"PATH": os.environ["PATH"], "PODMAN": podman, "VERTRAEGE_SKRIPT": skript,
+               "NOTIFY_EINGANG": os.path.join(tmp, "eingang"), "HAUSHALT_TOKEN": "haustoken"}
+        r = subprocess.run(["sh", str(DIR / "paperless-vertraege.sh")], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 3, "the script's exit code is the unit's")
+        self.assertIn("vertraege: eine Zeile", r.stdout)
+        self.assertNotIn("meldung {", r.stdout)
+        [f] = os.listdir(os.path.join(tmp, "eingang"))
+        self.assertTrue(f.startswith("paperless-") and f.endswith(".json"), f)
+        with open(os.path.join(tmp, "eingang", f)) as fh:
+            self.assertEqual(json.load(fh)["betreff"], "Kündigung prüfen: Strom")
+        argv = open(os.path.join(tmp, "argv")).read()
+        self.assertNotIn("haustoken", argv)
+        self.assertIn("-e HAUSHALT_TOKEN", argv)
+        self.assertEqual(open(os.path.join(tmp, "stdin")).read(), "print('hallo')")
 
 
 if __name__ == "__main__":
