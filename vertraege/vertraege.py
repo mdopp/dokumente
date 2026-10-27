@@ -73,6 +73,19 @@ Haushalt URL and token come from the unit. The standard library only.
    first run records them). The correspondent itself stays (Paperless marks
    none as the AI's); one left without documents is listed in the record,
    and paperless-mail.py check says so in laib's status.
+7. The family address book (#820). With Haus, the same question asks for the
+   sender too (KONTAKT): firm, contact person, phone, e-mail, IBAN, postal
+   address, and the recipient block only to keep the household out. A value
+   is kept when belegt() and its shape; never the household's own: in the
+   recipient block, a household person (6.), a login's e-mail, a number,
+   mail or IBAN the text calls the recipient's (EIGEN), or a street with a
+   household person's name just before it. An address goes only whole.
+   Haus's kontakt_ergaenzen gets it with the document's link as quelle,
+   once per document (the record's kontakte); one read before is asked once
+   more, for its sender only. An IBAN Haus answers abweichend: `prüfen` and
+   a note with Haus's reason. Haus away or without the tool: the contact
+   waits in the record, the model is not asked again. Without Haus nothing
+   is asked, sent or recorded.
 
 What it filled and reminded is kept in laib-vertraege.json in Paperless' data
 folder (backed up), so a run never asks or reminds twice."""
@@ -106,6 +119,25 @@ RECHNUNG_HILFEN = {"Rechnungsdatum": "JJJJ-MM-TT, das Datum der Rechnung",
                    "Zahlungsziel": "die Zahlungsfrist, wenn der Text statt eines Tages nur eine Frist nennt, z. B. \"14 Tage\""}
 # what a document is read as: its words for the note, its fields, what else is asked
 ARTEN = {"vertrag": ("Vertragsdaten", FELDER, {}), "rechnung": ("Rechnungsdaten", RECHNUNG_FELDER, RECHNUNG_HILFEN)}
+# #820: the sender, asked in the same question when Haus is there, for kontakt_ergaenzen; Empfänger only to keep the household out
+KONTAKT = {"Firma": "die Firma, Behörde oder Person, die das Dokument schickt (Briefkopf, Absender, Fußzeile); nie der Empfänger",
+           "Ansprechpartner": "die Person beim Absender, an die man sich wenden soll, nur wenn der Text sie nennt",
+           "Telefon": "die Telefonnummer des Absenders, wie sie dasteht",
+           "E-Mail": "die E-Mail-Adresse des Absenders",
+           "IBAN": "die IBAN des Absenders, auf die gezahlt werden soll; nie die des Empfängers (\"von Ihrem Konto\")",
+           "Anschrift": "die Postanschrift des Absenders aus Briefkopf, Absenderzeile oder Fußzeile, als "
+                        "{\"strasse\": …, \"plz\": …, \"ort\": …, \"land\": \"DE\"}; nie die Anschrift im Anschriftenfeld",
+           "Empfänger": "Name und Anschrift im Anschriftenfeld, an die das Dokument geht"}
+LAENDER = {"DE": "deutschland", "AT": "österreich", "CH": "schweiz", "NL": "niederlande", "FR": "frankreich", "LU": "luxemburg"}
+KONTAKT_ARGS = {"Firma": "firma", "Ansprechpartner": "ansprechpartner", "Telefon": "telefon", "E-Mail": "email", "IBAN": "iban"}
+FORM = {"Firma": lambda v: len(v) <= 128 and re.search(r"[^\W\d_]{2}", v),
+        "Ansprechpartner": lambda v: len(v) <= 80 and re.fullmatch(r"[^\W\d_][^\d@]*", v),
+        "Telefon": lambda v: re.fullmatch(r"\+?[\d\s()/.-]{6,30}", v) and 6 <= len(re.sub(r"\D", "", v)) <= 15,
+        "E-Mail": lambda v: re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", v),
+        "IBAN": lambda v: re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", v)}
+# words just before a number, mail or IBAN that make it the household's own (#820)
+EIGEN = re.compile(r"\bihr(?:e|em|en|er)?\s+(?:konto|iban|bankverbindung|telefon\w*|rufnummer\w*|mobil\w*|handy\w*|anschluss\w*|e-?mail\w*)"
+                   r"|lastschrift|abgebucht|abbuch|eingezogen|einzug|mandat|kontoinhaber", re.I)
 RECHNUNGSTITEL = re.compile(r"^(?:\d{4}-\d{2}-\d{2}\s+)?(?:.{1,60}?\s-\s)?rechnung\b", re.I)   # scan.py's dateiname
 GUTSCHRIFT = re.compile(r"gutschrift|guthaben|erstatt|gutgeschrieben|zu ihren gunsten|rückzahlung", re.I)
 MINUS = re.compile(r"(?<![\w.,/])[-−]\s*(?:€|eur)?\s*\d|\d[\d.,]*\s*(?:€|eur)?\s*[-−](?![\w])", re.I)   # never an en dash: a separator
@@ -311,6 +343,75 @@ def faellig(antwort, text):
         "Rechnungsdatum %s und „%s“" % (d.strftime("%d.%m.%Y"), re.sub(r"\s+", " ", str(z["beleg"])).strip())
 
 
+def eigen(name, v, text, empf, personen, mails):
+    """whether a contact value is the household's own: in the recipient block, a household
+    person, a login's mail, or a number, mail or IBAN the text calls the recipient's"""
+    if empf and (eng(v) in empf or dicht(v) in dicht(empf)):
+        return True
+    if name in ("Firma", "Ansprechpartner"):
+        return eigener(v, personen)
+    if name == "E-Mail" and v.casefold() in mails:
+        return True
+    t = eng(text)
+    for m in re.finditer(r"\s?".join(map(re.escape, dicht(v))), t):
+        if EIGEN.search(t[max(0, m.start() - 60):m.start()]):
+            return True
+    return False
+
+
+def anschrift(a, text, empf, personen):
+    """the sender's postal address for kontakt_ergaenzen (#820): street, postcode and town all in the
+    words it stands on, never the recipient block's; (address or None, why not or None)"""
+    if not isinstance(a, dict) or not isinstance(a.get("wert"), dict):
+        return None, None
+    w = {k: re.sub(r"\s+", " ", str(a["wert"].get(k) or "")).strip() for k in ("strasse", "plz", "ort", "land")}
+    if not (w["strasse"] and w["plz"] and w["ort"]):
+        return None, None
+    beleg = belegt(a, text)
+    if not beleg or not all(eng(w[k]) in beleg or dicht(w[k]) in dicht(beleg) for k in ("strasse", "plz", "ort")):
+        return None, "Anschrift (steht so nicht im Text)"
+    if not re.fullmatch(r"\d{4,5}", w["plz"]) or not re.search(r"[^\W\d_]{2}", w["strasse"]) or not re.search(r"[^\W\d_]{2}", w["ort"]):
+        return None, "Anschrift (%r ist keine Anschrift)" % a["wert"]
+    t, s = eng(text), r"\s?".join(map(re.escape, dicht(w["strasse"]))) + r"(?!\d)"
+    nachnamen = {x for g, n in personen for x in (n or g)}
+    if (empf and re.search(s, empf)) or any(nachnamen & set(worte(t[max(0, m.start() - 40):m.start()])) for m in re.finditer(s, t)):
+        return None, "Anschrift (gehört zum Haushalt)"
+    out = {k: w[k] for k in ("strasse", "plz", "ort")}
+    land = w["land"].upper()
+    if land in LAENDER and (re.search(r"\b%s\b" % land.lower(), beleg) or LAENDER[land] in beleg):
+        out["land"] = land
+    return out, None
+
+
+def kontaktdaten(antwort, text, personen, mails):
+    """the sender as kontakt_ergaenzen's arguments (#820), only values the text backs and never the
+    household's own; None without a firm. And what was not taken"""
+    empf = belegt(antwort.get("Empfänger"), text)
+    out, weg = {}, []
+    for name, arg in KONTAKT_ARGS.items():
+        a = antwort.get(name)
+        if not isinstance(a, dict) or leer(a.get("wert")):
+            continue
+        v, beleg = re.sub(r"\s+", " ", str(a["wert"])).strip(), belegt(a, text)
+        if name == "IBAN":
+            v = re.sub(r"\s", "", v).upper()
+        if not beleg or not (eng(v) in beleg or dicht(v) in dicht(beleg)):
+            weg.append("%s (steht so nicht im Text)" % name)
+        elif not FORM[name](v):
+            weg.append("%s (%r ist kein gültiger Wert)" % (name, a["wert"]))
+        elif eigen(name, v, text, empf, personen, mails):
+            weg.append("%s (gehört zum Haushalt)" % name)
+        else:
+            out[arg] = v
+    if "firma" in out:
+        a, warum = anschrift(antwort.get("Anschrift"), text, empf, personen)
+        if a:
+            out["anschrift"] = a
+        if warum:
+            weg.append(warum)
+    return (out if "firma" in out else None), weg
+
+
 def frage(text, felder=FELDER, was="Vertragsdaten"):
     felder = "\n".join("- %s: %s" % kv for kv in felder.items())
     return [{"role": "system", "content": "Du liest %s aus einem deutschen Dokument. Antworte nur mit einem JSON-Objekt. " % was +
@@ -495,14 +596,8 @@ def eigener(name, personen):
     return False
 
 
-def absender(api, rec, tags):
+def absender(api, rec, tags, personen):
     """a household person cleared off the documents the AI gave them as correspondent (#737)"""
-    try:
-        users = api.all("/api/users/")
-    except urllib.error.HTTPError as e:
-        print("vertraege: Paperless nennt seine Benutzer nicht (%d): Absender aus dem Haushalt nicht geprüft" % e.code)
-        return
-    personen = haushalt(users, E.get("HAUSHALT_NAMEN", ""), E.get("PAPERLESS_ADMIN_USER", "admin"))
     eigen = {c["id"]: c["name"] for c in api.all("/api/correspondents/") if eigener(c["name"], personen)}
     docs = api.all("/api/documents/?fields=id,title,correspondent,tags")
     k = rec.get("korrespondenten")
@@ -541,18 +636,61 @@ def absender(api, rec, tags):
         k["leer"] = leer
 
 
-def erinnern(text, wann):
-    """erinnerung_anlegen in Haus's Haushalt; True when Haus took it"""
+def werkzeug(name, arguments):
+    """one tool of Haus's Haushalt, its JSON-RPC answer"""
     r = urllib.request.Request(E["HAUSHALT_URL"], method="POST", data=json.dumps(
-        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "erinnerung_anlegen", "arguments": {"text": text, "wann": wann}}}).encode(),
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}).encode(),
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + E.get("HAUSHALT_TOKEN", "")})
     with urllib.request.urlopen(r, timeout=30) as resp:
-        res = json.loads(resp.read())
+        return json.loads(resp.read())
+
+
+def erinnern(text, wann):
+    """erinnerung_anlegen in Haus's Haushalt; True when Haus took it"""
+    res = werkzeug("erinnerung_anlegen", {"text": text, "wann": wann})
     out = res.get("result") or {}
     if res.get("error") or out.get("isError"):
         print("vertraege: Haus nimmt die Erinnerung nicht:", (res.get("error") or {}).get("message") or out.get("content"))
         return False
     return True
+
+
+def kontakte(api, rec, prüfen_tag):
+    """the senders waiting in the record, into Haus's address book through kontakt_ergaenzen (#820), each
+    once; a Haus that does not take them (away, or without the tool) keeps them for the next run"""
+    for k, e in sorted(rec.get("kontakte", {}).items(), key=lambda kv: int(kv[0])):
+        if "offen" not in e:
+            continue
+        try:
+            res = werkzeug("kontakt_ergaenzen", e["offen"])
+        except (OSError, ValueError) as x:
+            print("vertraege: Haus antwortet nicht (%s), Kontakte im nächsten Lauf" % x)
+            return
+        if res.get("error"):   # a Haus before kontakt_ergaenzen, or without the address book
+            print("vertraege: Haus nimmt keine Kontakte (%s), der nächste Lauf versucht es wieder" % res["error"].get("message"))
+            return
+        out, am = res.get("result") or {}, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        text = str(((out.get("content") or [{}])[0]).get("text") or "")
+        firma = e["offen"]["firma"]
+        if out.get("isError"):
+            rec["kontakte"][k] = {"fehler": text[:300], "am": am}
+            print("vertraege: Dokument %s: Haus nimmt den Kontakt „%s“ nicht: %s" % (k, firma, text))
+            continue
+        try:
+            a = json.loads(text.rsplit("\n", 1)[1])
+        except (IndexError, ValueError):
+            a = {}
+        felder = a.get("felder") or {}
+        rec["kontakte"][k] = {"status": a.get("status") or "?", "felder": felder, "am": am}
+        print("vertraege: Dokument %s: Kontakt „%s“ %s" % (k, firma, a.get("status") or text.split("\n")[0]))
+        if felder.get("iban") == "abweichend":   # the fake-invoice trick: a known firm with a new account
+            try:
+                markieren(api, int(k), "Die IBAN %s in diesem Dokument ist nicht die, die im Adressbuch für „%s“ steht (laib): %s. "
+                          "Bitte vor einer Überweisung prüfen, ob die neue Bankverbindung stimmt; eine geänderte IBAN kann ein "
+                          "Betrugsversuch sein." % (e["offen"].get("iban"), firma, (a.get("gruende") or {}).get("iban") or "Haus nennt keinen Grund"),
+                          prüfen_tag)
+            except urllib.error.HTTPError as x:
+                print("vertraege: Dokument %s: IBAN abweichend, aber nicht markiert (%d)" % (k, x.code))
 
 
 def verlaengern(api, d, fid, termin, heute, markiert, prüfen_tag):
@@ -631,7 +769,17 @@ def main():
         return tag[0]
 
     salat = textschicht(api, rec, heute, prüfen_tag)
-    absender(api, rec, tags)
+    try:
+        users = api.all("/api/users/")
+    except urllib.error.HTTPError as e:
+        users = None
+        print("vertraege: Paperless nennt seine Benutzer nicht (%d): Absender aus dem Haushalt nicht geprüft" % e.code)
+    personen = haushalt(users or [], E.get("HAUSHALT_NAMEN", ""), E.get("PAPERLESS_ADMIN_USER", "admin"))
+    mails = {str(u["email"]).casefold() for u in users or [] if u.get("email")}
+    if users is not None:
+        absender(api, rec, tags, personen)
+    haus = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
+    link = E.get("PAPERLESS_URL", "").rstrip("/")
     ki = E.get("PAPERLESS_AI_ENABLED", "").strip().lower() == "true" and E.get("PAPERLESS_AI_LLM_ENDPOINT")
     gelesen = 0
     for d in sorted({**rechnungen, **docs}.values(), key=lambda d: d["id"]) if ki else []:
@@ -641,27 +789,44 @@ def main():
         vals = {c["field"]: c.get("value") for c in d.get("custom_fields") or []}
         sha = hashlib.sha256((d.get("content") or "").encode()).hexdigest()[:16]
         e = rec["dokumente"].get(str(d["id"]), {})
-        if not (d.get("content") or "").strip() or all(not leer(vals.get(fid)) for fid, _ in f.values()) \
-                or (e.get("text") == sha and set(f) <= set(e.get("felder") or FELDER)) or d["id"] in salat:
+        if not (d.get("content") or "").strip() or d["id"] in salat:
+            continue
+        fertig = all(not leer(vals.get(fid)) for fid, _ in f.values()) or (e.get("text") == sha and set(f) <= set(e.get("felder") or FELDER))
+        kontakt = haus and str(d["id"]) not in rec.get("kontakte", {})   # #820: its sender, once; one read before is asked for it
+        if fertig and not kontakt:
             continue
         if gelesen >= PRO_LAUF:
             print("vertraege: weitere Verträge und Rechnungen im nächsten Lauf")
             break
         was = " und ".join(ARTEN[a][0] for a in arten)
+        hilfen = {k: v for a in arten for k, v in ARTEN[a][2].items()}
         try:
-            antwort = modell(frage(d.get("content") or "", {**beschreibung, **{k: v for a in arten for k, v in ARTEN[a][2].items()}}, was))
+            antwort = modell(frage(d.get("content") or "", {**beschreibung, **hilfen, **(KONTAKT if kontakt else {})},
+                                   was + (" und den Absender" if kontakt else "")))
         except (OSError, ValueError, KeyError, IndexError) as e:
             print("vertraege: das Modell antwortet nicht (%s), der nächste Lauf fragt wieder" % e)
             break
-        gefuellt, verworfen = lesen(api, d, antwort if isinstance(antwort, dict) else {}, f, prüfen_tag, "rechnung" in arten, was)
+        antwort = antwort if isinstance(antwort, dict) else {}
         gelesen += 1
+        if kontakt:
+            args, weg = kontaktdaten(antwort, d.get("content") or "", personen, mails)
+            am = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if args and link.startswith(("https://", "http://")):
+                args["quelle"] = "%s/documents/%d/details" % (link, d["id"])
+            rec.setdefault("kontakte", {})[str(d["id"])] = {"offen": args, "am": am} if args else {"status": "keiner", "verworfen": weg, "am": am}
+            if weg:
+                print("vertraege: %s (%d): vom Absender nicht übernommen: %s" % (d.get("title"), d["id"], ", ".join(weg)))
+        if fertig:
+            continue
+        gefuellt, verworfen = lesen(api, d, antwort, f, prüfen_tag, "rechnung" in arten, was)
         rec["dokumente"][str(d["id"])] = {"text": sha, "felder": sorted(f), "gefuellt": gefuellt, "verworfen": verworfen,
                                           "am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         print("vertraege: %s (%d): gefüllt %s%s" % (d.get("title"), d["id"], ", ".join(gefuellt) or "nichts",
                                                     "; prüfen: " + ", ".join(verworfen) if verworfen else ""))
+    if haus:
+        kontakte(api, rec, prüfen_tag)
 
     vorlauf = int(E.get("VERTRAG_VORLAUF_TAGE") or 28)
-    haus = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
     gemeldet, markiert = rec.setdefault("meldungen", {}), rec.setdefault("markiert", {})
     for d in sorted(docs.values(), key=lambda d: d["id"]):
         d = api("GET", "/api/documents/%d/" % d["id"]) if gelesen else d
