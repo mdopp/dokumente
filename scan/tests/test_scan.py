@@ -915,6 +915,140 @@ class Dienst(unittest.TestCase):
         self.assertIn("kein Modell eingerichtet", self.meldungen[-1][1])
         self.assertEqual(len(self.meldungen), 1)
 
+    # #831: the household model failing mid-split (llama restarted) is no nonsense stack
+
+    def bis_nachholen(self, frage, antwortet):
+        """a face-up stack whose split meets frage; the model's probe answers what antwortet[0] says"""
+        self.cfg.scanner, self.cfg.back_first = "fujitsu", False
+        self.runs(([leer(94), vorne(95, BRIEF_2), leer(96), vorne(97, FOLGE), leer(98), vorne(99, BRIEF_1)],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        alt = scan.modell_antwortet
+        scan.modell_antwortet = lambda cfg: antwortet[0]
+        self.addCleanup(setattr, scan, "modell_antwortet", alt)
+        jetzt = [1_000_000.0]
+        dienst = scan.Dienst(self.cfg, now=lambda: jetzt[0])
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage_ or frage)
+        self.auftrag(dienst, "start")
+        return dienst, jetzt
+
+    def test_a_model_that_drops_the_connection_files_nothing_and_splits_again_once_it_answers(self):
+        import http.client
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(gesendet(messages))
+            if len(gefragt) == 1:
+                raise http.client.RemoteDisconnected("Remote end closed connection without response")
+            return antwort([{"seite": 1, "neu": True}, {"seite": 2}, {"seite": 3, "neu": True}])
+        antwortet = ["Connection refused"]
+        dienst, jetzt = self.bis_nachholen(frage, antwortet)
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.consume, "Stapel")), "nothing filed until the split is redone")
+        self.assertEqual(len(self.meldungen), 1)
+        text = self.meldungen[0][1]
+        self.assertIn("Das Trennen wird nachgeholt, sobald das Hausmodell wieder antwortet", text)
+        self.assertNotIn("Stapel unsortiert", text)
+        self.assertNotIn("laib scan redo", text, "nobody has to act")
+        s = self.status()
+        zeit = s["stapel"]
+        self.assertEqual((s["zustand"], s["letzte"][0]["ende"]), ("bereit", "nachholen"), s)
+        self.assertIn("Das Trennen wird nachgeholt", s["detail"])
+        self.assertEqual(s["letzte"][0]["einzelheiten"], "Remote end closed connection without response", "the raw words beside, not in the message")
+        self.assertEqual([n["stapel"] for n in s["nachholen"]], [zeit])
+
+        jetzt[0] += 3600
+        dienst.tick()
+        self.assertEqual(len(gefragt), 1, "the probe fails: no try spent")
+        antwortet[0] = ""
+        dienst.tick()
+        self.assertEqual(len(gefragt), 1, "the model is asked whether it answers once a minute, not every tick")
+        jetzt[0] += 60
+        dienst.tick()
+        self.assertEqual(len(gefragt), 2, "the model answers again: the split is redone by itself")
+        self.assertEqual(self.abgelegt(), ["2021-02-03 ASV - Abfallgebühren.pdf", "2023-05-01 Mosel - Rechnung Schornsteinfeger.pdf"],
+                         "the split documents, never „Stapel unsortiert“ beside them")
+        self.assertEqual(len(self.meldungen), 2)
+        text = self.meldungen[1][1]
+        self.assertTrue(text.startswith("Scan fertig: 3 Blatt, 6 Seiten, 3 leer entfernt, 2 Dokumente"), text)
+        self.assertIn("Das Trennen ist nachgeholt.", text)
+        self.assertIn("die Reihenfolge ist umgedreht", text, "the face-up turn holds on the redo")
+        self.assertEqual([t.split()[0] for _, t in gefragt[1]], ["Stadtwerke", "Fortsetzung", "Tischlerei"])
+        s = self.status()
+        self.assertEqual([l["stapel"] for l in s["letzte"]], [zeit], "one line per stack under Letzte Stapel")
+        self.assertEqual((s["letzte"][0]["ende"], s["nachholen"]), ("fertig", []))
+        jetzt[0] += 86400
+        dienst.tick()
+        self.assertEqual(len(gefragt), 2, "done is done")
+
+    def test_not_before_its_wait_and_three_failed_tries_file_it_unsorted_and_say_so(self):
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(1)
+            raise TimeoutError("timed out")
+        dienst, jetzt = self.bis_nachholen(frage, [""])
+        dienst.tick()
+        self.assertEqual(len(gefragt), 1, "a model that answers the probe at once still waits out the back-off")
+        for warte in (600, 3600, 4 * 3600):
+            jetzt[0] += warte - 1
+            dienst.tick()
+            self.assertFalse(os.path.exists(os.path.join(self.cfg.consume, "Stapel")), "nothing filed while tries are left")
+            n = len(gefragt)
+            jetzt[0] += 1
+            dienst.tick()
+            self.assertEqual(len(gefragt), n + 1)
+        self.assertEqual(len(gefragt), 4, "the first split and 3 tries")
+        self.assertEqual(self.abgelegt(), ["Stapel unsortiert.pdf"])
+        self.assertEqual(len(self.meldungen), 2, "the tries in between are silent")
+        text = self.meldungen[-1][1]
+        self.assertIn("auch nach 3 Versuchen", text)
+        self.assertIn("Stapel unsortiert", text)
+        self.assertIn("laib scan redo --stapel", text)
+        s = self.status()
+        self.assertEqual((s["nachholen"], len(s["letzte"])), ([], 1))
+        jetzt[0] += 86400
+        dienst.tick()
+        self.assertEqual(len(gefragt), 4)
+
+    def test_a_day_without_the_model_files_it_unsorted(self):
+        dienst, jetzt = self.bis_nachholen(lambda m: (_ for _ in ()).throw(ConnectionRefusedError(111, "Connection refused")), ["Verbindung abgelehnt"])
+        jetzt[0] += 86399
+        dienst.tick()
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.consume, "Stapel")))
+        jetzt[0] += 1
+        dienst.tick()
+        self.assertEqual(self.abgelegt(), ["Stapel unsortiert.pdf"])
+        self.assertIn("einen Tag", self.meldungen[-1][1])
+        self.assertEqual(len(self.meldungen), 2)
+
+    def test_a_split_to_redo_waits_on_through_a_restart_and_a_redo_by_hand_settles_it(self):
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(1)
+            if len(gefragt) == 1:
+                raise scan.ModellWeg("Mira hält die Grafikkarte im Modus spiel")
+            return antwort([{"seite": 1, "neu": True}, {"seite": 2}, {"seite": 3, "neu": True}])
+        dienst, jetzt = self.bis_nachholen(frage, ["weg"])
+        zeit = self.status()["stapel"]
+        wieder = scan.Dienst(self.cfg, now=lambda: jetzt[0])
+        self.assertEqual([n["stapel"] for n in self.status()["nachholen"]], [zeit], "a restart keeps the stack waiting")
+        wieder.verarbeiten = lambda stapel, frage_=None, v=wieder.verarbeiten: v(stapel, frage_ or frage)
+        self.auftrag(wieder, "redo", stapel=zeit)
+        self.assertEqual(len(self.abgelegt()), 2)
+        self.assertEqual(self.status()["nachholen"], [])
+        jetzt[0] += 86400
+        wieder.tick()
+        self.assertEqual(len(gefragt), 2, "a redo by hand ends the wait: no second filing")
+
+    def test_a_restart_mid_redo_waits_on_instead_of_failing(self):
+        dienst, jetzt = self.bis_nachholen(lambda m: (_ for _ in ()).throw(TimeoutError("timed out")), ["weg"])
+        zeit = self.status()["stapel"]
+        dienst.zustand("trennt", "trennt 3 Seiten", dienst.nachholen[zeit])
+        scan.Dienst(self.cfg, now=lambda: jetzt[0])
+        s = self.status()
+        self.assertEqual((s["zustand"], [n["stapel"] for n in s["nachholen"]]), ("bereit", [zeit]), s)
+        self.assertEqual(len(self.meldungen), 1, "no FEHLER for a stack that is redone anyway")
+
     def test_a_probe_sheet_that_is_a_separator_says_so(self):
         self.runs(([strichcode(CODE128_PATCH_T)], "scanimage: sane_start: Document feeder out of documents"))
         dienst = scan.Dienst(self.cfg)
@@ -933,6 +1067,53 @@ class Dienst(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.cfg.consume, "Stapel")))
         self.assertFalse(os.path.exists(os.path.join(self.cfg.data, "probe")))
         self.assertEqual(self.meldungen, [])
+
+
+class Modell(unittest.TestCase):
+    """#831: what counts as the model failing, and the probe that says it is back"""
+
+    def test_a_failing_model_is_told_from_a_nonsense_answer(self):
+        import http.client, urllib.error
+        weg = [http.client.RemoteDisconnected("Remote end closed connection without response"), TimeoutError("timed out"),
+               urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")), ConnectionResetError(104, "reset"),
+               urllib.error.HTTPError("u", 503, "Service Unavailable", {}, None), scan.ModellWeg("die Karte ist verliehen")]
+        da = [ValueError("keine JSON-Antwort"), urllib.error.HTTPError("u", 400, "Bad Request", {}, None),
+              RuntimeError("kein Modell eingerichtet"), KeyError("choices")]
+        self.assertEqual([scan.modell_fehlt(e) for e in weg], [True] * len(weg))
+        self.assertEqual([scan.modell_fehlt(e) for e in da], [False] * len(da))
+
+    def test_a_card_lent_past_the_wait_is_the_model_failing(self):
+        cfg = scan.Config(model_url="http://127.0.0.1:1/v1", model_lease="http://127.0.0.1:1/api/model-lease", model_wait_s=0)
+        alt = scan.karte_vergeben
+        scan.karte_vergeben = lambda cfg: "Mira hält die Grafikkarte im Modus spiel"
+        self.addCleanup(setattr, scan, "karte_vergeben", alt)
+        with self.assertRaises(scan.ModellWeg):
+            scan.modell(cfg)([])
+
+    def test_the_probe_can_fail(self):
+        cfg = scan.Config(model_url="http://127.0.0.1:1/v1", model_lease="http://127.0.0.1:1/api/model-lease")
+        alt = scan.http_json, scan.karte_vergeben
+        self.addCleanup(lambda: (setattr(scan, "http_json", alt[0]), setattr(scan, "karte_vergeben", alt[1])))
+        antworten = {}
+        scan.karte_vergeben = lambda cfg: antworten.get("karte", "")
+
+        def http_json(url, method="GET", key="", body=None, timeout=30):
+            self.assertEqual((url, method), ("http://127.0.0.1:1/v1/models", "GET"))
+            if isinstance(antworten["models"], Exception):
+                raise antworten["models"]
+            return antworten["models"]
+        scan.http_json = http_json
+        # the lease's catalogue lists the household model even when the router behind it is down
+        antworten["models"] = {"object": "list", "data": [{"object": "model", "id": "haushalt", "allowed_in_mode": True}]}
+        self.assertTrue(scan.modell_antwortet(cfg))
+        antworten["models"] = {"object": "list", "data": [{"object": "model", "id": "haushalt", "allowed_in_mode": True, "status": {"value": "unloaded"}}]}
+        self.assertEqual(scan.modell_antwortet(cfg), "")
+        antworten["models"] = ConnectionRefusedError(111, "Connection refused")
+        self.assertIn("Connection refused", scan.modell_antwortet(cfg))
+        antworten["models"] = {"object": "list", "data": [{"object": "model", "id": "haushalt", "allowed_in_mode": True, "status": {}}]}
+        antworten["karte"] = "Mira hält die Grafikkarte im Modus spiel"
+        self.assertEqual(scan.modell_antwortet(cfg), "Mira hält die Grafikkarte im Modus spiel")
+        self.assertTrue(scan.modell_antwortet(scan.Config()))
 
 
 class Einrichtung(unittest.TestCase):

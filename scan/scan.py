@@ -34,12 +34,20 @@ never filed). Each stack is archived under
 answers modell-<fenster>.json, log.txt) for
 SCAN_KEEP_DAYS; `laib scan redo --stapel <zeit>` splits it again.
 
+A split the household model could not do because the model failed (the
+connection dropped, a timeout, a 5xx, the card lent past the wait; #831),
+not because the stack made no sense, files nothing: the stack waits in its
+archive, the message says the split will be redone, and the service redoes
+it by itself once the model answers again (the card free, the router behind
+the lease's proxy listing the model), at most NACHHOLEN times within a day,
+WARTEN apart. Only after that does it go to Paperless as „Stapel unsortiert“.
+
 Stdlib only, apart from Pillow and img2pdf for images and PDFs and libzbar
 (through ctypes) for the separators' codes; the command-line tools
 (scanimage, tesseract, pdftoppm, pdftotext, qpdf) come with the image
 (scan/Containerfile).
 """
-import concurrent.futures, ctypes, datetime, glob, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.request
+import concurrent.futures, ctypes, datetime, glob, http.client, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.error, urllib.request
 from dataclasses import dataclass, field
 
 ZEIT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
@@ -52,6 +60,8 @@ FAST_HELL = 0.88    # no text at all from here up: blank (#808), a photo is dark
 FENSTER, SCHRITT, AB_FENSTER = 30, 25, 40   # big stacks go to the model in overlapping windows
 EPSON2 = 1865       # the epson2 backend's network port (#589)
 TRENNER = "PATCH T" # a separator sheet's code (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING
+NACHHOLEN, EIN_TAG = 3, 86400    # a split the model failed: redone at most 3 times within a day (#831)
+WARTEN = (600, 3600, 4 * 3600)   # before each try, from the last failure: llama back from a restart, then longer
 
 
 @dataclass
@@ -79,7 +89,8 @@ class Config:
     poll_s: float = 2
     remind_s: float = 1800       # WARTET: one reminder after 30 min
     drop_s: float = 86400        # and dropped after a day
-    model_wait_s: float = 1800   # the card lent to another mode: wait this long, then unsorted
+    model_wait_s: float = 1800   # the card lent to another mode: wait this long, then the split is redone later (#831)
+    ping_s: float = 60           # a split to redo: the model asked whether it answers at most this often
     owner: tuple = (1000, 1000)  # Paperless' user (paperless.container USERMAP_UID): it removes what it filed
     suche_s: float = 3.0         # the direct search's whole budget, after the wake (#589)
     weck_s: float = 1.5          # the wake's wait for ARP answers
@@ -610,6 +621,34 @@ def karte_vergeben(cfg):
     return ""
 
 
+class ModellWeg(Exception):
+    """the household model did not answer: the card lent past the wait (#831)"""
+
+
+def modell_fehlt(e):
+    """the split failed because the model failed (connection, timeout, 5xx, the card), not the answer (#831)"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500
+    return isinstance(e, (ModellWeg, OSError, http.client.HTTPException))
+
+
+def modell_antwortet(cfg):
+    """"" when the household model answers now, else why not: the card lent, or the router behind the
+    lease's proxy silent. The proxy lists the household model either way; only the router's own
+    fields on it (its status) say the router answered (lease.go catalogue)"""
+    if not cfg.model_url:
+        return "kein Modell eingerichtet"
+    grund = karte_vergeben(cfg)
+    if grund:
+        return grund
+    try:
+        liste = http_json(cfg.model_url + "/models", key=cfg.model_key, timeout=10)
+    except Exception as e:
+        return str(e)[:160] or type(e).__name__
+    erstes = (liste.get("data") or [{}])[0]
+    return "" if set(erstes) - {"object", "id", "allowed_in_mode"} else "der Router hinter dem Proxy antwortet nicht"
+
+
 def modell(cfg, warte=None):
     """a function messages → answer text, asking the household model; it waits while the card is lent"""
     def frage(messages):
@@ -618,7 +657,7 @@ def modell(cfg, warte=None):
         bis = time.monotonic() + cfg.model_wait_s
         while (grund := karte_vergeben(cfg)):
             if time.monotonic() > bis:
-                raise RuntimeError(grund)
+                raise ModellWeg(grund)
             if warte:
                 warte(grund)
             time.sleep(30)
@@ -729,6 +768,7 @@ class Stapel:
     seit: float = 0                # WARTET since (epoch)
     erinnert: bool = False
     abgelegt: list = field(default_factory=list)  # file names in the consume folder
+    nachholen: dict = field(default_factory=dict)  # the model failed the split (#831): seit, versuche, naechster, grund
 
 
 class Dienst:
@@ -741,6 +781,8 @@ class Dienst:
         self.suche, self.pruefung = {}, {}   # the scanner's setup (#571), kept across every status
         self.aufgeraeumt = 0
         self.geblickt = 0          # the last status written: idle, a look follows blick_s later (#785)
+        self.nachholen = {}        # zeit → a stack whose split waits for the model (#831)
+        self.gepingt = 0           # when the model was last asked whether it answers
         os.makedirs(os.path.join(cfg.data, "auftrag"), exist_ok=True)
         self.wieder_an()
 
@@ -750,7 +792,10 @@ class Dienst:
         s = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "detail": detail,
              "zustand": zustand, "scanner": bool(self.cfg.scanner), "eingang": "scan-eingang",
              "stapel": stapel.zeit if stapel else "", "person": stapel.person if stapel else "", "letzte": self.letzte,
-             "suche": self.suche, "pruefung": self.pruefung}
+             "suche": self.suche, "pruefung": self.pruefung,
+             "nachholen": [{"stapel": z, "versuche": st.nachholen.get("versuche", 0), "grund": st.nachholen.get("grund", ""),
+                            "naechster": datetime.datetime.fromtimestamp(st.nachholen.get("naechster", 0), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                           for z, st in sorted(self.nachholen.items())]}
         s.update(mehr)
         if zustand == "fehler":
             s["findings"] = [{"severity": "gelb", "detail": "Der letzte Stapel ist fehlgeschlagen: " + detail,
@@ -758,19 +803,29 @@ class Dienst:
         elif zustand == "wartet-auf-rest":
             s["findings"] = [{"severity": "info", "detail": "Ein Stapel wartet auf den Rest: " + detail,
                               "fix": "laib scan weiter | abschliessen | verwerfen"}]
+        elif self.nachholen:
+            z = min(self.nachholen)
+            s["findings"] = [{"severity": "info", "detail": "Das Trennen von Stapel %s wird nachgeholt, sobald das Hausmodell wieder antwortet" % z,
+                              "fix": "nichts zu tun; sofort: laib scan redo --stapel %s" % z}]
         self.status, self.geblickt = s, self.now()
         pfad = os.path.join(self.cfg.data, "laib-status.json")
         with open(pfad + ".tmp", "w") as f:
             json.dump(s, f, ensure_ascii=False, indent=1)
         os.replace(pfad + ".tmp", pfad)
 
-    def ende(self, stapel, ende, meldung, dokumente=(), **zahlen):
-        """the stack's one closing message, its line in the status's last stacks"""
-        melde(self.cfg, stapel.person, meldung)
+    def ende(self, stapel, ende, meldung, dokumente=(), melden=True, **zahlen):
+        """the stack's closing message, its one line in the status's last stacks; a split to redo
+        (#831) says so once, and its outcome replaces that line"""
+        if melden:
+            melde(self.cfg, stapel.person, meldung)
+        if stapel.nachholen:
+            self.nachholen[stapel.zeit] = stapel
+        else:
+            self.nachholen.pop(stapel.zeit, None)
         self.letzte = ([{"stapel": stapel.zeit, "ende": ende, "quelle": stapel.quelle, "datei": stapel.datei,
                          "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "dokumente": [{"titel": t[:-4], "datei": t} for t in dokumente], "meldung": meldung, **zahlen}]
-                       + self.letzte)[:10]
+                       + [l for l in self.letzte if l.get("stapel") != stapel.zeit])[:10]
         zu = {"fertig": "fertig", "fehler": "fehler"}.get(ende, "bereit")
         self.zustand(zu, meldung.splitlines()[0], stapel)
         self.speichern(stapel, ende=ende)
@@ -807,9 +862,20 @@ class Dienst:
             alt = {}
         self.letzte = alt.get("letzte") or []
         self.suche, self.pruefung = alt.get("suche") or {}, alt.get("pruefung") or {}
+        for pfad in sorted(glob.glob(os.path.join(self.cfg.data, "*", "stapel.json"))):
+            try:
+                with open(pfad) as f:
+                    raw = json.load(f)
+                if raw.get("nachholen") and not raw.get("abgelegt"):
+                    st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
+                    self.nachholen[st.zeit] = st
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
         zeit = alt.get("stapel") or ""
         stapel = None
-        if ZEIT.match(zeit):
+        if zeit in self.nachholen:
+            stapel = self.nachholen[zeit]
+        elif ZEIT.match(zeit):
             try:
                 with open(os.path.join(self.cfg.data, zeit, "stapel.json")) as f:
                     raw = json.load(f)
@@ -820,7 +886,11 @@ class Dienst:
             self.offen = stapel
             self.zustand("wartet-auf-rest", alt.get("detail") or "", stapel, blatt=stapel.blatt + 1, grund=stapel.grund)
             return
+        if stapel and stapel.zeit in self.nachholen and alt.get("zustand") == "trennt":
+            self.blick()   # cut off in a redo before anything was filed: the next try redoes it (#831)
+            return
         if stapel and alt.get("zustand") in ("scannt", "trennt", "legt-ab"):
+            stapel.nachholen = {}
             schon = "Schon in Paperless: %d Dokumente." % len(stapel.abgelegt) if stapel.abgelegt else "In Paperless liegt noch nichts davon."
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: Der Dienst wurde mitten im Stapel neu gestartet. %s "
                       "Neu trennen: „laib scan redo --stapel %s“." % (schon, stapel.zeit))
@@ -856,6 +926,8 @@ class Dienst:
             datei = self.eingang_fertig()
             if datei:
                 self.ordner_stapel(datei)
+            elif self.nachholen:
+                self.nachholen_pruefen()
         if self.now() - self.aufgeraeumt > 3600:
             self.aufraeumen()
         if not self.offen and self.status.get("zustand") in ("bereit", "fertig") and self.now() - self.geblickt >= self.cfg.blick_s:
@@ -900,6 +972,9 @@ class Dienst:
             was = "%d Dokumente abgelegt" % len(l.get("dokumente") or []) if l.get("ende") == "fertig" else (l.get("ende") or "")
             if tag and was:
                 teile.append("zuletzt am %s: %s" % (tag, was))
+        if self.nachholen:
+            teile.append("%d Stapel warten aufs Hausmodell, das Trennen wird nachgeholt" % len(self.nachholen)
+                         if len(self.nachholen) > 1 else "1 Stapel wartet aufs Hausmodell, das Trennen wird nachgeholt")
         self.zustand("bereit", " · ".join(teile))
 
     def auftrag(self, a):
@@ -1227,6 +1302,7 @@ class Dienst:
             self._verarbeiten(stapel, frage or modell(self.cfg, lambda g: self.zustand("trennt", "wartet auf das Modell: " + g, stapel)))
         except Exception as e:
             log(traceback.format_exc())
+            stapel.nachholen = {}   # broken otherwise: a redo would end the same way
             schon = ("Schon in Paperless: %s." % ", ".join(stapel.abgelegt)) if stapel.abgelegt else "In Paperless liegt nichts davon."
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: %s. %s Neu versuchen: „laib scan redo --stapel %s“." % (str(e).rstrip("."), schon, stapel.zeit), stapel.abgelegt)
 
@@ -1249,7 +1325,25 @@ class Dienst:
             try:
                 docs, leer_modell = trennen(inhalt, frage, roh)
             except Exception as e:
-                hinweis = "Das Modell konnte nicht trennen (%s): alles liegt als ein Dokument „Stapel unsortiert“ in Paperless." % str(e)[:160]
+                n, grund = stapel.nachholen or {"seit": self.now(), "versuche": 0}, str(e)[:160] or type(e).__name__
+                if modell_fehlt(e) and n["versuche"] < NACHHOLEN and self.now() - n["seit"] < EIN_TAG:
+                    # the model failed, not the stack (#831): nothing filed, the split redone once it answers
+                    stapel.nachholen = {**n, "grund": grund, "naechster": self.now() + WARTEN[n["versuche"]]}
+                    self.protokoll(stapel, "das Modell antwortet nicht (%s): das Trennen wird nachgeholt, Versuch %d von %d"
+                                   % (grund, n["versuche"] + 1, NACHHOLEN))
+                    kopf = ("%d Blatt, " % ((len(seiten) + 1) // 2 if self.cfg.duplex else len(seiten))) if stapel.quelle == "scanner" else ("%s: " % stapel.datei)
+                    self.ende(stapel, "nachholen", "Scan wartet: Das Trennen wird nachgeholt, sobald das Hausmodell wieder antwortet.\n"
+                              "%s%d Seiten gelesen; bis dahin liegt nichts davon in Paperless." % (kopf, len(seiten)),
+                              melden=not n["versuche"], seiten=len(seiten), einzelheiten=grund)
+                    return
+                if not modell_fehlt(e):
+                    hinweis = "Das Modell konnte nicht trennen (%s): alles liegt als ein Dokument „Stapel unsortiert“ in Paperless." % grund
+                elif n["versuche"] >= NACHHOLEN:
+                    hinweis = ("Das Hausmodell konnte auch nach %d Versuchen nicht trennen (%s): alles liegt als ein Dokument „Stapel unsortiert“ "
+                               "in Paperless. Neu trennen: „laib scan redo --stapel %s“." % (n["versuche"], grund, stapel.zeit))
+                else:
+                    hinweis = ("Das Hausmodell hat einen Tag lang nicht geantwortet (%s): alles liegt als ein Dokument „Stapel unsortiert“ "
+                               "in Paperless. Neu trennen: „laib scan redo --stapel %s“." % (grund, stapel.zeit))
                 for s in inhalt:
                     s.leer, s.warum = False, ""
                 docs, leer_modell = [Dokument(seiten=inhalt, titel="Stapel unsortiert")], []
@@ -1288,14 +1382,36 @@ class Dienst:
             text += "\n" + lage(self.cfg.scanner)
         if hinweis:
             text += "\n" + hinweis
+        elif stapel.nachholen:
+            text += "\nDas Trennen ist nachgeholt."
+        stapel.nachholen = {}
         self.ende(stapel, "fertig", text, stapel.abgelegt, seiten=len(seiten), leer=leer)
+
+    def nachholen_pruefen(self):
+        """the next split to redo (#831): after its wait, once the model answers; after a day, unsorted"""
+        stapel = min(self.nachholen.values(), key=lambda s: s.nachholen.get("naechster", 0))
+        n, jetzt_ = stapel.nachholen, self.now()
+        if jetzt_ - n.get("seit", 0) >= EIN_TAG:
+            def tag_um(messages):
+                raise ModellWeg(n.get("grund") or "keine Antwort")
+            return self.verarbeiten(stapel, tag_um)
+        if jetzt_ < n.get("naechster", 0) or jetzt_ - self.gepingt < self.cfg.ping_s:
+            return
+        self.gepingt = jetzt_
+        grund = modell_antwortet(self.cfg)
+        if grund:
+            log("nachholen %s: das Modell antwortet noch nicht (%s)" % (stapel.zeit, grund))
+            return
+        n["versuche"] = n.get("versuche", 0) + 1
+        self.protokoll(stapel, "das Modell antwortet wieder: Trennen nachholen, Versuch %d von %d" % (n["versuche"], NACHHOLEN))
+        self.verarbeiten(stapel)
 
     def aufraeumen(self):
         self.aufgeraeumt = self.now()
         grenze = self.now() - self.cfg.keep_days * 86400
         for pfad in glob.glob(os.path.join(self.cfg.data, "*")):
             zeit = os.path.basename(pfad)
-            if not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit:
+            if not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit or zeit in self.nachholen:
                 continue
             try:
                 alt = os.path.getmtime(os.path.join(pfad, "stapel.json")) < grenze
