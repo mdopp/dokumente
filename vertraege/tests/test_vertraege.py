@@ -4,7 +4,7 @@ a contract's text, keeps only values the text backs up word for word, fills
 only empty fields, notes what it filled, and makes one reminder in Haus's
 Haushalt per document and notice date. Against a fake Paperless, a fake model
 and a fake Haus, never real ones; no real names or addresses."""
-import base64, json, os, subprocess, sys, tempfile, threading, unittest
+import base64, hashlib, json, os, subprocess, sys, tempfile, threading, unittest, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -12,8 +12,8 @@ DIR = Path(__file__).resolve().parent.parent
 SCRIPT = DIR / "paperless-vertraege.py"
 AUTH = "Basic " + base64.b64encode(b"admin:adminpw").decode()
 NAMES = ["Anbieter", "Vertragsnummer", "Vertragsbeginn", "Vertragsende", "Kündigungsfrist",
-         "Nächster Kündigungstermin", "Betrag", "Zahlungsintervall"]
-KINDS = ["string", "string", "date", "date", "string", "date", "monetary", "string"]
+         "Nächster Kündigungstermin", "Betrag", "Zahlungsintervall", "Rechnungsnummer", "Fällig am", "Verwendungszweck"]
+KINDS = ["string", "string", "date", "date", "string", "date", "monetary", "string", "string", "date", "string"]
 F = {n: i + 1 for i, n in enumerate(NAMES)}   # field ids
 OTHER = 20                                    # a custom field of the owner's, not a contract field
 TEXT = ("Stadtwerke Beispielstadt GmbH\nIhr Stromvertrag Nr. SW-12345\nVertragsbeginn: 01.04.2026\n"
@@ -44,13 +44,13 @@ def body_of(h):
 class Paperless:
     """documents with custom fields and tags, document types, tags, notes: in memory"""
 
-    def __init__(self, docs, types=None, tags=None, users=None, correspondents=None):
+    def __init__(self, docs, types=None, tags=None, users=None, correspondents=None, names=NAMES):
         self.docs, self.calls, self.notes, self.bulk, self.v3 = docs, [], {}, [], True
         self.users = users if users is not None else [{"id": 1, "username": "admin", "first_name": "", "last_name": ""}]
         self.correspondents = correspondents if correspondents is not None else []
         self.types = types if types is not None else [{"id": 1, "name": "Vertrag"}, {"id": 2, "name": "Rechnung"}]
         self.tags = tags if tags is not None else [{"id": 1, "name": "Versicherung"}]
-        self.fields = [{"id": F[n], "name": n, "data_type": k} for n, k in zip(NAMES, KINDS)] + [
+        self.fields = [{"id": F[n], "name": n, "data_type": k} for n, k in zip(NAMES, KINDS) if n in names] + [
             {"id": OTHER, "name": "Ablageort", "data_type": "string"}]
         fake = self
 
@@ -96,6 +96,9 @@ class Paperless:
                     if "tags__id__in" in q:
                         ids = {int(i) for i in q["tags__id__in"].split(",")}
                         out = [d for d in out if ids & set(d.get("tags") or [])]
+                    if "title__icontains" in q:
+                        w = urllib.parse.unquote(q["title__icontains"]).casefold()
+                        out = [d for d in out if w in (d.get("title") or "").casefold()]
                     return reply(self, 200, {"next": None, "results": out})
                 parts = path.strip("/").split("/")
                 if parts[:2] == ["api", "documents"] and len(parts) >= 3 and parts[2].isdigit():
@@ -151,11 +154,17 @@ class Model:
         self.srv, self.url = serve(H)
 
 
-class Haus:
-    """Haus's /mcp/haushalt: tools/call erinnerung_anlegen"""
+def kontakt_angelegt(args):
+    """Haus's kontakt_ergaenzen on an empty address book (haus#164): a German line, then one JSON line"""
+    return False, "Kontakt „%s“ angelegt.\n%s" % (args.get("firma"), json.dumps(
+        {"status": "angelegt", "kontakt": "uid-1", "felder": {k: "angelegt" for k in args if k != "quelle"}, "gruende": {}}))
 
-    def __init__(self):
-        self.calls = []
+
+class Haus:
+    """Haus's /mcp/haushalt: tools/call erinnerung_anlegen, kontakt_ergaenzen (#820)"""
+
+    def __init__(self, kontakt=kontakt_angelegt):
+        self.calls, self.kontakt, self.ohne_kontakte = [], kontakt, False
         fake = self
 
         class H(BaseHTTPRequestHandler):
@@ -169,12 +178,20 @@ class Haus:
                     return
                 b = body_of(self)
                 fake.calls.append(b)
+                if b["params"]["name"] == "kontakt_ergaenzen":
+                    if fake.ohne_kontakte:   # a Haus before haus#164, or without Radicale: the tool is not listed
+                        return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "error": {"code": -32602, "message": "unknown tool: kontakt_ergaenzen"}})
+                    fehler, text = fake.kontakt(b["params"]["arguments"])
+                    return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": text}], "isError": fehler}})
                 reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": "Erinnerung angelegt"}], "isError": False}})
 
         self.srv, self.url = serve(H)
 
     def reminders(self):
         return [c["params"]["arguments"] for c in self.calls if c["params"]["name"] == "erinnerung_anlegen"]
+
+    def kontakte(self):
+        return [c["params"]["arguments"] for c in self.calls if c["params"]["name"] == "kontakt_ergaenzen"]
 
 
 def vertrag(i=1, fields=None, typ=1, tags=None, text=TEXT, title="Stromvertrag", correspondent=None):
@@ -192,7 +209,9 @@ ANSWER = {"Anbieter": {"wert": "Stadtwerke Beispielstadt GmbH", "beleg": "Stadtw
           "Zahlungsintervall": {"wert": "monatlich", "beleg": "84,50 EUR monatlich"}}
 
 
-class Vertraege(unittest.TestCase):
+class Lauf(unittest.TestCase):
+    """one run of the script as the unit feeds it, against the fakes"""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.record = os.path.join(self.tmp, "laib-vertraege.json")
@@ -208,6 +227,8 @@ class Vertraege(unittest.TestCase):
         # as the unit feeds it: the script on stdin
         return subprocess.run([sys.executable, "-"], input=SCRIPT.read_text(), env=env, capture_output=True, text=True, timeout=60)
 
+
+class Vertraege(Lauf):
     def test_fills_only_empty_fields_keeps_the_owners_and_notes_what_it_filled(self):
         p = Paperless([vertrag(fields={F["Anbieter"]: "Meine Stadtwerke", F["Betrag"]: None, OTHER: "Ordner 3"})])
         m = Model(ANSWER)
@@ -259,13 +280,15 @@ class Vertraege(unittest.TestCase):
 
     def test_only_contracts_by_type_or_tag_and_only_with_an_empty_field(self):
         full = {F[n]: "x" for n in NAMES}
-        p = Paperless([vertrag(1, typ=2, title="Rechnung"), vertrag(2, typ=None, tags=[1]), vertrag(3, fields=full)])
+        rechnung = {F["Betrag"]: "EUR10.00", F["Rechnungsnummer"]: "R-1", F["Fällig am"]: "2026-01-31",
+                    F["Verwendungszweck"]: "R-1"}   # #818: an invoice, its fields full
+        p = Paperless([vertrag(1, typ=2, title="Rechnung", fields=rechnung), vertrag(2, typ=None, tags=[1]), vertrag(3, fields=full)])
         m = Model(ANSWER)
         r = self.run_job(p, m)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(m.asks), 1, "the invoice is no contract, the full one has nothing to fill")
         self.assertEqual(p.value(2, F["Vertragsnummer"]), "SW-12345", "tagged Versicherung: a contract")
-        self.assertEqual(p.doc(1)["custom_fields"], [])
+        self.assertIsNone(p.value(1, F["Vertragsnummer"]))
 
     def test_model_away_changes_nothing_and_the_next_run_asks_again(self):
         p = Paperless([vertrag()])
@@ -410,8 +433,8 @@ class Vertraege(unittest.TestCase):
 
     # #721 (c): a text layer that is letter salad is recognised again, a few a run
     def test_letter_salad_is_recognised_again_once_and_marked_when_it_stays(self):
-        docs = [vertrag(i, typ=2, title="Scan %d" % i, text=SALAT) for i in range(1, 6)]
-        docs += [vertrag(6, typ=2, title="Brief", text=BRIEF), vertrag(7, typ=2, title="Rechnung", text=RECHNUNG),
+        docs = [vertrag(i, typ=None, title="Scan %d" % i, text=SALAT) for i in range(1, 6)]
+        docs += [vertrag(6, typ=2, title="Brief", text=BRIEF, fields=VOLL), vertrag(7, typ=2, title="Rechnung", text=RECHNUNG, fields=VOLL),
                  vertrag(8, title="Vertrag", text=SALAT)]
         p, m = Paperless(docs), Model(ANSWER)
         r = self.run_job(p, m)
@@ -476,6 +499,422 @@ KORR = [{"id": 1, "name": "Erika Mustermann"}, {"id": 2, "name": "Stadtwerke Bei
         {"id": 6, "name": "Kim"}, {"id": 7, "name": "Erika Mustermann Immobilien GmbH"}, {"id": 8, "name": "Erika"},
         {"id": 9, "name": "Frau Lena Mustermann"}, {"id": 10, "name": "Herrn Dr. Jörg Beispiel-Weiß"}]
 OK_TAG = 50
+
+
+# #818: invented invoices, as OCR and mail deliver them
+MALER = ("Malerbetrieb Beispiel GmbH\nMusterweg 3, 12345 Beispielstadt\nRechnungsdatum: 04.05.2026\nRech.-\nNr.: 2026/\n0042\n"
+         "Leistung: Fassadenanstrich\nNettobetrag 1.037,45 €\nzzgl. 19 % MwSt. 197,11 €\nGesamtbetrag 1.234,56 €\n"
+         "zahlbar bis 18.05.2026 ohne Abzug")
+SHOP = ("Online-Shop Beispiel\nRechnung Nr. RE-88123\nRechnungsdatum 02.03.2026\nKundennummer K-555\n"
+        "Rechnungsbetrag: EUR 87,00\nZahlungsziel 14 Tage")
+MALER_ANTWORT = {"Betrag": {"wert": "1.234,56 €", "beleg": "Gesamtbetrag 1.234,56 €"},
+                 "Rechnungsnummer": {"wert": "2026/0042", "beleg": "Rech.-Nr.: 2026/0042"},
+                 "Fällig am": {"wert": "2026-05-18", "beleg": "zahlbar bis 18.05.2026"}}
+SHOP_ANTWORT = {"Betrag": {"wert": 87, "beleg": "Rechnungsbetrag: EUR 87,00"},
+                "Rechnungsnummer": {"wert": "RE-88123", "beleg": "Rechnung Nr. RE-88123"},
+                "Fällig am": None,
+                "Rechnungsdatum": {"wert": "2026-03-02", "beleg": "Rechnungsdatum 02.03.2026"},
+                "Zahlungsziel": {"wert": "14 Tage", "beleg": "Zahlungsziel 14 Tage"}}
+VOLL = {F["Betrag"]: "EUR57.62", F["Rechnungsnummer"]: "2026-0042", F["Fällig am"]: "2026-05-26", F["Verwendungszweck"]: "2026-0042"}   # an invoice with nothing to fill
+
+
+def rechnung(i=1, text=MALER, title="2026-05-04 Malerbetrieb Beispiel - Rechnung Fassade", typ=None, tags=None, fields=None):
+    return vertrag(i, typ=typ, tags=tags, text=text, title=title, fields=fields)
+
+
+class Rechnungen(Lauf):
+    """#818: the same reader fills Betrag, Rechnungsnummer and Fällig am of an invoice"""
+
+    def prüfen(self, p, i):
+        t = next((t for t in p.tags if t["name"] == "prüfen"), None)
+        return t is not None and t["id"] in p.doc(i)["tags"]
+
+    def test_a_scanned_invoice_by_its_title_fills_amount_number_and_due_date(self):
+        p, m = Paperless([rechnung()]), Model(MALER_ANTWORT)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Betrag"]), "EUR1234.56", "„1.234,56 €“ is 1234.56")
+        self.assertEqual(p.value(1, F["Rechnungsnummer"]), "2026/0042", "the number OCR split across lines, joined")
+        self.assertEqual(p.value(1, F["Fällig am"]), "2026-05-18")
+        self.assertIsNone(p.value(1, F["Anbieter"]), "an invoice is asked for no contract field")
+        self.assertFalse(self.prüfen(p, 1))
+        self.assertIn("Rechnungsdaten aus dem Text übernommen (laib): Betrag, Rechnungsnummer, Fällig am.", p.notes[1][0])
+        _, headers, body = m.asks[0]
+        self.assertEqual(headers.get("X-Laib-Background"), "paperless", "background work, as the contracts")
+        ask = body["messages"][-1]["content"]
+        self.assertIn("Rechnungsnummer", ask)
+        self.assertNotIn("Kündigungsfrist", ask)
+        self.run_job(p, m)
+        self.assertEqual(len(m.asks), 1, "once per text")
+
+    def test_only_the_scan_services_art_at_the_titles_start_makes_an_invoice(self):
+        p = Paperless([rechnung(1, title="Rechnung 2026-0042"), rechnung(2, title="2026-05-04 Mosel - Rechnung Schornsteinfeger"),
+                       rechnung(3, title="Mahnung zur Rechnung 4711"), rechnung(4, title="2026-05-04 Mosel - Rechnungskorrektur"),
+                       rechnung(5, title="Brief", tags=[7]), rechnung(6, title="Brief", typ=2)],
+                      tags=[{"id": 1, "name": "Versicherung"}, {"id": 7, "name": "rechnung"}])
+        m = Model(MALER_ANTWORT)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([i for i in range(1, 7) if p.value(i, F["Betrag"])], [1, 2, 5, 6],
+                         "by title, by tag, by document type; a reminder about an invoice is none")
+
+    def test_a_payment_term_counts_from_the_invoice_date(self):
+        p = Paperless([rechnung(text=SHOP, title="Ihre Bestellung", typ=2)])
+        r = self.run_job(p, Model(SHOP_ANTWORT))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Betrag"]), "EUR87.00", "„EUR 87,00“")
+        self.assertEqual(p.value(1, F["Rechnungsnummer"]), "RE-88123")
+        self.assertEqual(p.value(1, F["Fällig am"]), "2026-03-16", "02.03.2026 and 14 days")
+        self.assertFalse(self.prüfen(p, 1))
+        self.assertIn("Fällig am: Rechnungsdatum 02.03.2026 und „Zahlungsziel 14 Tage“", p.notes[1][0])
+
+    def test_a_payment_term_without_the_invoice_date_or_from_receipt_is_left_to_the_owner(self):
+        ohne = {**SHOP_ANTWORT, "Rechnungsdatum": None}
+        eingang = {**SHOP_ANTWORT, "Zahlungsziel": {"wert": "14 Tage", "beleg": "Zahlungsziel 14 Tage nach Erhalt der Rechnung"}}
+        for antwort, text in ((ohne, SHOP), (eingang, SHOP + " nach Erhalt der Rechnung")):
+            p = Paperless([rechnung(text=text, typ=2)])
+            r = self.run_job(p, Model(antwort))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNone(p.value(1, F["Fällig am"]), "no day is guessed")
+            self.assertEqual(p.value(1, F["Betrag"]), "EUR87.00", "the rest is filled")
+            self.assertTrue(self.prüfen(p, 1))
+            self.assertIn("Fällig am", p.notes[1][0].split("prüfen", 1)[1])
+            os.remove(self.record)
+
+    def test_a_due_date_or_amount_not_in_its_words_is_not_taken(self):
+        text = SHOP.replace("Zahlungsziel 14 Tage", "Der Betrag ist fällig am 30.06.2026.")
+        antwort = {"Betrag": {"wert": 870, "beleg": "Rechnungsbetrag: EUR 87,00"},
+                   "Rechnungsnummer": {"wert": "RE-88124", "beleg": "Rechnung Nr. RE-88123"},
+                   "Fällig am": {"wert": "2026-06-03", "beleg": "fällig am 30.06.2026"}}
+        p = Paperless([rechnung(text=text, typ=2)])
+        r = self.run_job(p, Model(antwort))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([p.value(1, F[n]) for n in ("Betrag", "Rechnungsnummer", "Fällig am")], [None, None, None])
+        self.assertTrue(self.prüfen(p, 1))
+        for n in ("Betrag", "Rechnungsnummer", "Fällig am"):
+            self.assertIn(n, p.notes[1][0])
+
+    def test_a_credit_note_or_a_negative_sum_is_never_an_invoice_amount(self):
+        gutschrift = "Online-Shop Beispiel\nGutschrift Nr. GS-551\nzur Rechnung RE-88123\nWir erstatten Ihnen 49,90 €."
+        minus = "Stadtwerke Beispielstadt\nRechnung Nr. 4711\nRechnungsbetrag -25,00 €"
+        dollar = "Example Shop\nRechnung Nr. 4712\nGesamtbetrag USD 87.00"
+        cases = [(gutschrift, {"wert": 49.9, "beleg": "erstatten Ihnen 49,90 €"}, "Gutschrift"),
+                 (minus, {"wert": -25, "beleg": "Rechnungsbetrag -25,00 €"}, "negativ"),
+                 (minus, {"wert": "25,00", "beleg": "Rechnungsbetrag -25,00 €"}, "negativ"),
+                 (dollar, {"wert": 87, "beleg": "Gesamtbetrag USD 87.00"}, "Euro")]
+        for text, betrag, warum in cases:
+            p = Paperless([rechnung(text=text, tags=[1])], tags=[{"id": 1, "name": "Rechnung"}])
+            r = self.run_job(p, Model({"Betrag": betrag}))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIsNone(p.value(1, F["Betrag"]), text)
+            self.assertTrue(self.prüfen(p, 1), "never silently: %s" % text)
+            self.assertIn(warum, p.notes[1][0])
+            os.remove(self.record)
+
+    def test_the_owners_value_stays_and_a_contract_keeps_its_regular_amount(self):
+        p = Paperless([rechnung(fields={F["Betrag"]: "EUR10.00"}), vertrag(2)])
+        r = self.run_job(p, Model({**ANSWER, **MALER_ANTWORT, "Betrag": {"wert": 84.5, "beleg": "84,50 EUR"}}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Betrag"]), "EUR10.00", "a value the owner set is never changed")
+        self.assertFalse(self.prüfen(p, 1), "a value not taken for a field the owner filled is no reason to look")
+        self.assertEqual(p.value(1, F["Rechnungsnummer"]), "2026/0042")
+        self.assertEqual(p.value(2, F["Betrag"]), "EUR84.50", "the contract's Betrag, read as before")
+        self.assertIsNone(p.value(2, F["Rechnungsnummer"]), "a contract is asked for no invoice field")
+
+    def test_at_most_pro_lauf_documents_a_run_older_invoices_bit_by_bit(self):
+        p = Paperless([rechnung(i, typ=2) for i in range(1, 13)])
+        m = Model(MALER_ANTWORT)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(m.asks), 10)
+        self.assertIn("im nächsten Lauf", r.stdout)
+        self.assertEqual([i for i in range(1, 13) if p.value(i, F["Betrag"])], list(range(1, 11)), "the oldest first")
+        self.run_job(p, m)
+        self.assertEqual(len(m.asks), 12)
+
+    def test_a_contract_read_before_is_asked_again_once_when_it_is_also_an_invoice(self):
+        d = rechnung(typ=1)   # a contract by its type, an invoice by its title
+        sha = hashlib.sha256(d["content"].encode()).hexdigest()[:16]
+        with open(self.record, "w") as f:   # the record of a run before #818: no "felder"
+            json.dump({"dokumente": {"1": {"text": sha, "gefuellt": [], "verworfen": []}}}, f)
+        p, m = Paperless([d]), Model(MALER_ANTWORT)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(m.asks), 1)
+        self.assertEqual(p.value(1, F["Rechnungsnummer"]), "2026/0042")
+        self.run_job(p, m)
+        self.assertEqual(len(m.asks), 1)
+
+    def test_without_the_invoice_fields_contracts_are_read_and_it_says_so(self):
+        p = Paperless([rechnung(1, typ=2), vertrag(2)], names=NAMES[:8])
+        m = Model(ANSWER)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(m.asks), 1)
+        self.assertEqual(p.value(2, F["Vertragsnummer"]), "SW-12345")
+        self.assertIn("Rechnungsnummer", r.stdout)
+        self.assertIn("laib apply paperless", r.stdout)
+
+    # the payment reference the invoice asks for (#820)
+    def zweck(self, text, zweck, extra=None):
+        p = Paperless([rechnung(text=text, typ=2)])
+        r = self.run_job(p, Model({**SHOP_ANTWORT, **(extra or {}), "Verwendungszweck": zweck}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.remove(self.record)
+        return p.value(1, F["Verwendungszweck"]), self.prüfen(p, 1), p.value(1, F["Rechnungsnummer"])
+
+    def test_the_payment_reference_the_invoice_asks_for(self):
+        bitte = SHOP + "\nBitte als Verwendungszweck angeben: RE-88123 K-555"
+        self.assertEqual(self.zweck(bitte, {"wert": "RE-88123 K-555", "beleg": "Bitte als Verwendungszweck angeben: RE-88123 K-555"}),
+                         ("RE-88123 K-555", False, "RE-88123"))
+        amt = ("Stadtkasse Beispielstadt\nGebührenbescheid\nRechnung Nr. GB-2026-17\nBetrag: 87,00 EUR\n"
+               "Kassenzeichen: 5.123.456.789 – bei Zahlung bitte unbedingt angeben")
+        self.assertEqual(self.zweck(amt, {"wert": "5.123.456.789", "beleg": "Kassenzeichen: 5.123.456.789"}, {
+            "Betrag": {"wert": 87, "beleg": "Betrag: 87,00 EUR"}, "Rechnungsnummer": {"wert": "GB-2026-17", "beleg": "Rechnung Nr. GB-2026-17"}})[0],
+            "5.123.456.789", "an authority's Kassenzeichen")
+        lastschrift = SHOP + "\nDer Betrag wird per SEPA-Lastschrift eingezogen. Mandatsreferenz: MR-0099-ABC"
+        self.assertEqual(self.zweck(lastschrift, {"wert": "MR-0099-ABC", "beleg": "Mandatsreferenz: MR-0099-ABC"})[0], "MR-0099-ABC",
+                         "a direct debit's mandate reference is still recorded")
+        ref = SHOP + "\nZahlungsreferenz: ZR-77881"
+        self.assertEqual(self.zweck(ref, {"wert": "ZR-77881", "beleg": "Zahlungsreferenz: ZR-77881"})[0], "ZR-77881")
+
+    def test_no_payment_reference_named_stays_empty_without_pruefen(self):
+        self.assertEqual(self.zweck(SHOP, None), (None, False, "RE-88123"), "none named: empty, and no reason to look")
+        self.assertEqual(self.zweck(SHOP, {"wert": "RE-88123", "beleg": "Rechnung Nr. RE-88123"}), (None, False, "RE-88123"),
+                         "the invoice number is no payment reference unless the invoice says so")
+
+    def test_the_households_own_reference_is_never_the_payment_reference(self):
+        text = ("Familie Erika Mustermann\nReferenz EM-55\nMusterstraße 1\n12345 Beispielstadt\n" + SHOP +
+                "\nIhre Referenz: EM-2026-07\nZahlungsreferenz: ZR-77881")
+        empf = {"Empfänger": {"wert": "Familie Erika Mustermann", "beleg": "Familie Erika Mustermann Referenz EM-55 Musterstraße 1"}}
+        self.assertEqual(self.zweck(text, {"wert": "EM-2026-07", "beleg": "Ihre Referenz: EM-2026-07"}, empf)[:2], (None, False),
+                         "„Ihre Referenz“ is the household's own")
+        self.assertEqual(self.zweck(text, {"wert": "EM-55", "beleg": "Referenz EM-55"}, empf)[:2], (None, False), "in the recipient block")
+        self.assertEqual(self.zweck(text, {"wert": "ZR-77881", "beleg": "Zahlungsreferenz: ZR-77881"}, empf)[0], "ZR-77881")
+
+    def test_a_payment_reference_not_in_the_text_is_marked(self):
+        self.assertEqual(self.zweck(SHOP + "\nVerwendungszweck: K-555", {"wert": "K-556", "beleg": "Verwendungszweck: K-556"})[:2],
+                         (None, True), "a reference the text does not back is a guess: the family looks")
+
+    def test_the_unit_hands_the_invoice_kinds_on(self):
+        self.assertIn("Environment=RECHNUNG_ARTEN=${RECHNUNG_ARTEN}", (DIR / "paperless-vertraege.service").read_text())
+        self.assertIn("-e RECHNUNG_ARTEN ", (DIR / "paperless-vertraege.sh").read_text())
+        self.assertIn("RECHNUNG_ARTEN: Rechnung", (DIR / "values.example.yml").read_text())
+
+
+# #820: the sender's contact into the family address book. Invented firms, the standard example IBANs.
+IBAN_DE, IBAN_GB = "DE89 3704 0044 0532 0130 00", "GB82 WEST 1234 5698 7654 32"
+ANSCHRIFT = "Familie Erika Mustermann\nMusterstraße 1\n12345 Beispielstadt\n"
+FUSS = ("\nIhr Ansprechpartner: Herr Max Pinsel\nTel. 030 1234567 · info@maler-beispiel.example\n"
+        "Bankverbindung: Beispielbank IBAN " + IBAN_DE)
+MALER_KONTAKT = ANSCHRIFT + MALER + FUSS
+KONTAKT_ANTWORT = {**MALER_ANTWORT,
+                   "Empfänger": {"wert": "Familie Erika Mustermann, Musterstraße 1, 12345 Beispielstadt",
+                                 "beleg": "Familie Erika Mustermann Musterstraße 1 12345 Beispielstadt"},
+                   "Firma": {"wert": "Malerbetrieb Beispiel GmbH", "beleg": "Malerbetrieb Beispiel GmbH"},
+                   "Ansprechpartner": {"wert": "Max Pinsel", "beleg": "Ihr Ansprechpartner: Herr Max Pinsel"},
+                   "Telefon": {"wert": "030 1234567", "beleg": "Tel. 030 1234567"},
+                   "E-Mail": {"wert": "info@maler-beispiel.example", "beleg": "info@maler-beispiel.example"},
+                   "IBAN": {"wert": IBAN_DE, "beleg": "IBAN " + IBAN_DE},
+                   "Anschrift": {"wert": {"strasse": "Musterweg 3", "plz": "12345", "ort": "Beispielstadt", "land": "DE"},
+                                 "beleg": "Musterweg 3, 12345 Beispielstadt"}}
+
+
+def kontakt_iban_abweichend(args):
+    return False, "Kontakt „%s“: die IBAN weicht ab, nichts geändert.\n%s" % (args["firma"], json.dumps(
+        {"status": "unveraendert", "kontakt": "uid-7", "felder": {"firma": "vorhanden", "iban": "abweichend"},
+         "gruende": {"iban": "im Adressbuch steht eine andere IBAN"}}))
+
+
+class Kontakte(Lauf):
+    """#820: the sender's firm, contact person, phone, e-mail and IBAN, asked in the same question,
+    into Haus's family address book through kontakt_ergaenzen, once per document"""
+
+    def rec(self):
+        with open(self.record) as f:
+            return json.load(f)
+
+    def prüfen(self, p, i):
+        return Rechnungen.prüfen(self, p, i)
+
+    def test_an_invoice_gives_the_senders_contact_in_the_same_question_once(self):
+        p, m, h = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Haus()
+        r = self.run_job(p, m, haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(m.asks), 1, "one question per document: the invoice's fields and the sender together")
+        ask = m.asks[0][2]["messages"][-1]["content"]
+        for name in ("Rechnungsnummer", "Firma", "Ansprechpartner", "Telefon", "E-Mail", "IBAN", "Empfänger"):
+            self.assertIn(name, ask)
+        self.assertEqual(p.value(1, F["Rechnungsnummer"]), "2026/0042", "the invoice is read as before")
+        [call] = [c for c in h.calls if c["params"]["name"] == "kontakt_ergaenzen"]
+        self.assertEqual((call["jsonrpc"], call["method"]), ("2.0", "tools/call"))
+        self.assertEqual(call["params"]["arguments"], {
+            "firma": "Malerbetrieb Beispiel GmbH", "ansprechpartner": "Max Pinsel", "telefon": "030 1234567",
+            "email": "info@maler-beispiel.example", "iban": "DE89370400440532013000",
+            "anschrift": {"strasse": "Musterweg 3", "plz": "12345", "ort": "Beispielstadt"},
+            "quelle": "https://paperless.example.org/documents/1/details"})
+        self.assertIn("Anschrift", ask)
+        self.assertEqual(self.rec()["kontakte"]["1"]["status"], "angelegt")
+        self.assertFalse(self.prüfen(p, 1))
+        r = self.run_job(p, m, haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((len(m.asks), len(h.kontakte())), (1, 1), "once per document: neither asked nor sent again")
+        p.doc(1)["content"] += "\nSeite 2"
+        p.doc(1)["custom_fields"] = []
+        self.run_job(p, m, haus=h)
+        self.assertEqual(len(h.kontakte()), 1, "a new text is read again, its sender is not sent again")
+
+    def test_a_value_left_out_is_not_sent_and_without_a_firm_nothing_is(self):
+        antwort = {**KONTAKT_ANTWORT, "Ansprechpartner": None, "Anschrift": None, "E-Mail": {"wert": "", "beleg": ""},
+                   "Telefon": {"wert": "030 7654321", "beleg": "Tel. 030 7654321"}}
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus()
+        r = self.run_job(p, Model(antwort), haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        [args] = h.kontakte()
+        self.assertEqual(sorted(args), ["firma", "iban", "quelle"], "only what was found and the text backs")
+        os.remove(self.record)
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus()
+        r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": "Malerei Beispiel AG", "beleg": "Malerei Beispiel AG"}}), haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(h.kontakte(), [], "a firm the text does not name: nothing to send")
+        self.assertEqual(self.rec()["kontakte"]["1"]["status"], "keiner", "asked: not asked again")
+
+    def test_the_households_own_name_address_phone_mail_and_iban_are_never_the_firms(self):
+        text = (ANSCHRIFT + "Mobilfunk Beispiel AG\nRechnung Nr. MB-4711\nIhre Rufnummer: 0171 2345678\n"
+                "Ihr Kundenkonto: erika@familie.example\nDer Betrag von 19,99 € wird von Ihrem Konto " + IBAN_GB +
+                " abgebucht.\nService: 0800 1234567\nIBAN " + IBAN_DE)
+        users = USERS + [{"id": 5, "username": "anna", "first_name": "Anna", "last_name": "Mustermann", "email": "erika@familie.example"}]
+        antwort = {"Empfänger": KONTAKT_ANTWORT["Empfänger"],
+                   "Firma": {"wert": "Mobilfunk Beispiel AG", "beleg": "Mobilfunk Beispiel AG"},
+                   "Ansprechpartner": {"wert": "Erika Mustermann", "beleg": "Erika Mustermann"},
+                   "Telefon": {"wert": "0171 2345678", "beleg": "Ihre Rufnummer: 0171 2345678"},
+                   "E-Mail": {"wert": "erika@familie.example", "beleg": "erika@familie.example"},
+                   "IBAN": {"wert": IBAN_GB, "beleg": IBAN_GB}}
+        p, h = Paperless([rechnung(text=text, title="Rechnung Mobilfunk")], users=users), Haus()
+        r = self.run_job(p, Model(antwort), haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        [args] = h.kontakte()
+        self.assertEqual(sorted(args), ["firma", "quelle"],
+                         "the household's person, its own number, its login's mail and the account it pays from stay out: %s" % args)
+        # the household's own name as the firm: nothing is sent
+        for firma in ("Familie Erika Mustermann", "Erika Mustermann", "Musterstraße 1"):
+            os.remove(self.record)
+            p, h = Paperless([rechnung(text=MALER_KONTAKT)], users=USERS), Haus()
+            r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": firma, "beleg": firma}}), haus=h)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(h.kontakte(), [], "the recipient is never the firm: %s" % firma)
+
+    def anschrift(self, text, antwort, users=None):
+        p, h = Paperless([rechnung(text=text)], users=users), Haus()
+        r = self.run_job(p, Model({**KONTAKT_ANTWORT, **antwort}), haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.remove(self.record)
+        [args] = h.kontakte()
+        return args.get("anschrift")
+
+    def test_the_senders_address_only_whole_backed_and_never_the_households(self):
+        def a(strasse="Musterweg 3", plz="12345", ort="Beispielstadt", land="DE", beleg="Musterweg 3, 12345 Beispielstadt"):
+            return {"Anschrift": {"wert": {"strasse": strasse, "plz": plz, "ort": ort, "land": land}, "beleg": beleg}}
+        land = MALER_KONTAKT.replace("12345 Beispielstadt\nRechnungsdatum", "12345 Beispielstadt, Deutschland\nRechnungsdatum")
+        self.assertEqual(self.anschrift(land, a(beleg="Musterweg 3, 12345 Beispielstadt, Deutschland")),
+                         {"strasse": "Musterweg 3", "plz": "12345", "ort": "Beispielstadt", "land": "DE"}, "a country the text names")
+        self.assertEqual(self.anschrift(MALER_KONTAKT, a(land="AT"))["plz"], "12345", "a country it does not name is left out")
+        self.assertNotIn("land", self.anschrift(MALER_KONTAKT, a(land="AT")))
+        self.assertIsNone(self.anschrift(MALER_KONTAKT, a(strasse="")), "without the street no address")
+        self.assertIsNone(self.anschrift(MALER_KONTAKT, a(plz=None, beleg="Musterweg 3")), "without the postcode no address")
+        self.assertIsNone(self.anschrift(MALER_KONTAKT, a(strasse="Musterweg 30")), "a street not in its words")
+        self.assertIsNone(self.anschrift(MALER_KONTAKT, a(plz="54321")), "a postcode not in its words")
+        self.assertIsNone(self.anschrift(MALER_KONTAKT, a(strasse="Musterstraße 1", beleg="Musterstraße 1 12345 Beispielstadt")),
+                          "the recipient block's address is the household's")
+
+    def test_an_ocr_line_that_mixes_the_return_address_and_the_recipient(self):
+        # the window envelope's return-address line, run into the recipient block by OCR
+        text = ("Malerbetrieb Beispiel GmbH · Musterweg 3 · 12345 Beispielstadt Familie Erika Mustermann Musterstraße 1 "
+                "12345 Beispielstadt\n" + MALER + FUSS)
+        gemischt = "Malerbetrieb Beispiel GmbH · Musterweg 3 · 12345 Beispielstadt Familie Erika Mustermann Musterstraße 1 12345 Beispielstadt"
+        empf = {"wert": "Familie Erika Mustermann, Musterstraße 1, 12345 Beispielstadt",
+                "beleg": "Familie Erika Mustermann Musterstraße 1 12345 Beispielstadt"}
+        firma = {"strasse": "Musterweg 3", "plz": "12345", "ort": "Beispielstadt"}
+        haushalt = {"strasse": "Musterstraße 1", "plz": "12345", "ort": "Beispielstadt"}
+        self.assertEqual(self.anschrift(text, {"Empfänger": empf, "Anschrift": {"wert": firma, "beleg": gemischt}}), firma,
+                         "the sender's part of the line, the same town as the household's")
+        self.assertIsNone(self.anschrift(text, {"Empfänger": empf, "Anschrift": {"wert": haushalt, "beleg": gemischt}}),
+                          "the household's part of the line, by the recipient block")
+        self.assertIsNone(self.anschrift(text, {"Empfänger": None, "Anschrift": {"wert": haushalt, "beleg": gemischt}}, users=USERS),
+                          "the model named no recipient: the household's person just before the street gives it away")
+
+    def test_a_different_iban_marks_the_document_with_the_reason(self):
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus(kontakt=kontakt_iban_abweichend)
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.prüfen(p, 1), "a changed IBAN on an invoice is the fake-invoice trick: the family looks")
+        note = p.notes[1][-1]
+        self.assertIn("IBAN", note)
+        self.assertIn("im Adressbuch steht eine andere IBAN", note, "the note says Haus' reason")
+        self.assertIn("Malerbetrieb Beispiel GmbH", note)
+        self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        self.assertEqual((len(h.kontakte()), len(p.notes[1])), (1, 2), "sent and said once")
+
+    def test_a_contract_feeds_contacts_too_and_one_read_before_is_asked_once_for_its_sender(self):
+        full = {F[n]: "x" for n in NAMES[:8]}
+        d = vertrag(fields=full)
+        sha = hashlib.sha256(d["content"].encode()).hexdigest()[:16]
+        with open(self.record, "w") as f:   # read before #820
+            json.dump({"dokumente": {"1": {"text": sha, "felder": NAMES[:8], "gefuellt": [], "verworfen": []}}}, f)
+        antwort = {**ANSWER, "Firma": {"wert": "Stadtwerke Beispielstadt GmbH", "beleg": "Stadtwerke Beispielstadt GmbH"}}
+        p, m = Paperless([d]), Model(antwort)
+        r = self.run_job(p, m)
+        self.assertEqual((r.returncode, m.asks), (0, []), "without Haus a contract read before is not asked again")
+        h = Haus()
+        r = self.run_job(p, m, haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(m.asks), 1, "with Haus: once, for its sender")
+        self.assertEqual(h.kontakte()[0]["firma"], "Stadtwerke Beispielstadt GmbH")
+        self.assertFalse([c for c in p.calls if c[0] == "PATCH"], "its fields were read: nothing written")
+        self.assertEqual(p.notes, {})
+        self.run_job(p, m, haus=h)
+        self.assertEqual((len(m.asks), len(h.kontakte())), (1, 1))
+
+    def test_without_haus_nothing_is_asked_sent_or_recorded(self):
+        p, m = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("IBAN", m.asks[0][2]["messages"][-1]["content"].split("Text:")[0], "no Haus: no contact asked")
+        self.assertNotIn("kontakte", self.rec())
+        h = Haus()
+        self.run_job(p, m, haus=h)
+        self.assertEqual((len(m.asks), len(h.kontakte())), (2, 1), "Haus came later: its sender asked and sent once")
+
+    def test_a_haus_without_the_tool_keeps_the_contact_and_sends_it_once_it_has_it(self):
+        p, m, h = Paperless([rechnung(1, text=MALER_KONTAKT), rechnung(2, text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Haus()
+        h.ohne_kontakte = True
+        r = self.run_job(p, m, haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("kontakt_ergaenzen", r.stdout, "it says why")
+        self.assertEqual(len(h.kontakte()), 1, "the first refusal stops the run's sending")
+        self.assertIn("offen", self.rec()["kontakte"]["1"], "kept, never re-asked")
+        self.run_job(p, m, haus=h)
+        self.assertEqual(len(m.asks), 2, "the model is not asked again for a contact waiting for Haus")
+        h.ohne_kontakte = False
+        self.run_job(p, m, haus=h)
+        self.run_job(p, m, haus=h)
+        self.assertEqual([a["quelle"].split("/")[-2] for a in h.kontakte()[2:]], ["1", "2"], "each sent once Haus has the tool")
+        self.assertEqual({k: v["status"] for k, v in self.rec()["kontakte"].items()}, {"1": "angelegt", "2": "angelegt"})
+
+    def test_a_tool_error_is_recorded_and_not_sent_again(self):
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus(kontakt=lambda a: (True, "firma fehlt"))
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("firma fehlt", r.stdout)
+        self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        self.assertEqual(len(h.kontakte()), 1, "at most once per document")
+        self.assertIn("firma fehlt", self.rec()["kontakte"]["1"]["fehler"])
+
+    def test_without_a_paperless_url_no_source_is_sent(self):
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus()
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), haus=h, PAPERLESS_URL="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("quelle", h.kontakte()[0], "Haus takes only an http(s) link as the source")
 
 
 class Korrespondenten(unittest.TestCase):
