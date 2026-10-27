@@ -352,12 +352,12 @@ class Vertraege(Lauf):
         exec_line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
         self.assertIn("paperless-vertraege.sh", exec_line)
         self.assertNotIn("${HAUSHALT_TOKEN}", exec_line)
-        self.assertIn("Environment=HAUSHALT_TOKEN=${HAUSHALT_TOKEN}", unit)
+        self.assertIn('Environment="HAUSHALT_TOKEN=${HAUSHALT_TOKEN}"', unit)
         self.assertTrue((DIR / "paperless-vertraege.timer").exists())
         sh = (DIR / "paperless-vertraege.sh").read_text()
         self.assertIn("-e HAUSHALT_TOKEN ", sh)
         self.assertIn("-e HAUSHALT_NAMEN ", sh)
-        self.assertIn("Environment=HAUSHALT_NAMEN=${HAUSHALT_NAMEN}", unit)
+        self.assertIn('Environment="HAUSHALT_NAMEN=${HAUSHALT_NAMEN}"', unit)
         self.assertIn("--user paperless", sh)
         self.assertNotIn("$HAUSHALT_TOKEN", sh)
 
@@ -697,7 +697,9 @@ class Rechnungen(Lauf):
                          (None, True), "a reference the text does not back is a guess: the family looks")
 
     def test_the_unit_hands_the_invoice_kinds_on(self):
-        self.assertIn("Environment=RECHNUNG_ARTEN=${RECHNUNG_ARTEN}", (DIR / "paperless-vertraege.service").read_text())
+        self.assertIn('Environment="RECHNUNG_ARTEN=${RECHNUNG_ARTEN}"', (DIR / "paperless-vertraege.service").read_text())
+        # quoted, or systemd splits „Vertrag, Versicherung, Bescheid“ at the spaces and drops the rest (#829)
+        self.assertIn('Environment="VERTRAG_ARTEN=${VERTRAG_ARTEN}"', (DIR / "paperless-vertraege.service").read_text())
         self.assertIn("-e RECHNUNG_ARTEN ", (DIR / "paperless-vertraege.sh").read_text())
         self.assertIn("RECHNUNG_ARTEN: Rechnung", (DIR / "values.example.yml").read_text())
 
