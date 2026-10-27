@@ -492,7 +492,7 @@ def laeufe(seiten, flags, meta):
     wartet = []   # (page, its kennung, the index of the document it followed)
     for s in seiten:
         neu, ist_leer, absender = flags.get(s.nr, (False, False, ""))
-        if ist_leer and s.hell >= HELL:
+        if ist_leer and (s.hell >= HELL or s.woerter < LEER_WOERTER):   # dokumente#2: a near-wordless page the model also calls blank
             s.leer, s.warum = True, "das Modell: leer"
             leer.append(s)
             continue
@@ -526,6 +526,10 @@ def laeufe(seiten, flags, meta):
         docs[w[2]].seiten.append(w[0])
     for d in docs:   # the first page stays first; the rest in stack order, a page come back in its place
         d.seiten[1:] = sorted(d.seiten[1:], key=lambda x: x.nr)
+        if not d.titel:   # the model named a page of it that came in late (dokumente#2): what is still empty
+            m = next((meta[p.nr] for p in d.seiten if meta.get(p.nr)), None)
+            if m:
+                d.art, d.absender, d.datum, d.titel = (getattr(d, k) or str(m.get(k) or "") for k in ("art", "absender", "datum", "titel"))
     return docs, leer
 
 

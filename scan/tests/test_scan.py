@@ -357,6 +357,28 @@ class Trennen(unittest.TestCase):
         docs, _ = scan.laeufe(seiten, flags, {})
         self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [4, 3]])
 
+    def test_the_redo_on_the_box_beckers_then_os_solar_named(self):
+        # dokumente#2, the redo 2026-10-27 23:27: page 32 (one word, 93 %) the model called blank but
+        # it was kept and started a document; OS-Solar's page two followed it, its page one too, and the
+        # model's name for OS-Solar (on its page two) was lost: „Dokument“ with [32, 33, 35]
+        beckers = ("Christian Beckers Gartengestaltung\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\n"
+                   "Rechnung Nr. 20220922 vom 02.11.2022\nPflasterarbeiten")
+        beckers_2 = "[Rechnung 20220922]\nPos Menge Einh. Leistung\nNettosumme EUR 2.553,82\nRechnungsbetrag EUR 3.039,05"
+        stempel = "NER 6.70."
+        solar_2 = ("Seite 2 OS - Solar GmbH * Wiesenstr. 1 * 49191 Belm\nRechnung - Nr. RE - 2023 -2390 13.01.2023\n"
+                   "Rechnungsbetrag 16.590,00 €\nabzgl. Anzahlungs- RG 2022-2355")
+        solar_1 = ("OS - Solar GmbH * Wiesenstr. 1 * 49191 Belm\nHerr Michael Beispiel\nMusterweg 1\n12345 Musterstadt\n"
+                   "Rechnung-Nr: RE-2023-2390 Datum 13.01.2023\nPhotovoltaikanlage")
+        seiten = briefe(beckers, beckers_2, stempel, solar_2, solar_1)
+        seiten[2].hell, seiten[2].woerter = 0.93, 1
+        flags = {1: (True, False, "Beckers"), 2: (False, False, "Beckers"), 3: (True, True, ""), 4: (True, False, "OS - Solar GmbH"), 5: (False, False, "OS - Solar GmbH")}
+        meta = {1: {"art": "Rechnung", "absender": "Christian Beckers Gartengestaltung", "titel": "Rechnung Pflasterarbeiten"},
+                4: {"art": "Rechnung", "absender": "OS - Solar GmbH", "datum": "2023-01-13", "titel": "Abschlussrechnung PV-Anlage"}}
+        docs, leer = scan.laeufe(seiten, flags, meta)
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [5, 4]])
+        self.assertEqual([s.nr for s in leer], [3])
+        self.assertEqual((docs[1].absender, docs[1].titel), ("OS - Solar GmbH", "Abschlussrechnung PV-Anlage"))
+
     def test_a_page_two_nobody_claims_goes_back_where_it_came(self):
         fremd = "Seite 2\nAufstellung vom 05.05.2019\nPosten"
         seiten = briefe(RECHNUNG % (2021, 21, 2021), fremd, "Anlage\nweitere Posten")
