@@ -12,8 +12,8 @@ DIR = Path(__file__).resolve().parent.parent
 SCRIPT = DIR / "paperless-vertraege.py"
 AUTH = "Basic " + base64.b64encode(b"admin:adminpw").decode()
 NAMES = ["Anbieter", "Vertragsnummer", "Vertragsbeginn", "Vertragsende", "Kündigungsfrist",
-         "Nächster Kündigungstermin", "Betrag", "Zahlungsintervall", "Rechnungsnummer", "Fällig am"]
-KINDS = ["string", "string", "date", "date", "string", "date", "monetary", "string", "string", "date"]
+         "Nächster Kündigungstermin", "Betrag", "Zahlungsintervall", "Rechnungsnummer", "Fällig am", "Verwendungszweck"]
+KINDS = ["string", "string", "date", "date", "string", "date", "monetary", "string", "string", "date", "string"]
 F = {n: i + 1 for i, n in enumerate(NAMES)}   # field ids
 OTHER = 20                                    # a custom field of the owner's, not a contract field
 TEXT = ("Stadtwerke Beispielstadt GmbH\nIhr Stromvertrag Nr. SW-12345\nVertragsbeginn: 01.04.2026\n"
@@ -280,7 +280,8 @@ class Vertraege(Lauf):
 
     def test_only_contracts_by_type_or_tag_and_only_with_an_empty_field(self):
         full = {F[n]: "x" for n in NAMES}
-        rechnung = {F["Betrag"]: "EUR10.00", F["Rechnungsnummer"]: "R-1", F["Fällig am"]: "2026-01-31"}   # #818: an invoice, its fields full
+        rechnung = {F["Betrag"]: "EUR10.00", F["Rechnungsnummer"]: "R-1", F["Fällig am"]: "2026-01-31",
+                    F["Verwendungszweck"]: "R-1"}   # #818: an invoice, its fields full
         p = Paperless([vertrag(1, typ=2, title="Rechnung", fields=rechnung), vertrag(2, typ=None, tags=[1]), vertrag(3, fields=full)])
         m = Model(ANSWER)
         r = self.run_job(p, m)
@@ -514,7 +515,7 @@ SHOP_ANTWORT = {"Betrag": {"wert": 87, "beleg": "Rechnungsbetrag: EUR 87,00"},
                 "Fällig am": None,
                 "Rechnungsdatum": {"wert": "2026-03-02", "beleg": "Rechnungsdatum 02.03.2026"},
                 "Zahlungsziel": {"wert": "14 Tage", "beleg": "Zahlungsziel 14 Tage"}}
-VOLL = {F["Betrag"]: "EUR57.62", F["Rechnungsnummer"]: "2026-0042", F["Fällig am"]: "2026-05-26"}   # an invoice with nothing to fill
+VOLL = {F["Betrag"]: "EUR57.62", F["Rechnungsnummer"]: "2026-0042", F["Fällig am"]: "2026-05-26", F["Verwendungszweck"]: "2026-0042"}   # an invoice with nothing to fill
 
 
 def rechnung(i=1, text=MALER, title="2026-05-04 Malerbetrieb Beispiel - Rechnung Fassade", typ=None, tags=None, fields=None):
@@ -653,6 +654,47 @@ class Rechnungen(Lauf):
         self.assertEqual(p.value(2, F["Vertragsnummer"]), "SW-12345")
         self.assertIn("Rechnungsnummer", r.stdout)
         self.assertIn("laib apply paperless", r.stdout)
+
+    # the payment reference the invoice asks for (#820)
+    def zweck(self, text, zweck, extra=None):
+        p = Paperless([rechnung(text=text, typ=2)])
+        r = self.run_job(p, Model({**SHOP_ANTWORT, **(extra or {}), "Verwendungszweck": zweck}))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.remove(self.record)
+        return p.value(1, F["Verwendungszweck"]), self.prüfen(p, 1), p.value(1, F["Rechnungsnummer"])
+
+    def test_the_payment_reference_the_invoice_asks_for(self):
+        bitte = SHOP + "\nBitte als Verwendungszweck angeben: RE-88123 K-555"
+        self.assertEqual(self.zweck(bitte, {"wert": "RE-88123 K-555", "beleg": "Bitte als Verwendungszweck angeben: RE-88123 K-555"}),
+                         ("RE-88123 K-555", False, "RE-88123"))
+        amt = ("Stadtkasse Beispielstadt\nGebührenbescheid\nRechnung Nr. GB-2026-17\nBetrag: 87,00 EUR\n"
+               "Kassenzeichen: 5.123.456.789 – bei Zahlung bitte unbedingt angeben")
+        self.assertEqual(self.zweck(amt, {"wert": "5.123.456.789", "beleg": "Kassenzeichen: 5.123.456.789"}, {
+            "Betrag": {"wert": 87, "beleg": "Betrag: 87,00 EUR"}, "Rechnungsnummer": {"wert": "GB-2026-17", "beleg": "Rechnung Nr. GB-2026-17"}})[0],
+            "5.123.456.789", "an authority's Kassenzeichen")
+        lastschrift = SHOP + "\nDer Betrag wird per SEPA-Lastschrift eingezogen. Mandatsreferenz: MR-0099-ABC"
+        self.assertEqual(self.zweck(lastschrift, {"wert": "MR-0099-ABC", "beleg": "Mandatsreferenz: MR-0099-ABC"})[0], "MR-0099-ABC",
+                         "a direct debit's mandate reference is still recorded")
+        ref = SHOP + "\nZahlungsreferenz: ZR-77881"
+        self.assertEqual(self.zweck(ref, {"wert": "ZR-77881", "beleg": "Zahlungsreferenz: ZR-77881"})[0], "ZR-77881")
+
+    def test_no_payment_reference_named_stays_empty_without_pruefen(self):
+        self.assertEqual(self.zweck(SHOP, None), (None, False, "RE-88123"), "none named: empty, and no reason to look")
+        self.assertEqual(self.zweck(SHOP, {"wert": "RE-88123", "beleg": "Rechnung Nr. RE-88123"}), (None, False, "RE-88123"),
+                         "the invoice number is no payment reference unless the invoice says so")
+
+    def test_the_households_own_reference_is_never_the_payment_reference(self):
+        text = ("Familie Erika Mustermann\nReferenz EM-55\nMusterstraße 1\n12345 Beispielstadt\n" + SHOP +
+                "\nIhre Referenz: EM-2026-07\nZahlungsreferenz: ZR-77881")
+        empf = {"Empfänger": {"wert": "Familie Erika Mustermann", "beleg": "Familie Erika Mustermann Referenz EM-55 Musterstraße 1"}}
+        self.assertEqual(self.zweck(text, {"wert": "EM-2026-07", "beleg": "Ihre Referenz: EM-2026-07"}, empf)[:2], (None, False),
+                         "„Ihre Referenz“ is the household's own")
+        self.assertEqual(self.zweck(text, {"wert": "EM-55", "beleg": "Referenz EM-55"}, empf)[:2], (None, False), "in the recipient block")
+        self.assertEqual(self.zweck(text, {"wert": "ZR-77881", "beleg": "Zahlungsreferenz: ZR-77881"}, empf)[0], "ZR-77881")
+
+    def test_a_payment_reference_not_in_the_text_is_marked(self):
+        self.assertEqual(self.zweck(SHOP + "\nVerwendungszweck: K-555", {"wert": "K-556", "beleg": "Verwendungszweck: K-556"})[:2],
+                         (None, True), "a reference the text does not back is a guess: the family looks")
 
     def test_the_unit_hands_the_invoice_kinds_on(self):
         self.assertIn("Environment=RECHNUNG_ARTEN=${RECHNUNG_ARTEN}", (DIR / "paperless-vertraege.service").read_text())

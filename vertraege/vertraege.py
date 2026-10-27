@@ -29,6 +29,12 @@ Haushalt URL and token come from the unit. The standard library only.
    `prüfen`. A due date must be a day its words name; a payment term in days
    ("Zahlungsziel 14 Tage") counts from the invoice's date when the text names
    that date and the term no other start (receipt, delivery); else `prüfen`.
+   Verwendungszweck (#820) is the reference the invoice asks to give with
+   the payment (Verwendungszweck, Kassenzeichen, Zahlungsreferenz, also a
+   direct debit's Mandatsreferenz): its words must name one, never the
+   household's own line (the recipient block, „Ihr Zeichen“, „Ihre
+   Referenz“); none named leaves it empty without `prüfen`, never the
+   invoice number in its place.
    A document both a contract and an invoice is asked for both, its Betrag as
    the invoice's. The question is one per document over the fields of every
    kind it is (ARTEN), and so is the answer: a later reader takes its own
@@ -114,9 +120,15 @@ FELDER = {"Anbieter": "die Firma, Versicherung oder Behörde, mit der der Vertra
 RECHNUNG_FELDER = {"Betrag": "der Gesamtbetrag, den die Rechnung zu zahlen verlangt (Rechnungsbetrag, Gesamtbetrag, zu zahlen), "
                              "brutto, in Euro als Zahl, z. B. 1234.56; null bei einer Gutschrift oder einem Guthaben",
                    "Rechnungsnummer": "die Nummer der Rechnung (Rechnung Nr., Rech.-Nr., Rechnungsnummer), nie die Kunden-, Auftrags- oder Vertragsnummer",
-                   "Fällig am": "JJJJ-MM-TT, der Tag, bis zu dem die Rechnung zu zahlen ist (zahlbar bis, fällig am), nur wenn der Text diesen Tag nennt"}
+                   "Fällig am": "JJJJ-MM-TT, der Tag, bis zu dem die Rechnung zu zahlen ist (zahlbar bis, fällig am), nur wenn der Text diesen Tag nennt",
+                   "Verwendungszweck": "was die Rechnung bei der Zahlung anzugeben verlangt (Verwendungszweck, Kassenzeichen, Referenz, "
+                                       "Zahlungsreferenz, Mandatsreferenz), wörtlich; null, wenn sie keinen nennt, nie einfach die Rechnungsnummer"}
+EMPFAENGER = {"Empfänger": "Name und Anschrift im Anschriftenfeld, an die das Dokument geht"}
 RECHNUNG_HILFEN = {"Rechnungsdatum": "JJJJ-MM-TT, das Datum der Rechnung",
-                   "Zahlungsziel": "die Zahlungsfrist, wenn der Text statt eines Tages nur eine Frist nennt, z. B. \"14 Tage\""}
+                   "Zahlungsziel": "die Zahlungsfrist, wenn der Text statt eines Tages nur eine Frist nennt, z. B. \"14 Tage\"", **EMPFAENGER}
+# #820: a payment reference stands on one of these words; "Ihr Zeichen", "Ihre Referenz" are the household's own
+REFERENZ = re.compile(r"verwendungszweck|kassenzeichen|referenz", re.I)
+IHR_ZEICHEN = re.compile(r"\bihr(?:e|em|en|er)?\s+(?:zeichen|referenz|nachricht|aktenzeichen)\b", re.I)
 # what a document is read as: its words for the note, its fields, what else is asked
 ARTEN = {"vertrag": ("Vertragsdaten", FELDER, {}), "rechnung": ("Rechnungsdaten", RECHNUNG_FELDER, RECHNUNG_HILFEN)}
 # #820: the sender, asked in the same question when Haus is there, for kontakt_ergaenzen; Empfänger only to keep the household out
@@ -127,7 +139,7 @@ KONTAKT = {"Firma": "die Firma, Behörde oder Person, die das Dokument schickt (
            "IBAN": "die IBAN des Absenders, auf die gezahlt werden soll; nie die des Empfängers (\"von Ihrem Konto\")",
            "Anschrift": "die Postanschrift des Absenders aus Briefkopf, Absenderzeile oder Fußzeile, als "
                         "{\"strasse\": …, \"plz\": …, \"ort\": …, \"land\": \"DE\"}; nie die Anschrift im Anschriftenfeld",
-           "Empfänger": "Name und Anschrift im Anschriftenfeld, an die das Dokument geht"}
+           **EMPFAENGER}
 LAENDER = {"DE": "deutschland", "AT": "österreich", "CH": "schweiz", "NL": "niederlande", "FR": "frankreich", "LU": "luxemburg"}
 KONTAKT_ARGS = {"Firma": "firma", "Ansprechpartner": "ansprechpartner", "Telefon": "telefon", "E-Mail": "email", "IBAN": "iban"}
 FORM = {"Firma": lambda v: len(v) <= 128 and re.search(r"[^\W\d_]{2}", v),
@@ -296,6 +308,8 @@ def wert(name, kind, v):
             " zum " + next(name for k, name in ENDEN.values() if k == ende) if ende else "")
     if name == "Zahlungsintervall":
         return s.lower() if s.lower() in INTERVALLE else None
+    if name == "Verwendungszweck":   # SEPA's 140 characters
+        return s[:140] or None
     if name == "Rechnungsnummer":   # "2026/ 0042" as OCR split it is 2026/0042
         s = re.sub(r"\s*([/._-])\s*", r"\1", s)
         return s[:64] if re.search(r"\d", s) else None
@@ -320,6 +334,16 @@ def rechnungswert(name, kind, roh, v, beleg, text):
     if kind == "date" and v and datum(v) not in daten(beleg):
         return "der Tag %r steht so nicht in „%s“" % (roh, beleg)
     return None
+
+
+def kein_zweck(v, beleg, antwort, text):
+    """whether a Verwendungszweck is none the invoice asks for (#820): its words name no reference,
+    or the line is the household's own (the recipient block, "Ihr Zeichen", "Ihre Referenz")"""
+    empf = belegt(antwort.get("Empfänger"), text)
+    if not REFERENZ.search(beleg) or (empf and v and (eng(v) in empf or dicht(v) in dicht(empf))):
+        return True
+    t = eng(text)
+    return any(IHR_ZEICHEN.search(t[max(0, m.start() - 30):m.start()]) for m in re.finditer(r"\s?".join(map(re.escape, dicht(v or ""))), t))
 
 
 def faellig(antwort, text):
@@ -448,6 +472,8 @@ def lesen(api, doc, antwort, felder, prüfen_tag, rechnung=False, was="Vertragsd
                     verworfen.append((fid, z[1]))
             continue
         v, beleg = wert(name, kind, a["wert"]), belegt(a, text)
+        if name == "Verwendungszweck" and beleg and kein_zweck(v, beleg, antwort, text):
+            continue   # none named, or the household's: empty, and no reason to look
         warum = rechnungswert(name, kind, a["wert"], v, beleg, text) if rechnung and beleg else None
         if not beleg:
             verworfen.append((fid, "%s (steht so nicht im Text)" % name))
