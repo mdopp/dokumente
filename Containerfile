@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY scan/scan.py /opt/scan.py
 COPY vertraege/vertraege.py /opt/vertraege.py
+COPY dienst.py /opt/dienst.py
 LABEL org.opencontainers.image.source=https://github.com/mdopp/dokumente
 ENV PYTHONUNBUFFERED=1
-ENTRYPOINT ["python3", "/opt/scan.py"]
+ENTRYPOINT ["python3", "/opt/dienst.py"]
