@@ -7,8 +7,11 @@ folder) or a run of a SANE scanner, on the network or the box's USB
 (SCANNER, #801; ordered with `laib scan start`). Each page is turned (Tesseract OSD), read (OCR deu)
 and judged blank (bright and almost no words, or a back page where the
 front's print shows through: mirrored, the OCR reads clearly more). The
-household model marks where a new document starts; documents are runs
-from one start to the next, never page groups the model makes up. Each
+household model marks where a new document starts (an answer that leaves
+pages out or starts far too few is asked again once, then the pages'
+letterheads fill in, #808); documents are runs from one start to the next,
+never page groups the model makes up. A duplex run whose print is on the
+backs only lay the wrong way up and is turned round. Each
 document becomes a PDF in Paperless' consume folder under SCAN_TAG, named
 as Paperless titles it: "JJJJ-MM-TT Absender - Titel".
 
@@ -24,7 +27,8 @@ weiter, abschliessen, verwerfen, redo; and for setting the scanner up
 eSCL, #589: the network's scanners into the status's suche), pruefen (the device opened without paper, into pruefung; also on
 the first start with a new SCANNER) and probe (one sheet scanned and read,
 never filed). Each stack is archived under
-/data/<zeit>/ (the original or the raw pages, plan.json, log.txt) for
+/data/<zeit>/ (the original or the raw pages, plan.json, the model's
+answers modell-<fenster>.json, log.txt) for
 SCAN_KEEP_DAYS; `laib scan redo --stapel <zeit>` splits it again.
 
 Stdlib only, apart from Pillow and img2pdf for images and PDFs; the
@@ -40,6 +44,7 @@ ENDUNGEN = {".pdf", ".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 UNFERTIG = (".part", ".tmp", ".crdownload", ".partial", "~")
 HELL = 0.94         # a blank page's mean brightness: blank backs 95-97 %, a printed front 92 % (#568)
 LEER_WOERTER = 4    # fewer words than this on a bright page: blank
+FAST_HELL = 0.88    # no text at all from here up: blank (#808), a photo is darker, handwriting reads as marks
 FENSTER, SCHRITT, AB_FENSTER = 30, 25, 40   # big stacks go to the model in overlapping windows
 EPSON2 = 1865       # the epson2 backend's network port (#589)
 
@@ -245,6 +250,9 @@ def pruefe_seite(pfad, nr, text=None, quelle=0):
     s.woerter = woerter(s.text)
     if s.hell >= HELL and s.woerter < LEER_WOERTER:
         s.leer, s.warum = True, "hell, %d Wörter" % s.woerter
+    elif s.hell >= FAST_HELL and s.woerter == 0 and len(re.findall(r"\w", s.text)) < 5:
+        # a face-up stack's fronts at 92-93 %: the print on their backs shows through, Tesseract reads nothing (#808)
+        s.leer, s.warum = True, "fast hell, kein Text"
     elif s.hell >= HELL and s.woerter < 40:
         spiegel = s.bild + ".spiegel" + os.path.splitext(s.bild)[1]
         schreib_pnm(gespiegelt(b), spiegel)
@@ -286,10 +294,28 @@ Die erste Seite des Auszugs ist immer neu. Antworte nur mit JSON in genau dieser
 
 
 def nachricht(seiten):
-    """the model's messages for these pages; each page's text cut so a big stack still fits"""
+    """the model's messages for these pages, numbered 1..n as sent, never by their place in the stack: after
+    the blanks went those skip, and the model answered 1, 2, 3 (#808); each page's text cut so a big stack fits"""
     limit = max(300, min(1500, 24000 // max(1, len(seiten))))
-    teile = ["--- Seite %d ---\n%s" % (s.nr, re.sub(r"\s+\n", "\n", s.text.strip())[:limit] or "(kein Text)") for s in seiten]
-    return [{"role": "system", "content": ANWEISUNG}, {"role": "user", "content": "\n\n".join(teile)}]
+    teile = ["--- Seite %d ---\n%s" % (i, re.sub(r"\s+\n", "\n", s.text.strip())[:limit] or "(kein Text)") for i, s in enumerate(seiten, 1)]
+    kopf = "%d Seiten, Seite 1 bis %d. Antworte für jede Seite.\n\n" % (len(seiten), len(seiten))
+    return [{"role": "system", "content": ANWEISUNG}, {"role": "user", "content": kopf + "\n\n".join(teile)}]
+
+
+# a first page: the recipient's address and a date or a number; a page two says so (#808)
+FOLGESEITE = re.compile(r"\bSeite\s*(?:[2-9]|[1-9]\d)\b|\b(?:Fortsetzung|Übertrag)\b", re.I)
+ANSCHRIFT = re.compile(r"(?m)^\W{0,3}(?:\d{5}\s+[A-ZÄÖÜ][a-zäöüß]|(?:Herrn?|Frau|Familie|Firma)\b)")
+DATUM = re.compile(r"\b\d{1,2}\s?\.\s?\d{1,2}\s?\.\s?(?:\d{4}|\d{2})\b")
+NUMMER = re.compile(r"\b(?:Rech(?:nung)?s?|Beleg|Angebots?|Bescheid|Liefer(?:schein)?|Kunden|Auftrags?|Vertrags?)[\s.-]*(?:Nr|Nummer)\b"
+                    r"|\bRechnung\s+\d{3,}", re.I)
+
+
+def briefkopf(text):
+    """1 when the page reads like a document's first page, -1 like a later one, 0 when it cannot tell"""
+    if FOLGESEITE.search(text or ""):
+        return -1
+    kopf = "\n".join((text or "").splitlines()[:40])
+    return 1 if ANSCHRIFT.search(kopf) and (DATUM.search(kopf) or NUMMER.search(kopf)) else 0
 
 
 def json_aus(text):
@@ -305,15 +331,17 @@ def json_aus(text):
     return obj
 
 
-def entscheidungen(antwort):
-    """per page number: (neu, leer, absender); per first page: the document's details"""
+def entscheidungen(antwort, teil):
+    """per stack page number: (neu, leer, absender); per first page: the document's details. The answer
+    counts the pages as sent, 1..n: a number outside is no page"""
+    nr = lambda k: teil[k - 1].nr if isinstance(k, int) and 1 <= k <= len(teil) else None
     seiten, dokumente = {}, {}
     for s in antwort.get("seiten") or []:
-        if isinstance(s, dict) and isinstance(s.get("seite"), int):
-            seiten[s["seite"]] = (s.get("neu") is True, s.get("leer") is True, str(s.get("absender") or ""))
+        if isinstance(s, dict) and nr(s.get("seite")):
+            seiten[nr(s["seite"])] = (s.get("neu") is True, s.get("leer") is True, str(s.get("absender") or ""))
     for d in antwort.get("dokumente") or []:
-        if isinstance(d, dict) and isinstance(d.get("erste_seite"), int):
-            dokumente[d["erste_seite"]] = d
+        if isinstance(d, dict) and nr(d.get("erste_seite")):
+            dokumente[nr(d["erste_seite"])] = d
     return seiten, dokumente
 
 
@@ -348,12 +376,53 @@ def fenster(n):
         a += SCHRITT
 
 
-def trennen(seiten, frage):
+def befragen(teil, frage, roh, fenster_nr):
+    """one window's decisions. An answer that leaves pages out, or starts far fewer documents than the
+    pages' letterheads show, is asked again once; what is still missing then goes by the letterhead
+    (#808). Every answer lands in roh as it came."""
+    kopf = [briefkopf(s.text) for s in teil]
+    text_neu = {teil[0].nr} | {s.nr for s, k in zip(teil, kopf) if k > 0}
+    messages, f, m = nachricht(teil), None, None
+    for versuch in (1, 2):
+        text = frage(messages)
+        roh.append({"fenster": fenster_nr, "versuch": versuch, "seiten": [s.nr for s in teil], "antwort": text})
+        try:
+            f2, m2 = entscheidungen(json_aus(text), teil)
+        except ValueError:
+            if f is None and versuch == 2:
+                raise
+            if f is None:
+                continue
+            break   # the second answer broke: the first stands
+        if f is None or len(f2) >= len(f):
+            f, m = f2, m2
+        fehlt = [i for i, s in enumerate(teil, 1) if s.nr not in f]
+        neu = {teil[0].nr} | {nr for nr, (n, _, _) in f.items() if n}
+        zu_wenig = len(text_neu) >= 2 and 2 * len(neu) <= len(text_neu)
+        if versuch == 2 or not (fehlt or zu_wenig):
+            break
+        warum = []
+        if fehlt:
+            warum.append("Seiten %s fehlen in deiner Antwort" % ", ".join(map(str, fehlt)))
+        if zu_wenig:
+            warum.append("du beginnst %d Dokumente, aber auf den Seiten %s steht ein Briefkopf (Anschrift mit Datum oder Nummer)"
+                         % (len(neu), ", ".join(str(i) for i, k in enumerate(kopf, 1) if k > 0)))
+        messages = messages + [{"role": "assistant", "content": text},
+                               {"role": "user", "content": "Prüfe noch einmal: %s. Antworte für jede Seite 1 bis %d, im selben JSON." % ("; ".join(warum), len(teil))}]
+    for s, k in zip(teil, kopf):
+        if s.nr not in f:
+            f[s.nr] = (k > 0, False, "")
+        elif zu_wenig and k > 0:
+            f[s.nr] = (True,) + f[s.nr][1:]
+    return f, m
+
+
+def trennen(seiten, frage, roh=None):
     """the stack's documents from the model's answers (frage: messages → answer text); a window's
     page counts from its fourth page on, the first three are the window before's call"""
-    flags, meta = {}, {}
+    flags, meta, roh = {}, {}, [] if roh is None else roh
     for i, (a, b) in enumerate(fenster(len(seiten))):
-        f, m = entscheidungen(json_aus(frage(nachricht(seiten[a:b]))))
+        f, m = befragen(seiten[a:b], frage, roh, i + 1)
         for pos, s in enumerate(seiten[a:b]):
             if i == 0 or pos >= 3:
                 flags[s.nr] = f.get(s.nr, (False, False, ""))
@@ -954,7 +1023,8 @@ class Dienst:
     # one way through
 
     def seiten(self, stapel):
-        """the stack's pages, checked: from the archived original or the raw scans"""
+        """the stack's pages, checked: from the archived original or the raw scans; and whether the
+        scanner's run was turned round"""
         ordner = self.ordner(stapel)
         original = next(iter(glob.glob(os.path.join(ordner, "original.*"))), "")
         seiten_dir = os.path.join(ordner, "seiten")
@@ -991,7 +1061,14 @@ class Dienst:
         for i, p in enumerate(bilder):
             self.zustand("trennt", "liest Seite %d von %d" % (i + 1, len(bilder)), stapel)
             out.append(pruefe_seite(p, i + 1, texte[i], quellen[i]))
-        return out, original
+        gewendet = not original and self.cfg.duplex and verkehrt(out)
+        if gewendet:
+            # face up for this feeder: the last sheet came first, each front a blank back, so the whole
+            # run backwards reads front to back (#808)
+            out = out[::-1]
+            for i, s in enumerate(out, 1):
+                s.nr = i
+        return out, original, gewendet
 
     def verarbeiten(self, stapel, frage=None):
         try:
@@ -1002,24 +1079,30 @@ class Dienst:
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: %s. %s Neu versuchen: „laib scan redo --stapel %s“." % (str(e).rstrip("."), schon, stapel.zeit), stapel.abgelegt)
 
     def _verarbeiten(self, stapel, frage):
-        seiten, original = self.seiten(stapel)
+        seiten, original, gewendet = self.seiten(stapel)
         inhalt = [s for s in seiten if not s.leer]
         if not inhalt:
             self.ende(stapel, "abgebrochen", "Scan abgebrochen: alle %d Seiten sind leer, nichts abgelegt." % len(seiten))
             return
         self.zustand("trennt", "trennt %d Seiten" % len(inhalt), stapel)
-        hinweis = ""
+        hinweis, roh = "", []
         try:
-            docs, leer_modell = trennen(inhalt, frage)
+            docs, leer_modell = trennen(inhalt, frage, roh)
         except Exception as e:
             hinweis = "Das Modell konnte nicht trennen (%s): alles liegt als ein Dokument „Stapel unsortiert“ in Paperless." % str(e)[:160]
             for s in inhalt:
                 s.leer, s.warum = False, ""
             docs, leer_modell = [Dokument(seiten=inhalt, titel="Stapel unsortiert")], []
+        for alt in glob.glob(os.path.join(self.ordner(stapel), "modell-*.json")):
+            os.unlink(alt)   # a redo's answers, not the last run's
+        for r in roh:   # the model's answers as they came, beside the plan: a wrong split can be read (#808)
+            with open(os.path.join(self.ordner(stapel), "modell-%d%s.json" % (r["fenster"], "" if r["versuch"] == 1 else "-%d" % r["versuch"])), "w") as f:
+                json.dump(r, f, ensure_ascii=False, indent=1)
         with open(os.path.join(self.ordner(stapel), "plan.json"), "w") as f:
             json.dump({"seiten": [{k: v for k, v in s.__dict__.items() if k != "text"} for s in seiten],
                        "dokumente": [{"seiten": [s.nr for s in d.seiten], "art": d.art, "absender": d.absender, "datum": d.datum,
-                                      "titel": d.titel, "name": dateiname(d)} for d in docs], "hinweis": hinweis}, f, ensure_ascii=False, indent=1)
+                                      "titel": d.titel, "name": dateiname(d)} for d in docs], "hinweis": hinweis,
+                       "umgedreht": gewendet}, f, ensure_ascii=False, indent=1)
         self.zustand("legt-ab", "legt %d Dokumente ab" % len(docs), stapel)
         vergeben = set()
         ordner = os.path.join(self.cfg.consume, self.cfg.tag)
@@ -1039,6 +1122,8 @@ class Dienst:
         kopf = ("%d Blatt, " % ((len(seiten) + 1) // 2 if self.cfg.duplex else len(seiten))) if stapel.quelle == "scanner" else ("%s: " % stapel.datei)
         text = "Scan fertig: %s%d Seiten, %d leer entfernt, %d Dokumente in Paperless (Tag %s):\n%s" % (
             kopf, len(seiten), leer, len(docs), self.cfg.tag, "\n".join("- " + n[:-4] for n in stapel.abgelegt))
+        if gewendet:
+            text += "\n" + lage(self.cfg.scanner)
         if hinweis:
             text += "\n" + hinweis
         self.ende(stapel, "fertig", text, stapel.abgelegt, seiten=len(seiten), leer=leer)
@@ -1056,6 +1141,25 @@ class Dienst:
                 alt = os.path.getmtime(pfad) < grenze
             if alt:
                 shutil.rmtree(pfad, ignore_errors=True)
+
+
+def verkehrt(seiten):
+    """a duplex run, front first per sheet, whose stack lay the wrong way up (#808): (nearly) every sheet
+    with print carries it on the back only. A stack laid right has print on its fronts; one with
+    print on both sides cannot tell and stays as it came."""
+    blaetter = [seiten[i:i + 2] for i in range(0, len(seiten) - 1, 2)]
+    hinten = sum(1 for v, r in blaetter if v.leer and not r.leer)
+    vorne = sum(1 for v, r in blaetter if not v.leer and r.leer)
+    return hinten >= 2 and 5 * vorne <= hinten
+
+
+def lage(geraet):
+    """the finished message's line on a stack turned round: how it lay, so it lies right next time"""
+    if geraet.split(":", 1)[0] == "fujitsu":
+        return "Der Stapel lag mit der Schrift nach oben; die Reihenfolge ist umgedreht. Beim nächsten Mal mit der Schrift nach unten einlegen."
+    if geraet.startswith("epson2"):
+        return "Der Stapel lag mit der Schrift nach unten; die Reihenfolge ist umgedreht. Beim nächsten Mal mit der Schrift nach oben einlegen."
+    return "Der Stapel lag andersherum im Einzug; die Reihenfolge ist umgedreht."
 
 
 def jetzt():

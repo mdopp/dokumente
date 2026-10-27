@@ -47,10 +47,16 @@ BRIEF_A2 = "Fortsetzung Seite zwei von zwei Zahlbar innerhalb vierzehn Tagen ohn
 BRIEF_B = "Abfallwirtschaft ASV Bescheid ueber Abfallgebuehren vom 03.02.2021 Grundstueck Restmuell Biotonne Gebuehr Jahr"
 
 
-def antwort(seiten):
+def antwort(seiten, zweite=3):
+    """the model's answer; its page numbers are places in what it was sent, from 1 (#808)"""
     return json.dumps({"seiten": seiten, "dokumente": [
         {"erste_seite": 1, "art": "Rechnung", "absender": "Mosel", "datum": "2023-05-01", "titel": "Rechnung Schornsteinfeger"},
-        {"erste_seite": 5, "art": "Bescheid", "absender": "ASV", "datum": "2021-02-03", "titel": "Abfallgebühren"}]})
+        {"erste_seite": zweite, "art": "Bescheid", "absender": "ASV", "datum": "2021-02-03", "titel": "Abfallgebühren"}]})
+
+
+def gesendet(messages):
+    """what the model was sent: (the number it saw, the page's text) per page"""
+    return __import__("re").findall(r"--- Seite (\d+) ---\n([^\n]*)", messages[1]["content"])
 
 
 class Bilder(unittest.TestCase):
@@ -111,6 +117,20 @@ class Seiten(unittest.TestCase):
         DREHUNG[unsicher.data] = (90, 1.2)
         self.assertEqual(self.pruefe(unsicher, 2).drehung, 0)
 
+    def test_a_page_without_any_text_just_under_bright_is_blank_a_photo_or_handwriting_stays(self):
+        # #808: the fronts of a face-up stack, 0 words at 92-93 %, show-through of the print on their backs
+        fast = seite(238, 8)
+        self.assertLess(scan.helligkeit(fast), scan.HELL)
+        s = self.pruefe(fast)
+        self.assertTrue(s.leer, s)
+        self.assertIn("kein Text", s.warum)
+        self.assertFalse(self.pruefe(seite(110, 9), 2).leer, "a photo: dark, no words")
+        hand = seite(238, 10)
+        TEXTE[hand.data] = "Mi ll 2 a5 0k"   # handwriting: Tesseract reads marks, no words
+        s = self.pruefe(hand, 3)
+        self.assertEqual(s.woerter, 0)
+        self.assertFalse(s.leer, "handwriting: marks are read")
+
     def test_a_pdfs_text_layer_is_read_as_it_is(self):
         b = seite(130, 7)
         s = self.pruefe(b, 1, BRIEF_A1 + " " + BRIEF_A2)
@@ -121,6 +141,17 @@ def inhalt(nrs, hell=0.5):
     return [scan.Seite(nr=n, bild="", hell=hell, text="Text %d" % n, woerter=10) for n in nrs]
 
 
+# invented letters (#808): a first page has the recipient's address and a date or a number
+BRIEF_1 = "Stadtwerke Musterhausen\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\nDatum: 14.03.2024\nAbschlag Strom"
+BRIEF_2 = "Tischlerei Holzwurm\nHerrn Erika Beispiel\nMusterweg 1\n12345 Musterstadt\nAngebot Nr. 2024-17\nTreppe"
+BRIEF_3 = "Bezirksschornsteinfeger Rauch\nFrau Erika Beispiel\nRech.-Nr.: 77/24/1\nDatum: 02.07.2024\nKehrung"
+FOLGE = "Fortsetzung der Leistungen\nSeite 2 von 2\nZwischensumme Gesamtbetrag"
+
+
+def briefe(*texte):
+    return [scan.Seite(nr=n, bild="", hell=0.5, text=t, woerter=10) for n, t in enumerate(texte, 1)]
+
+
 class Trennen(unittest.TestCase):
     def test_documents_are_runs_from_each_start_never_the_models_page_groups(self):
         seiten = [{"seite": 1, "neu": True}, {"seite": 2, "neu": False}, {"seite": 3, "neu": True}, {"seite": 4}]
@@ -129,8 +160,28 @@ class Trennen(unittest.TestCase):
         self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [3, 4]])
 
     def test_the_first_page_starts_a_document_even_unmarked(self):
-        docs, _ = scan.trennen(inhalt([2, 5]), lambda m: json.dumps({"seiten": [{"seite": 5, "neu": True}]}))
+        docs, _ = scan.trennen(inhalt([2, 5]), lambda m: json.dumps({"seiten": [{"seite": 1}, {"seite": 2, "neu": True}]}))
         self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[2], [5]])
+
+    def test_the_model_sees_the_pages_numbered_as_sent_and_its_answer_maps_back(self):
+        # #808: after the blanks went, the stack's numbers were 2, 4, 6, 8 and the model answered 1, 2, 3, 4
+        gesehen = []
+
+        def frage(messages):
+            gesehen.append(gesendet(messages))
+            n = len(gesehen[-1])   # by place, whatever the labels say
+            return json.dumps({"seiten": [{"seite": i, "neu": i in (1, 3)} for i in range(1, n + 1)],
+                               "dokumente": [{"erste_seite": 3, "absender": "Stadtwerke", "titel": "Abschlag"}]})
+        docs, _ = scan.trennen(inhalt([2, 4, 6, 8]), frage)
+        self.assertEqual(gesehen, [[("1", "Text 2"), ("2", "Text 4"), ("3", "Text 6"), ("4", "Text 8")]])
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[2, 4], [6, 8]])
+        self.assertEqual((docs[1].absender, docs[1].titel), ("Stadtwerke", "Abschlag"))
+
+    def test_every_answer_is_kept_as_it_came(self):
+        roh = []
+        scan.trennen(inhalt([3, 7]), lambda m: '```json {"seiten": [{"seite": 1, "neu": true}, {"seite": 2}]} ```', roh)
+        self.assertEqual(roh, [{"fenster": 1, "versuch": 1, "seiten": [3, 7],
+                                "antwort": '```json {"seiten": [{"seite": 1, "neu": true}, {"seite": 2}]} ```'}])
 
     def test_the_models_blank_counts_only_on_a_bright_page(self):
         answer = lambda m: json.dumps({"seiten": [{"seite": 1, "neu": True}, {"seite": 2, "leer": True}]})
@@ -150,14 +201,68 @@ class Trennen(unittest.TestCase):
         calls = []
 
         def frage(messages):
-            nrs = [int(x) for x in __import__("re").findall(r"--- Seite (\d+) ---", messages[1]["content"])]
-            calls.append(nrs)
-            # every window marks its own first page new, and every tenth page
-            return json.dumps({"seiten": [{"seite": n, "neu": n == nrs[0] or n % 10 == 1} for n in nrs]})
+            seiten = gesendet(messages)
+            calls.append(seiten)
+            self.assertEqual([int(n) for n, _ in seiten], list(range(1, len(seiten) + 1)), "each window counts from 1")
+            # every window marks its own first page new, and every tenth page of the stack
+            return json.dumps({"seiten": [{"seite": int(n), "neu": n == "1" or int(t.split()[1]) % 10 == 1} for n, t in seiten]})
         docs, _ = scan.trennen(inhalt(range(1, 61)), frage)
         self.assertEqual(len(calls), 3)
         self.assertEqual([d.seiten[0].nr for d in docs], [1, 11, 21, 31, 41, 51])
         self.assertEqual(sum(len(d.seiten) for d in docs), 60)
+
+    def test_an_answer_that_leaves_pages_out_is_asked_again_once(self):
+        calls = []
+
+        def frage(messages):
+            calls.append(messages)
+            n = 2 if len(calls) == 1 else 4
+            return json.dumps({"seiten": [{"seite": i, "neu": i in (1, 3)} for i in range(1, n + 1)]})
+        docs, _ = scan.trennen(inhalt([1, 2, 3, 4]), frage)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][:3], calls[0] + [{"role": "assistant", "content": calls[1][2]["content"]}])
+        self.assertIn("Seiten 3, 4 fehlen", calls[1][3]["content"])
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [3, 4]])
+
+    def test_pages_still_unanswered_go_by_their_letterhead(self):
+        seiten = briefe(BRIEF_1, FOLGE, BRIEF_2, "Kleingedrucktes Allgemeine Geschaeftsbedingungen")
+        calls = []
+        docs, _ = scan.trennen(seiten, lambda m: calls.append(m) or json.dumps({"seiten": [{"seite": 1, "neu": True}]}))
+        self.assertEqual(len(calls), 2, "asked again once, then the text decides")
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [3, 4]])
+
+    def test_far_fewer_starts_than_letterheads_is_asked_again_then_the_letterheads_count_too(self):
+        seiten = briefe(BRIEF_1, FOLGE, BRIEF_2, BRIEF_3)
+        calls = []
+
+        def frage(messages):
+            calls.append(messages)
+            return json.dumps({"seiten": [{"seite": i, "neu": i == 1} for i in range(1, 5)],
+                               "dokumente": [{"erste_seite": 1, "absender": "Stadtwerke Musterhausen", "titel": "Abschlag"}]})
+        docs, _ = scan.trennen(seiten, frage)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Briefkopf", calls[1][3]["content"])
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [3], [4]])
+        self.assertEqual(docs[0].titel, "Abschlag", "the model's details stay")
+
+    def test_a_plausible_answer_is_asked_once_and_the_model_decides(self):
+        # letterheads on 1 and 3, the model starts 1 and 2: a judgment, not an incomplete answer
+        seiten = briefe(BRIEF_1, FOLGE, BRIEF_2, FOLGE)
+        calls = []
+        docs, _ = scan.trennen(seiten, lambda m: calls.append(m) or json.dumps(
+            {"seiten": [{"seite": i, "neu": i in (1, 2)} for i in range(1, 5)]}))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1], [2, 3, 4]])
+
+    def test_a_letterhead_is_an_address_with_a_date_or_a_number_a_page_two_never(self):
+        self.assertEqual(scan.briefkopf(BRIEF_1), 1)
+        self.assertEqual(scan.briefkopf(BRIEF_2), 1)
+        self.assertEqual(scan.briefkopf(BRIEF_3), 1)
+        self.assertEqual(scan.briefkopf(FOLGE), -1)
+        self.assertEqual(scan.briefkopf(BRIEF_1 + "\nSeite 2 von 3"), -1)
+        self.assertEqual(scan.briefkopf("Familie Beispiel\nMusterweg 1\n12345 Musterstadt\nViele Gruesse"), 0, "an address alone is no letterhead")
+        self.assertEqual(scan.briefkopf("Rechnung Nr. 4711 vom 01.02.2024 Betrag"), 0, "nor a number without an address")
+        self.assertEqual(scan.briefkopf(""), 0)
 
     def test_names_are_paperless_titles_and_never_collide(self):
         self.assertEqual(scan.dateiname(scan.Dokument([], absender="Mosel", datum="2023-05-01", titel="Rechnung")), "2023-05-01 Mosel - Rechnung")
@@ -276,7 +381,7 @@ class Dienst(unittest.TestCase):
 
         def frage(messages):
             gefragt.append(messages[1]["content"])
-            return antwort([{"seite": 1, "neu": True}, {"seite": 3, "neu": False}, {"seite": 5, "neu": True}])
+            return antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": False}, {"seite": 3, "neu": True}])
         dienst = scan.Dienst(self.cfg)
         dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage)
         self.auftrag(dienst, "start", person="mama")
@@ -293,11 +398,40 @@ class Dienst(unittest.TestCase):
         self.assertEqual(self.abgelegt(), ["2021-02-03 ASV - Abfallgebühren.pdf", "2023-05-01 Mosel - Rechnung Schornsteinfeger.pdf"])
         self.assertEqual(len(self.meldungen), 2)
         self.assertTrue(self.meldungen[1][1].startswith("Scan fertig: 3 Blatt, 6 Seiten, 3 leer entfernt, 2 Dokumente"), self.meldungen[1][1])
-        # the model saw the content pages, front first, the blanks never
-        self.assertEqual(__import__("re").findall(r"--- Seite (\d+) ---", gefragt[0]), ["1", "3", "5"])
+        # the model saw the content pages, front first, the blanks never, numbered as sent (#808)
+        self.assertEqual(__import__("re").findall(r"--- Seite (\d+) ---\n(\w+)", gefragt[0]), [("1", "Bezirksschornsteinfeger"), ("2", "Fortsetzung"), ("3", "Abfallwirtschaft")])
+        self.assertNotIn("umgedreht", self.meldungen[1][1], "a stack laid as it should is not turned")
         self.assertEqual(s["letzte"][0]["dokumente"][0]["titel"], "2023-05-01 Mosel - Rechnung Schornsteinfeger")
         with open(os.path.join(self.cfg.data, s["stapel"], "plan.json")) as f:
             self.assertEqual([d["seiten"] for d in json.load(f)["dokumente"]], [[1, 3], [5]])
+
+    def test_a_face_up_stack_is_turned_so_its_documents_read_front_to_back(self):
+        # #808: the fi-6130 takes paper face down; face up, every front it scans is a blank back and the
+        # last sheet comes first. Stack in reading order: BRIEF_1, FOLGE (one letter), BRIEF_2.
+        self.cfg.scanner, self.cfg.back_first = "fujitsu", False
+        self.runs(([leer(94), vorne(95, BRIEF_2), leer(96), vorne(97, FOLGE), leer(98), vorne(99, BRIEF_1)],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(gesendet(messages))
+            return antwort([{"seite": 1, "neu": True}, {"seite": 2}, {"seite": 3, "neu": True}])
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage)
+        self.auftrag(dienst, "start")
+        self.assertEqual([t.split()[0] for _, t in gefragt[0]], ["Stadtwerke", "Fortsetzung", "Tischlerei"])
+        text = self.meldungen[-1][1]
+        self.assertTrue(text.startswith("Scan fertig: 3 Blatt, 6 Seiten, 3 leer entfernt, 2 Dokumente"), text)
+        self.assertIn("Der Stapel lag mit der Schrift nach oben; die Reihenfolge ist umgedreht.", text)
+        ordner = os.path.join(self.cfg.data, self.status()["stapel"])
+        with open(os.path.join(ordner, "plan.json")) as f:
+            plan = json.load(f)
+        self.assertEqual([d["seiten"] for d in plan["dokumente"]], [[1, 3], [5]])
+        self.assertTrue(plan["umgedreht"])
+        # the model's answer kept beside the plan (#808)
+        with open(os.path.join(ordner, "modell-1.json")) as f:
+            roh = json.load(f)
+        self.assertEqual((roh["seiten"], roh["antwort"]), ([1, 3, 5], antwort([{"seite": 1, "neu": True}, {"seite": 2}, {"seite": 3, "neu": True}])))
 
     def test_verwerfen_files_nothing_and_says_so_once(self):
         self.runs(([leer(21), vorne(22, BRIEF_A1), leer(23)], "scanimage: sane_start: Document feeder jammed"))
@@ -341,7 +475,7 @@ class Dienst(unittest.TestCase):
         with open(pdf, "wb") as f:
             f.write(b"%PDF-1.7 half")
         dienst = scan.Dienst(self.cfg)
-        dienst.verarbeiten = lambda stapel, frage=None, v=dienst.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 3, "neu": True}]).replace('"erste_seite": 5', '"erste_seite": 3'))
+        dienst.verarbeiten = lambda stapel, frage=None, v=dienst.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2))
         dienst.tick()
         time.sleep(0.1)
         with open(pdf, "ab") as f:
