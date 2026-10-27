@@ -181,6 +181,8 @@ FAKE_SCANIMAGE = textwrap.dedent("""\
     #!/usr/bin/env python3
     # scanimage as the WF-3540 behaves: the runs in $FAKE_RUNS, one per call
     import json, os, sys
+    if os.environ.get("FAKE_ARGV"):   # every call's options, one JSON line each
+        open(os.environ["FAKE_ARGV"], "a").write(json.dumps(sys.argv[1:]) + "\\n")
     if "-L" in sys.argv:   # the search: what $FAKE_LIST says is on the network
         print(os.environ.get("FAKE_LIST", ""))
         sys.exit(0)
@@ -219,7 +221,8 @@ class Dienst(unittest.TestCase):
         self.d = tempfile.mkdtemp()
         self.cfg = scan.Config(data=os.path.join(self.d, "data"), eingang=os.path.join(self.d, "eingang"),
                                consume=os.path.join(self.d, "consume"), scanner="epson2:net:192.0.2.7", notify="papa",
-                               scanimage=os.path.join(self.d, "scanimage"), stable_s=0.2, poll_s=0, owner=(os.getuid(), os.getgid()))
+                               scanimage=os.path.join(self.d, "scanimage"), stable_s=0.2, poll_s=0, owner=(os.getuid(), os.getgid()),
+                               usb_sys=os.path.join(self.d, "sys"), usb_dev=os.path.join(self.d, "dev"))
         for k in ("data", "eingang", "consume"):
             os.makedirs(os.path.join(self.d, k))
         with open(self.cfg.scanimage, "w") as f:
@@ -239,7 +242,7 @@ class Dienst(unittest.TestCase):
 
     def tearDown(self):
         scan.ocr, scan.osd, scan.melde, scan.pdf_aus_bildern, scan.run, scan.tcp, scan.hole, scan.nachbarn, scan.wecken = self.alt
-        for k in ("FAKE_RUNS", "FAKE_LIST", "FAKE_A_FAILS"):
+        for k in ("FAKE_RUNS", "FAKE_LIST", "FAKE_A_FAILS", "FAKE_ARGV"):
             os.environ.pop(k, None)
 
     def hole(self, url, timeout):
@@ -412,6 +415,99 @@ class Dienst(unittest.TestCase):
         dienst = scan.Dienst(self.cfg)
         self.auftrag(dienst, "suchen")
         self.assertIn("von Hand", self.status()["suche"]["detail"])
+        self.assertIn("USB", self.status()["suche"]["detail"], "a scanner on the box's USB is found too (#801)")
+
+    def test_a_usb_scanner_is_found_under_its_backend_which_a_replug_does_not_change(self):
+        # #801: SANE names the fi-6130 by its bus and device number, which change when it is switched on again
+        os.environ["FAKE_LIST"] = "device `fujitsu:libusb:001:005' is a FUJITSU fi-6130dj scanner\n"
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "suchen")
+        self.assertEqual(self.status()["suche"]["funde"], [{"geraet": "fujitsu", "name": "FUJITSU fi-6130dj scanner"}])
+        # two of one backend: only the numbered names tell them apart
+        os.environ["FAKE_LIST"] += "device `fujitsu:libusb:001:007' is a FUJITSU fi-7160 scanner\n"
+        self.auftrag(dienst, "suchen")
+        self.assertEqual([f["geraet"] for f in self.status()["suche"]["funde"]], ["fujitsu:libusb:001:005", "fujitsu:libusb:001:007"])
+
+    def argv(self):
+        with open(os.environ["FAKE_ARGV"]) as f:
+            return [json.loads(z) for z in f]
+
+    def test_a_fujitsu_scans_with_its_own_feeder_options(self):
+        # #801: the fujitsu backend has neither --adf-mode nor --auto-eject, and fails on them
+        os.environ["FAKE_ARGV"] = os.path.join(self.d, "argv")
+        self.cfg.scanner, self.cfg.back_first = "fujitsu", False
+        self.runs(([vorne(81, BRIEF_A1), leer(82)], "scanimage: sane_start: Document feeder out of documents"),
+                  ([vorne(83, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage=None, v=dienst.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}]))
+        self.auftrag(dienst, "start")
+        self.auftrag(dienst, "probe")
+        stapel, probe = [a for a in self.argv() if "--batch-start=1" in a]
+        for a in (stapel, probe):
+            self.assertEqual(a[:2], ["-d", "fujitsu"])
+            self.assertNotIn("--adf-mode", a)
+            self.assertFalse([o for o in a if o.startswith("--auto-eject")], a)
+            # A4 on a backend whose page defaults to Letter: the page size before the area, or -y is cut to 279 mm
+            self.assertLess(a.index("--page-height"), a.index("-y"))
+            self.assertEqual(a[a.index("--page-height") + 1], "297")
+        self.assertEqual(stapel[stapel.index("--source") + 1], "ADF Duplex")
+        self.assertEqual(probe[probe.index("--source") + 1], "ADF Front")
+        self.assertIn("--batch-count=1", probe)
+
+    def test_an_epson_keeps_its_feeder_options(self):
+        os.environ["FAKE_ARGV"] = os.path.join(self.d, "argv")
+        self.runs(([vorne(84, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "probe")
+        a, = [a for a in self.argv() if "--batch-start=1" in a]
+        for o in (["--source", "Automatic Document Feeder"], ["--adf-mode", "Simplex"]):
+            self.assertEqual(a[a.index(o[0]):a.index(o[0]) + 2], o)
+        self.assertIn("--auto-eject=yes", a)
+        self.assertNotIn("--page-height", a)
+
+    def usb(self, *geraete, knoten=()):
+        """the host's USB tree as sysfs shows it, and the nodes this container was given at its start"""
+        for i, (bus, num) in enumerate(geraete):
+            d = os.path.join(self.cfg.usb_sys, "%d-%d" % (bus, i))
+            os.makedirs(d, exist_ok=True)
+            schreib(os.path.join(d, "busnum"), b"%d\n" % bus)
+            schreib(os.path.join(d, "devnum"), b"%d\n" % num)
+        os.makedirs(os.path.join(self.cfg.usb_sys, "1-0:1.0"), exist_ok=True)   # an interface: no node of its own
+        for bus, num in knoten:
+            os.makedirs(os.path.join(self.cfg.usb_dev, "%03d" % bus), exist_ok=True)
+            schreib(os.path.join(self.cfg.usb_dev, "%03d" % bus, "%03d" % num), b"")
+
+    def test_a_scanner_switched_on_after_the_start_restarts_the_service_once(self):
+        # #801: podman passes the USB nodes there are at the start; the fi-6130 switched on later is a new node
+        self.cfg.scanner = "fujitsu"
+        self.usb((1, 1), (1, 5), knoten=[(1, 1), (1, 5)])
+        dienst = scan.Dienst(self.cfg)
+        dienst.tick()
+        self.usb((1, 1), (1, 6), knoten=[])
+        auftrag = os.path.join(self.cfg.data, "auftrag", "1.json")
+        schreib(auftrag, b'{"aktion": "start", "von": "haus"}')
+        with self.assertRaises(SystemExit):
+            dienst.tick()
+        self.assertTrue(os.path.exists(auftrag), "the order waits for the restart, it is not lost")
+        self.assertIn("neu eingeschaltet", self.status()["detail"])
+        # after the restart the node is there still not (podman could not pass it): no restart loop
+        os.unlink(auftrag)
+        dienst = scan.Dienst(self.cfg)
+        dienst.tick()
+        dienst.tick()
+
+    def test_without_usb_in_the_container_nothing_restarts(self):
+        self.usb((1, 1), (1, 5))   # the host's tree, but no /dev/bus/usb passed in: an old unit
+        scan.Dienst(self.cfg).tick()
+
+    def test_a_usb_scanner_that_does_not_open_asks_whether_it_is_on(self):
+        self.cfg.scanner = "fujitsu"
+        os.environ["FAKE_A_FAILS"] = "1"
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "pruefen")
+        p = self.status()["pruefung"]
+        self.assertFalse(p["ok"])
+        self.assertEqual(p["detail"], "Der Scanner am USB der Box meldet sich nicht – ist er an und eingesteckt?")
 
     def test_a_new_scanner_is_checked_at_once_and_a_dead_one_says_why(self):
         dienst = scan.Dienst(self.cfg)

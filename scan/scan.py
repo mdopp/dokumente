@@ -3,8 +3,8 @@
 
 Two ways in, one way through. A stack is a file in the inbox folder
 (/eingang, the share's scan-eingang: a scanner that scans to a network
-folder) or a run of a SANE network scanner (SCANNER, ordered with
-`laib scan start`). Each page is turned (Tesseract OSD), read (OCR deu)
+folder) or a run of a SANE scanner, on the network or the box's USB
+(SCANNER, #801; ordered with `laib scan start`). Each page is turned (Tesseract OSD), read (OCR deu)
 and judged blank (bright and almost no words, or a back page where the
 front's print shows through: mirrored, the OCR reads clearly more). The
 household model marks where a new document starts; documents are runs
@@ -75,6 +75,8 @@ class Config:
     weck_s: float = 1.5          # the wake's wait for ARP answers
     tcp_s: float = 1.5           # one knock on one port
     blick_s: float = 900         # idle, the status looks again this often (#785): its age is a look's
+    usb_sys: str = "/sys/bus/usb/devices"   # the host's USB tree (#801)
+    usb_dev: str = "/dev/bus/usb"           # the nodes podman passed at the start (AddDevice=/dev/bus/usb)
 
     @classmethod
     def from_env(cls, env):
@@ -615,6 +617,8 @@ class Dienst:
             time.sleep(self.cfg.poll_s)
 
     def tick(self):
+        if not self.offen:
+            self.usb_neu()
         if self.cfg.scanner and self.pruefung.get("geraet") != self.cfg.scanner and not self.offen:
             self.pruefen()   # a new SCANNER: does it answer
         for pfad in sorted(glob.glob(os.path.join(self.cfg.data, "auftrag", "*.json"))):
@@ -635,6 +639,25 @@ class Dienst:
             self.aufraeumen()
         if not self.offen and self.status.get("zustand") in ("bereit", "fertig") and self.now() - self.geblickt >= self.cfg.blick_s:
             self.blick()
+
+    def usb_neu(self):
+        """a USB device plugged in or switched on after the start has no node here: podman passes the nodes
+        there are when the container starts, and libusb opens the node sysfs names (#801). Idle only, the
+        orders left where they are, and once per set of missing nodes: one podman cannot pass is no loop."""
+        fehlt = usb_fehlt(self.cfg.usb_sys, self.cfg.usb_dev)
+        marke = os.path.join(self.cfg.data, "usb-neustart.json")
+        try:
+            with open(marke) as f:
+                schon = json.load(f)
+        except (OSError, ValueError):
+            schon = []
+        if not fehlt or fehlt == schon:
+            return
+        with open(marke, "w") as f:
+            json.dump(fehlt, f)
+        log("USB: %s neu, der Container startet neu, damit er es sieht" % ", ".join(fehlt))
+        self.zustand("bereit", "Der Scanner wurde neu eingeschaltet oder eingesteckt: der Dienst verbindet ihn neu, einen Moment")
+        raise SystemExit(3)   # Restart=always brings it back with the new node
 
     def blick(self):
         """idle: knock on the scanner's port and say what the last stack did (#785); SANE stays closed"""
@@ -746,11 +769,9 @@ class Dienst:
     def scanimage(self, stapel, start):
         roh = os.path.join(self.ordner(stapel), "roh")
         os.makedirs(roh, exist_ok=True)
-        w, h = self.cfg.area
-        return [self.cfg.scanimage, "-d", self.cfg.scanner, "--source", "Automatic Document Feeder",
-                "--adf-mode", "Duplex" if self.cfg.duplex else "Simplex", "--resolution", str(self.cfg.dpi),
-                "--mode", self.cfg.mode, "-x", "%g" % w, "-y", "%g" % h, "--auto-eject=yes", "--format=pnm",
-                "--batch=" + os.path.join(roh, "bild-%04d.pnm"), "--batch-start=%d" % start]
+        return ([self.cfg.scanimage, "-d", self.cfg.scanner] + einzug(self.cfg.scanner, self.cfg.duplex, self.cfg.area)
+                + ["--resolution", str(self.cfg.dpi), "--mode", self.cfg.mode, "--format=pnm",
+                   "--batch=" + os.path.join(roh, "bild-%04d.pnm"), "--batch-start=%d" % start])
 
     def scanner_stapel(self, stapel):
         """scans until the feeder is empty; a stop mid-stack keeps the pages and waits for the rest"""
@@ -853,6 +874,12 @@ class Dienst:
             return self.zeige()
         funde = [{"geraet": m.group(1), "name": m.group(2).strip()}
                  for m in re.finditer(r"device [`'‘](.+?)['’] is an? (.+)", r.stdout)]
+        # a USB device's name carries its bus and device number, which change when it is switched on
+        # again: the backend alone opens its first device, and stays right while it is the only one (#801)
+        usb = [(f, re.fullmatch(r"([a-z0-9_]+):libusb:\d+:\d+", f["geraet"])) for f in funde]
+        for f, m in usb:
+            if m and sum(1 for _, n in usb if n and n.group(1) == m.group(1)) == 1:
+                f["geraet"] = m.group(1)
         for f in direkt:
             ip = adresse(f["geraet"])[0]
             if f["geraet"] in [g["geraet"] for g in funde]:
@@ -861,7 +888,7 @@ class Dienst:
                 continue   # sane-airscan knows it: its device, not a second find
             funde.append(f)
         self.suche = {"zustand": "fertig", "at": jetzt(), "funde": funde, "gefragt": len(lan),
-                      "detail": "%d Scanner gefunden" % len(funde) if funde else "kein Scanner gefunden: das Gerät an, im selben Netz? Sonst die Adresse von Hand, epson2:net:<ip>"}
+                      "detail": "%d Scanner gefunden" % len(funde) if funde else "kein Scanner gefunden: das Gerät an, im selben Netz oder am USB der Box? Sonst die Adresse von Hand, epson2:net:<ip>"}
         self.zeige()
 
     def erreicht(self, probe=False):
@@ -902,10 +929,9 @@ class Dienst:
         ordner = os.path.join(self.cfg.data, "probe")
         shutil.rmtree(ordner, ignore_errors=True)
         os.makedirs(ordner)
-        w, h = self.cfg.area
-        cmd = [self.cfg.scanimage, "-d", self.cfg.scanner, "--source", "Automatic Document Feeder", "--adf-mode", "Simplex",
-               "--resolution", str(self.cfg.dpi), "--mode", self.cfg.mode, "-x", "%g" % w, "-y", "%g" % h, "--auto-eject=yes",
-               "--format=pnm", "--batch=" + os.path.join(ordner, "bild-%04d.pnm"), "--batch-start=1", "--batch-count=1"]
+        cmd = ([self.cfg.scanimage, "-d", self.cfg.scanner] + einzug(self.cfg.scanner, False, self.cfg.area)
+               + ["--resolution", str(self.cfg.dpi), "--mode", self.cfg.mode, "--format=pnm",
+                  "--batch=" + os.path.join(ordner, "bild-%04d.pnm"), "--batch-start=1", "--batch-count=1"])
         roh = ""
         try:
             r = run(cmd, timeout=180)
@@ -1049,9 +1075,42 @@ def aus_text(host):
 
 
 def zu_text(geraet):
+    if am_usb(geraet):
+        return "Der Scanner am USB der Box meldet sich nicht – ist er an und eingesteckt?"
     ziel = adresse(geraet)
     return ("Der Scanner%s antwortet, lässt sich aber nicht öffnen – scannt gerade jemand anders? Sonst ihn aus- und "
             "wieder einschalten." % (" unter " + ziel[0] if ziel else ""))
+
+
+def am_usb(geraet):
+    """a scanner on the box's USB: a backend SANE does not reach over the network (#801)"""
+    return bool(geraet) and ":net:" not in geraet and not re.match(r"(airscan|escl|net):", geraet)
+
+
+def einzug(geraet, duplex, area):
+    """the feeder's options as the device's backend names them (#801); the area after the page size,
+    which bounds it. fujitsu: ADF Duplex/Front, a page that defaults to Letter, no --adf-mode, no
+    --auto-eject (it fails on both); epson2 and the rest as the WF-3540 took them."""
+    w, h = ("%g" % area[0], "%g" % area[1])
+    if geraet.split(":", 1)[0] == "fujitsu":
+        return ["--source", "ADF Duplex" if duplex else "ADF Front", "--page-width", w, "--page-height", h, "-x", w, "-y", h]
+    return ["--source", "Automatic Document Feeder", "--adf-mode", "Duplex" if duplex else "Simplex", "-x", w, "-y", h, "--auto-eject=yes"]
+
+
+def usb_fehlt(sys_usb, dev):
+    """the nodes of the host's USB devices this container lacks; none when it was given no USB at all"""
+    if not os.path.isdir(dev):
+        return []
+    fehlt = []
+    for d in glob.glob(os.path.join(sys_usb, "*")):
+        try:
+            bus, num = (int(open(os.path.join(d, n)).read()) for n in ("busnum", "devnum"))
+        except (OSError, ValueError):
+            continue   # an interface, no device of its own
+        knoten = os.path.join(dev, "%03d" % bus, "%03d" % num)
+        if not os.path.exists(knoten):
+            fehlt.append(knoten)
+    return sorted(fehlt)
 
 
 def adresse(geraet):

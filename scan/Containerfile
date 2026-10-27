@@ -1,4 +1,4 @@
-# Scan (laib #568): paper stacks into Paperless. SANE for a network scanner
+# Scan (laib #568): paper stacks into Paperless. SANE for a network or USB scanner (#801)
 # (sane-airscan finds eSCL/AirScan devices for the setup's search, #571),
 # Tesseract (deu + OSD) to turn and read each page, poppler and qpdf for a
 # PDF that came in, Pillow and img2pdf for the PDFs of scanned pages; the
