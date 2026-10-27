@@ -64,6 +64,11 @@ NACHHOLEN, EIN_TAG = 3, 86400    # a split the model failed: redone at most 3 ti
 WARTEN = (600, 3600, 4 * 3600)   # before each try, from the last failure: llama back from a restart, then longer
 
 
+# AUSWERTUNG is the contract helper's last run (ADR 0028), set by dienst.py;
+# the status carries it beside the scan's own
+AUSWERTUNG = {}
+
+
 @dataclass
 class Config:
     data: str = "/data"
@@ -797,6 +802,8 @@ class Dienst:
                             "naechster": datetime.datetime.fromtimestamp(st.nachholen.get("naechster", 0), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
                            for z, st in sorted(self.nachholen.items())]}
         s.update(mehr)
+        if AUSWERTUNG:
+            s["auswertung"] = dict(AUSWERTUNG)
         if zustand == "fehler":
             s["findings"] = [{"severity": "gelb", "detail": "Der letzte Stapel ist fehlgeschlagen: " + detail,
                               "fix": "laib scan redo --stapel %s" % s["stapel"] if s["stapel"] else "laib logs scan"}]
@@ -908,6 +915,9 @@ class Dienst:
             time.sleep(self.cfg.poll_s)
 
     def tick(self):
+        if getattr(self, "neu_zeigen", False):   # dienst.py: the evaluation has news for the status
+            self.neu_zeigen = False
+            self.zeige()
         if not self.offen:
             self.usb_neu()
         if self.cfg.scanner and self.pruefung.get("geraet") != self.cfg.scanner and not self.offen:

@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t dokumente:test -f Containerfile .
-      - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py
+      - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py
   image:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

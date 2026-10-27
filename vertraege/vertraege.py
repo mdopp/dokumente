@@ -184,9 +184,10 @@ HAEUFIG = set("der die das und ist in zu den dem des ein eine einer eines einem 
 
 
 class API:
-    def __init__(self, base, user, password):
+    def __init__(self, base, user, password, token=""):
         self.base = base.rstrip("/")
-        self.auth = "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
+        # Dokumente (ADR 0028): its own token of the narrowest user; inside Paperless, the admin's login
+        self.auth = ("Token " + token) if token else "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
 
     def __call__(self, method, path, body=None):
         r = urllib.request.Request(self.base + path, method=method, data=json.dumps(body).encode() if body is not None else None,
@@ -775,7 +776,8 @@ def main():
         rec = {}
     rec.setdefault("dokumente", {})
     rec.setdefault("erinnerungen", {})
-    api = API(E.get("PAPERLESS_API", "http://127.0.0.1:8000"), E.get("PAPERLESS_ADMIN_USER", "admin"), E.get("PAPERLESS_ADMIN_PASSWORD", ""))
+    api = API(E.get("PAPERLESS_API", "http://127.0.0.1:8000"), E.get("PAPERLESS_ADMIN_USER", "admin"), E.get("PAPERLESS_ADMIN_PASSWORD", ""),
+              E.get("PAPERLESS_TOKEN", ""))
     have = {f["name"].casefold(): (f["id"], f.get("data_type")) for f in api.all("/api/custom_fields/")}
     felder = {n: have[n.casefold()] for n in {**FELDER, **RECHNUNG_FELDER} if n.casefold() in have}
     if any(n not in felder for n in FELDER):
