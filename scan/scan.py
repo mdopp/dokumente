@@ -6,7 +6,10 @@ Two ways in, one way through. A stack is a file in the inbox folder
 folder) or a run of a SANE scanner, on the network or the box's USB
 (SCANNER, #801; ordered with `laib scan start`). Each page is turned (Tesseract OSD), read (OCR deu)
 and judged blank (bright and almost no words, or a back page where the
-front's print shows through: mirrored, the OCR reads clearly more). The
+front's print shows through: mirrored, the OCR reads clearly more). A page
+whose Code 128 or QR code reads PATCH T is a separator sheet (#814, Paperless'
+CONSUMER_BARCODE_STRING, Haus prints them): a stack with one cuts there, the
+documents are the runs between, and the model only names each run. Without one, the
 household model marks where a new document starts (an answer that leaves
 pages out or starts far too few is asked again once, then the pages'
 letterheads fill in, #808); documents are runs from one start to the next,
@@ -31,11 +34,12 @@ never filed). Each stack is archived under
 answers modell-<fenster>.json, log.txt) for
 SCAN_KEEP_DAYS; `laib scan redo --stapel <zeit>` splits it again.
 
-Stdlib only, apart from Pillow and img2pdf for images and PDFs; the
-command-line tools (scanimage, tesseract, pdftoppm, pdftotext, qpdf) come
-with the image (scan/Containerfile).
+Stdlib only, apart from Pillow and img2pdf for images and PDFs and libzbar
+(through ctypes) for the separators' codes; the command-line tools
+(scanimage, tesseract, pdftoppm, pdftotext, qpdf) come with the image
+(scan/Containerfile).
 """
-import concurrent.futures, datetime, glob, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.request
+import concurrent.futures, ctypes, datetime, glob, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.request
 from dataclasses import dataclass, field
 
 ZEIT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
@@ -47,6 +51,7 @@ LEER_WOERTER = 4    # fewer words than this on a bright page: blank
 FAST_HELL = 0.88    # no text at all from here up: blank (#808), a photo is darker, handwriting reads as marks
 FENSTER, SCHRITT, AB_FENSTER = 30, 25, 40   # big stacks go to the model in overlapping windows
 EPSON2 = 1865       # the epson2 backend's network port (#589)
+TRENNER = "PATCH T" # a separator sheet's code (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING
 
 
 @dataclass
@@ -208,6 +213,61 @@ class Seite:
     leer: bool = False
     warum: str = ""
     quelle: int = 0          # a PDF's page number, 0 for a scanned image
+    trenner: bool = False    # a separator sheet (#814): it ends the document before it and is dropped
+
+
+_ZBAR = []
+
+
+def zbar():
+    """the box's libzbar (libzbar0 in the image), None without it"""
+    if not _ZBAR:
+        try:
+            lib = ctypes.CDLL("libzbar.so.0")
+        except OSError:
+            lib = None
+        if lib:
+            v, u = ctypes.c_void_p, ctypes.c_uint
+            for name, res, args in (("zbar_image_scanner_create", v, []), ("zbar_image_scanner_set_config", ctypes.c_int, [v, ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+                                    ("zbar_image_create", v, []), ("zbar_image_set_format", None, [v, ctypes.c_ulong]),
+                                    ("zbar_image_set_size", None, [v, u, u]), ("zbar_image_set_data", None, [v, ctypes.c_char_p, ctypes.c_ulong, v]),
+                                    ("zbar_scan_image", ctypes.c_int, [v, v]), ("zbar_image_first_symbol", v, [v]), ("zbar_symbol_next", v, [v]),
+                                    ("zbar_symbol_get_data", v, [v]), ("zbar_symbol_get_data_length", u, [v]),
+                                    ("zbar_image_destroy", None, [v]), ("zbar_image_scanner_destroy", None, [v])):
+                f = getattr(lib, name)
+                f.restype, f.argtypes = res, args
+        _ZBAR.append(lib)
+    return _ZBAR[0]
+
+
+def strichcodes(b):
+    """the Code 128 and QR codes on a page, in any of the four turns; nothing without libzbar"""
+    lib = zbar()
+    if not lib:
+        return []
+    gray = b.data if b.c == 1 else b.data[1::b.c]   # the green channel stands for gray
+    scanner, img = lib.zbar_image_scanner_create(), lib.zbar_image_create()
+    try:
+        lib.zbar_image_scanner_set_config(scanner, 0, 0, 0)        # ZBAR_NONE, ZBAR_CFG_ENABLE: all off
+        for sym in (64, 128):                                        # ZBAR_QRCODE, ZBAR_CODE128
+            lib.zbar_image_scanner_set_config(scanner, sym, 0, 1)
+        lib.zbar_image_set_format(img, int.from_bytes(b"Y800", "little"))
+        lib.zbar_image_set_size(img, b.w, b.h)
+        lib.zbar_image_set_data(img, gray, len(gray), None)
+        out = []
+        if lib.zbar_scan_image(scanner, img) > 0:
+            sym = lib.zbar_image_first_symbol(img)
+            while sym:
+                out.append(ctypes.string_at(lib.zbar_symbol_get_data(sym), lib.zbar_symbol_get_data_length(sym)).decode("utf-8", "replace"))
+                sym = lib.zbar_symbol_next(sym)
+        return out
+    finally:
+        lib.zbar_image_destroy(img)
+        lib.zbar_image_scanner_destroy(scanner)
+
+
+def ist_trenner(b):
+    return TRENNER in strichcodes(b)
 
 
 def woerter(text):
@@ -237,7 +297,8 @@ def pruefe_seite(pfad, nr, text=None, quelle=0):
     """a page's turn, text and blankness. text: a PDF's own text layer, used as it is when it reads"""
     b = lies_pnm(pfad)
     s = Seite(nr=nr, bild=pfad, hell=helligkeit(b), quelle=quelle)
-    if text is not None and woerter(text) >= 20:
+    lesen = text is None or woerter(text) < 20
+    if not lesen:
         s.text = text
     else:
         grad, konf = osd(pfad)
@@ -246,6 +307,11 @@ def pruefe_seite(pfad, nr, text=None, quelle=0):
             s.drehung = grad
             s.bild = re.sub(r"(\.p[gpn]m)$", r"-gedreht\1", pfad)
             schreib_pnm(b, s.bild)
+    if ist_trenner(b):
+        # after the turn, before the OCR and the blank checks: a separator is bright and nearly wordless (#814)
+        s.trenner, s.warum = True, "Trennblatt"
+        return s
+    if lesen:
         s.text = ocr(s.bild)
     s.woerter = woerter(s.text)
     if s.hell >= HELL and s.woerter < LEER_WOERTER:
@@ -293,13 +359,25 @@ Die erste Seite des Auszugs ist immer neu. Antworte nur mit JSON in genau dieser
 {"seiten":[{"seite":1,"neu":true,"leer":false,"absender":"…","grund":"…"}],"dokumente":[{"erste_seite":1,"art":"…","absender":"…","datum":"JJJJ-MM-TT","titel":"…"}]}"""
 
 
-def nachricht(seiten):
+BENENNEN = """Du bekommst den OCR-Text eines gescannten Dokuments, Seite für Seite. Es ist genau ein Dokument; wo es beginnt und endet, steht fest.
+
+Bestimme:
+- art: Rechnung, Brief, Bescheid, Vertrag, Kontoauszug, Bescheinigung …
+- absender: kurz, z. B. „Stadtwerke“ oder „Finanzamt Osnabrück“
+- datum: das Datum des Schreibens als JJJJ-MM-TT, leer wenn keins zu sehen ist
+- titel: kurz und deutsch, ohne Absender und Datum, z. B. „Rechnung Schornsteinfeger 2023“
+
+Antworte nur mit JSON in genau dieser Form:
+{"art":"…","absender":"…","datum":"JJJJ-MM-TT","titel":"…"}"""
+
+
+def nachricht(seiten, anweisung=ANWEISUNG, kopf=None):
     """the model's messages for these pages, numbered 1..n as sent, never by their place in the stack: after
     the blanks went those skip, and the model answered 1, 2, 3 (#808); each page's text cut so a big stack fits"""
     limit = max(300, min(1500, 24000 // max(1, len(seiten))))
     teile = ["--- Seite %d ---\n%s" % (i, re.sub(r"\s+\n", "\n", s.text.strip())[:limit] or "(kein Text)") for i, s in enumerate(seiten, 1)]
-    kopf = "%d Seiten, Seite 1 bis %d. Antworte für jede Seite.\n\n" % (len(seiten), len(seiten))
-    return [{"role": "system", "content": ANWEISUNG}, {"role": "user", "content": kopf + "\n\n".join(teile)}]
+    kopf = kopf or "%d Seiten, Seite 1 bis %d. Antworte für jede Seite.\n\n" % (len(seiten), len(seiten))
+    return [{"role": "system", "content": anweisung}, {"role": "user", "content": kopf + "\n\n".join(teile)}]
 
 
 # a first page: the recipient's address and a date or a number; a page two says so (#808)
@@ -469,6 +547,42 @@ def trennen(seiten, frage, roh=None):
                 else:
                     meta.pop(s.nr, None)
     return laeufe(seiten, flags, meta)
+
+
+def stuecke(seiten):
+    """the runs of content pages between separator sheets (#814); separators and blanks dropped"""
+    out = [[]]
+    for s in seiten:
+        if s.trenner:
+            out.append([])
+        elif not s.leer:
+            out[-1].append(s)
+    return [r for r in out if r]
+
+
+def benennen(stuecke, frage, roh):
+    """the separators' documents, as they stand, each named by the model (#814): kind, sender, date, title.
+    An answer that is no JSON leaves that one unnamed; a model that fails is not asked again (it may
+    have waited half an hour for the card already). (documents, how many unnamed, the first reason)"""
+    docs, ohne, grund = [], 0, ""
+    for i, teil in enumerate(stuecke, 1):
+        d = {}
+        if not grund:
+            try:
+                text = frage(nachricht(teil, BENENNEN, "Ein Dokument, %d Seiten.\n\n" % len(teil)))
+                roh.append({"fenster": i, "versuch": 1, "seiten": [s.nr for s in teil], "antwort": text})
+                a, b = text.find("{"), text.rfind("}")
+                d = json.loads(text[a:b + 1]) if 0 <= a < b else None
+                if not isinstance(d, dict):
+                    raise ValueError("keine JSON-Antwort")
+            except ValueError:
+                d = {}
+            except Exception as e:
+                grund = str(e)[:160] or type(e).__name__
+        ohne += not d
+        docs.append(Dokument(seiten=teil, art=str(d.get("art") or ""), absender=str(d.get("absender") or ""),
+                             datum=str(d.get("datum") or ""), titel=str(d.get("titel") or "")))
+    return docs, ohne, grund or "keine JSON-Antwort"
 
 
 # ---- the model, through the lease's proxy ----
@@ -1047,8 +1161,8 @@ class Dienst:
                 detail, ok, roh = "Probeseite: keine Seite. Ein Blatt in den Einzug legen.", False, scanner_grund(r.stderr or "")
             else:
                 s = pruefe_seite(bilder[0], 1)
-                ok = s.woerter >= LEER_WOERTER
-                detail = "Probeseite: %d Wörter gelesen%s, Helligkeit %d %%%s" % (
+                ok = s.trenner or s.woerter >= LEER_WOERTER
+                detail = "Probeseite: Trennblatt erkannt (%s)" % TRENNER if s.trenner else "Probeseite: %d Wörter gelesen%s, Helligkeit %d %%%s" % (
                     s.woerter, ", um %d° gedreht" % s.drehung if s.drehung else "", round(s.hell * 100), "" if ok else ": leer oder unlesbar, richtig herum eingelegt?")
         except (OSError, subprocess.SubprocessError, ValueError) as e:
             detail, ok, roh = "Probeseite fehlgeschlagen: der Scanner hat das Blatt nicht geliefert.", False, str(e)
@@ -1118,19 +1232,27 @@ class Dienst:
 
     def _verarbeiten(self, stapel, frage):
         seiten, original, gewendet = self.seiten(stapel)
-        inhalt = [s for s in seiten if not s.leer]
+        # the turn (#808) came first: the separators cut the stack in reading order (#814)
+        trenner = [s for s in seiten if s.trenner]
+        inhalt = [s for s in seiten if not s.leer and not s.trenner]
         if not inhalt:
-            self.ende(stapel, "abgebrochen", "Scan abgebrochen: alle %d Seiten sind leer, nichts abgelegt." % len(seiten))
+            self.ende(stapel, "abgebrochen", "Scan abgebrochen: alle %d Seiten sind leer%s, nichts abgelegt." % (len(seiten), " oder Trennblätter" if trenner else ""))
             return
         self.zustand("trennt", "trennt %d Seiten" % len(inhalt), stapel)
         hinweis, roh = "", []
-        try:
-            docs, leer_modell = trennen(inhalt, frage, roh)
-        except Exception as e:
-            hinweis = "Das Modell konnte nicht trennen (%s): alles liegt als ein Dokument „Stapel unsortiert“ in Paperless." % str(e)[:160]
-            for s in inhalt:
-                s.leer, s.warum = False, ""
-            docs, leer_modell = [Dokument(seiten=inhalt, titel="Stapel unsortiert")], []
+        if trenner:
+            docs, ohne, grund = benennen(stuecke(seiten), frage, roh)
+            leer_modell = []
+            if ohne:
+                hinweis = "Das Modell konnte %d von %d Dokumenten nicht benennen (%s): sie heißen „Dokument“." % (ohne, len(docs), grund)
+        else:
+            try:
+                docs, leer_modell = trennen(inhalt, frage, roh)
+            except Exception as e:
+                hinweis = "Das Modell konnte nicht trennen (%s): alles liegt als ein Dokument „Stapel unsortiert“ in Paperless." % str(e)[:160]
+                for s in inhalt:
+                    s.leer, s.warum = False, ""
+                docs, leer_modell = [Dokument(seiten=inhalt, titel="Stapel unsortiert")], []
         for alt in glob.glob(os.path.join(self.ordner(stapel), "modell-*.json")):
             os.unlink(alt)   # a redo's answers, not the last run's
         for r in roh:   # the model's answers as they came, beside the plan: a wrong split can be read (#808)
@@ -1140,7 +1262,7 @@ class Dienst:
             json.dump({"seiten": [{k: v for k, v in s.__dict__.items() if k != "text"} for s in seiten],
                        "dokumente": [{"seiten": [s.nr for s in d.seiten], "art": d.art, "absender": d.absender, "datum": d.datum,
                                       "titel": d.titel, "name": dateiname(d)} for d in docs], "hinweis": hinweis,
-                       "umgedreht": gewendet}, f, ensure_ascii=False, indent=1)
+                       "umgedreht": gewendet, "trennblaetter": [s.nr for s in trenner]}, f, ensure_ascii=False, indent=1)
         self.zustand("legt-ab", "legt %d Dokumente ab" % len(docs), stapel)
         vergeben = set()
         ordner = os.path.join(self.cfg.consume, self.cfg.tag)
@@ -1156,10 +1278,12 @@ class Dienst:
             stapel.abgelegt.append(name)
             self.speichern(stapel)
             self.protokoll(stapel, "abgelegt: %s (Seiten %s)" % (name, ",".join(str(s.nr) for s in d.seiten)))
-        leer = len(seiten) - len(inhalt) + len(leer_modell)
+        leer = len(seiten) - len(inhalt) - len(trenner) + len(leer_modell)
         kopf = ("%d Blatt, " % ((len(seiten) + 1) // 2 if self.cfg.duplex else len(seiten))) if stapel.quelle == "scanner" else ("%s: " % stapel.datei)
         text = "Scan fertig: %s%d Seiten, %d leer entfernt, %d Dokumente in Paperless (Tag %s):\n%s" % (
             kopf, len(seiten), leer, len(docs), self.cfg.tag, "\n".join("- " + n[:-4] for n in stapel.abgelegt))
+        if trenner:
+            text += "\n" + ("1 Trennblatt erkannt." if len(trenner) == 1 else "%d Trennblätter erkannt." % len(trenner))
         if gewendet:
             text += "\n" + lage(self.cfg.scanner)
         if hinweis:
@@ -1406,7 +1530,8 @@ def main(argv):
         os.makedirs(d, exist_ok=True)
     sane_netz(cfg.scanner)
     sane_suche()
-    log("bereit: Eingang %s, Scanner %s, Modell %s" % (cfg.eingang, cfg.scanner or "keiner", cfg.model_name or "keins"))
+    log("bereit: Eingang %s, Scanner %s, Modell %s, Trennblätter %s" % (cfg.eingang, cfg.scanner or "keiner", cfg.model_name or "keins",
+                                                                     "ja" if zbar() else "nein (libzbar.so.0 fehlt)"))
     Dienst(cfg).schleife()
     return 0
 

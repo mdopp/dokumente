@@ -1,13 +1,15 @@
 # Scan (laib #568): paper stacks into Paperless. SANE for a network or USB scanner (#801)
 # (sane-airscan finds eSCL/AirScan devices for the setup's search, #571),
 # Tesseract (deu + OSD) to turn and read each page, poppler and qpdf for a
-# PDF that came in, Pillow and img2pdf for the PDFs of scanned pages; the
-# program itself is scan.py, stdlib apart from those two.
+# PDF that came in, Pillow and img2pdf for the PDFs of scanned pages, libzbar
+# for the separator sheets' Code 128 / QR (#814: the library alone, scan.py
+# calls it through ctypes; zbar-tools would pull in ImageMagick); the program
+# itself is scan.py, stdlib apart from those.
 FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       sane-utils libsane1 sane-airscan tesseract-ocr tesseract-ocr-deu tesseract-ocr-osd \
-      poppler-utils qpdf python3 python3-pil python3-img2pdf ca-certificates \
+      poppler-utils qpdf libzbar0t64 python3 python3-pil python3-img2pdf ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 COPY scan/scan.py /opt/scan.py
