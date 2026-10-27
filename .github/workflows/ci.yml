@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  test:
+    # the tests run in the image itself: SANE, Tesseract, poppler, zbar, Pillow as on the box
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t dokumente:test -f Containerfile .
+      - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py
+  image:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ghcr.io/mdopp/dokumente:latest,ghcr.io/mdopp/dokumente:${{ github.sha }}

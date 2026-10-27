@@ -1,4 +1,4 @@
-# Scan (laib #568): paper stacks into Paperless. SANE for a network or USB scanner (#801)
+# Dokumente (laib ADR 0028): paper and files into Paperless. The scan (laib #568): paper stacks into Paperless. SANE for a network or USB scanner (#801)
 # (sane-airscan finds eSCL/AirScan devices for the setup's search, #571),
 # Tesseract (deu + OSD) to turn and read each page, poppler and qpdf for a
 # PDF that came in, Pillow and img2pdf for the PDFs of scanned pages, libzbar
@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 COPY scan/scan.py /opt/scan.py
-LABEL org.opencontainers.image.source=https://github.com/mdopp/laib
+COPY vertraege/vertraege.py /opt/vertraege.py
+LABEL org.opencontainers.image.source=https://github.com/mdopp/dokumente
 ENV PYTHONUNBUFFERED=1
 ENTRYPOINT ["python3", "/opt/scan.py"]

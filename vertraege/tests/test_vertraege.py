@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 DIR = Path(__file__).resolve().parent.parent
-SCRIPT = DIR / "paperless-vertraege.py"
+SCRIPT = DIR / "vertraege.py"
 AUTH = "Basic " + base64.b64encode(b"admin:adminpw").decode()
 NAMES = ["Anbieter", "Vertragsnummer", "Vertragsbeginn", "Vertragsende", "Kündigungsfrist",
          "Nächster Kündigungstermin", "Betrag", "Zahlungsintervall", "Rechnungsnummer", "Fällig am", "Verwendungszweck"]
@@ -348,20 +348,6 @@ class Vertraege(Lauf):
         self.assertIn("Haus", r.stdout)
         self.run_job(p, haus=(h := Haus()), ai="false")
         self.assertEqual(len(h.reminders()), 1, "not recorded while there was no Haus")
-
-    def test_the_unit_hands_the_token_by_name_never_on_argv(self):
-        unit = (DIR / "paperless-vertraege.service").read_text()
-        exec_line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
-        self.assertIn("paperless-vertraege.sh", exec_line)
-        self.assertNotIn("${HAUSHALT_TOKEN}", exec_line)
-        self.assertIn('Environment="HAUSHALT_TOKEN=${HAUSHALT_TOKEN}"', unit)
-        self.assertTrue((DIR / "paperless-vertraege.timer").exists())
-        sh = (DIR / "paperless-vertraege.sh").read_text()
-        self.assertIn("-e HAUSHALT_TOKEN ", sh)
-        self.assertIn("-e HAUSHALT_NAMEN ", sh)
-        self.assertIn('Environment="HAUSHALT_NAMEN=${HAUSHALT_NAMEN}"', unit)
-        self.assertIn("--user paperless", sh)
-        self.assertNotIn("$HAUSHALT_TOKEN", sh)
 
     # #721 (a): a notice date that passed moves on by the renewal the text names
     def test_a_past_notice_date_moves_on_by_the_renewal_the_text_names(self):
@@ -709,14 +695,6 @@ class Rechnungen(Lauf):
         self.assertEqual(self.zweck(SHOP + "\nVerwendungszweck: K-555", {"wert": "K-556", "beleg": "Verwendungszweck: K-556"})[:2],
                          (None, True), "a reference the text does not back is a guess: the family looks")
 
-    def test_the_unit_hands_the_invoice_kinds_on(self):
-        self.assertIn('Environment="RECHNUNG_ARTEN=${RECHNUNG_ARTEN}"', (DIR / "paperless-vertraege.service").read_text())
-        # quoted, or systemd splits „Vertrag, Versicherung, Bescheid“ at the spaces and drops the rest (#829)
-        self.assertIn('Environment="VERTRAG_ARTEN=${VERTRAG_ARTEN}"', (DIR / "paperless-vertraege.service").read_text())
-        self.assertIn("-e RECHNUNG_ARTEN ", (DIR / "paperless-vertraege.sh").read_text())
-        self.assertIn("RECHNUNG_ARTEN: Rechnung", (DIR / "values.example.yml").read_text())
-
-
 # #820: the sender's contact into the family address book. Invented firms, the standard example IBANs.
 IBAN_DE, IBAN_GB = "DE89 3704 0044 0532 0130 00", "GB82 WEST 1234 5698 7654 32"
 ANSCHRIFT = "Familie Erika Mustermann\nMusterstraße 1\n12345 Beispielstadt\n"
@@ -1033,102 +1011,3 @@ RECHNUNG = ("Rechnung Nr. 2026-0042 Datum 12.05.2026 Pos Menge Artikel Einzelpre
 # what Tesseract makes of an upside-down or blurred page (the box, #567)
 SALAT = ("ae Wu ZEN NIE aD TER cn Ta PEN ER ne nase Fe ri oa DE HE LE ne EEE Tre En Er ze ae Ze ae Br pr ee Er RE an "
          "ee ee ae ae Sr Sn En Te ne ZZ ae ER ea ri ae ae Er Tue ae i ' Eee ; = NN — = rn DD . ‚ e7 = ae IE ee re")
-
-
-class Sender(unittest.TestCase):
-    """paperless-vertraege.sh, the host's part: runs the script in the container, hands its messages to laib-notify"""
-
-    def test_messages_go_to_eingang_logs_to_the_journal_and_the_exit_code_stays(self):
-        tmp = tempfile.mkdtemp()
-        podman = os.path.join(tmp, "podman")
-        with open(podman, "w") as f:
-            f.write("#!/bin/sh\necho \"$@\" >%s/argv\ncat >%s/stdin\necho 'vertraege: eine Zeile'\n"
-                    "echo 'meldung {\"an\": \"\", \"betreff\": \"Kündigung prüfen: Strom\", \"text\": \"Kündigen bis 31.12.2026\", \"at\": 1}'\n"
-                    "exit 3\n" % (tmp, tmp))
-        os.chmod(podman, 0o755)
-        skript = os.path.join(tmp, "skript.py")
-        with open(skript, "w") as f:
-            f.write("print('hallo')")
-        env = {"PATH": os.environ["PATH"], "PODMAN": podman, "VERTRAEGE_SKRIPT": skript,
-               "NOTIFY_EINGANG": os.path.join(tmp, "eingang"), "HAUSHALT_TOKEN": "haustoken"}
-        r = subprocess.run(["sh", str(DIR / "paperless-vertraege.sh")], env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(r.returncode, 3, "the script's exit code is the unit's")
-        self.assertIn("vertraege: eine Zeile", r.stdout)
-        self.assertNotIn("meldung {", r.stdout)
-        [f] = os.listdir(os.path.join(tmp, "eingang"))
-        self.assertTrue(f.startswith("paperless-") and f.endswith(".json"), f)
-        with open(os.path.join(tmp, "eingang", f)) as fh:
-            self.assertEqual(json.load(fh)["betreff"], "Kündigung prüfen: Strom")
-        argv = open(os.path.join(tmp, "argv")).read()
-        self.assertNotIn("haustoken", argv)
-        self.assertIn("-e HAUSHALT_TOKEN", argv)
-        self.assertEqual(open(os.path.join(tmp, "stdin")).read(), "print('hallo')")
-
-    def fakes(self):
-        tmp = tempfile.mkdtemp()
-        for name, body in (("podman", "cat >/dev/null\necho 'vertraege: lief'\n"), ("systemctl", "echo \"$@\" >>%s/gestartet\n" % tmp)):
-            with open(os.path.join(tmp, name), "w") as f:
-                f.write("#!/bin/sh\n" + body)
-            os.chmod(os.path.join(tmp, name), 0o755)
-        os.makedirs(os.path.join(tmp, "thumbnails"))
-        open(os.path.join(tmp, "skript.py"), "w").close()
-        return tmp, {"PATH": os.environ["PATH"], "PODMAN": os.path.join(tmp, "podman"), "SYSTEMCTL": os.path.join(tmp, "systemctl"),
-                     "VERTRAEGE_SKRIPT": os.path.join(tmp, "skript.py"), "VERTRAEGE_STAND": os.path.join(tmp, "stand", "lauf"),
-                     "VORSCHAU": os.path.join(tmp, "thumbnails"), "RUHE": "120", "NOTIFY_EINGANG": os.path.join(tmp, "eingang")}
-
-    def started(self, tmp):
-        try:
-            return Path(tmp, "gestartet").read_text().splitlines()
-        except FileNotFoundError:
-            return []
-
-    def test_a_run_marks_its_start_and_refreshes_the_status(self):
-        # #829: the start is what neu compares against; the status line shows the run at once
-        tmp, env = self.fakes()
-        vorher = time.time()
-        r = subprocess.run(["sh", str(DIR / "paperless-vertraege.sh")], env=env, capture_output=True, text=True, timeout=30)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertGreaterEqual(os.stat(env["VERTRAEGE_STAND"]).st_mtime, int(vorher))
-        self.assertEqual(self.started(tmp), ["--user start --no-block paperless-check.service"])
-
-    def test_new_documents_start_one_run_once_paperless_is_quiet(self):
-        # #829: Paperless writes a thumbnail for each document it files; neu (every two minutes) starts the
-        # run once that folder changed after the last run's start and has been quiet for RUHE seconds,
-        # so a stack of 13 documents is one run
-        tmp, env = self.fakes()
-        neu = lambda: subprocess.run(["sh", str(DIR / "paperless-vertraege.sh"), "neu"], env=env, capture_output=True, text=True, timeout=30)
-        jetzt = time.time()
-        os.utime(env["VORSCHAU"], (jetzt - 30, jetzt - 30))
-        r = neu()
-        self.assertEqual((r.returncode, self.started(tmp)), (0, []), "still filing: wait")
-        os.utime(env["VORSCHAU"], (jetzt - 300, jetzt - 300))
-        r = neu()
-        self.assertEqual((r.returncode, self.started(tmp)), (0, ["--user start --no-block paperless-vertraege.service"]),
-                         "quiet, and no run since: one run")
-        os.makedirs(os.path.dirname(env["VERTRAEGE_STAND"]))
-        open(env["VERTRAEGE_STAND"], "w").close()
-        os.utime(env["VERTRAEGE_STAND"], (jetzt - 200, jetzt - 200))
-        neu()
-        self.assertEqual(len(self.started(tmp)), 1, "nothing new since the last run started")
-        os.utime(env["VORSCHAU"], (jetzt - 150, jetzt - 150))
-        neu()
-        self.assertEqual(len(self.started(tmp)), 2, "filed during or after that run: once more")
-        env["VORSCHAU"] = os.path.join(tmp, "fehlt")
-        r = neu()
-        self.assertEqual((r.returncode, len(self.started(tmp))), (0, 2), "no folder to look at: the hourly run stays, never a red unit")
-        self.assertEqual(r.stdout + r.stderr, "", "and no line every two minutes")
-
-    def test_the_units_wire_neu_to_the_thumbnails_and_the_run(self):
-        timer = (DIR / "paperless-vertraege-neu.timer").read_text()
-        unit = (DIR / "paperless-vertraege-neu.service").read_text()
-        self.assertIn("OnUnitActiveSec=2min", timer)
-        self.assertIn("[Install]", timer)
-        self.assertNotIn("[Install]", unit, "a timer's oneshot: inactive between ticks, only a failed one counts")
-        self.assertIn('Environment="VORSCHAU=${DATA_DIR}/paperless/media/documents/thumbnails"', unit)
-        self.assertIn("paperless-vertraege.sh neu", unit)
-        self.assertIn("OnCalendar=hourly", (DIR / "paperless-vertraege.timer").read_text(), "the hourly catch-all stays")
-        self.assertNotIn("POST_CONSUME", (DIR / "paperless.container").read_text(), "nothing new inside the container")
-
-
-if __name__ == "__main__":
-    unittest.main()
