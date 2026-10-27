@@ -57,7 +57,9 @@ class Auswertung:
         if not os.path.exists(self.skript):
             self.skript = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vertraege", "vertraege.py")
         data = env.get("DOKUMENTE_DATA", "/data")
-        self.datei = env.get("VERTRAEGE_FILE") or os.path.join(data, "laib-vertraege.json")
+        # the record is backed up (laib mounts /dokumente); /data is the scan's transient folder
+        self.datei = env.get("VERTRAEGE_FILE") or (
+            "/dokumente/laib-vertraege.json" if os.path.isdir("/dokumente") else os.path.join(data, "laib-vertraege.json"))
         self.meldungen = env.get("MELDUNGEN", "/meldungen")
         self.ruhe = float(env.get("AUSWERTUNG_RUHE_S") or 60)
         self.spaetestens = float(env.get("AUSWERTUNG_SPAETESTENS_S") or 600)
@@ -139,19 +141,22 @@ class Auswertung:
                 letzte = (letzte + [z])[-5:]
         rc = p.wait()
         uhr.cancel()
-        lauf = {}
+        lauf, rec = {}, {}
         try:
             with open(self.datei, encoding="utf-8") as f:
-                lauf = json.load(f).get("lauf") or {}
-        except (OSError, ValueError):
+                rec = json.load(f)
+            lauf = rec.get("lauf") or {}
+        except (OSError, ValueError, AttributeError):
             pass
+        befunde = leere_absender(rec)
         dauer = int(time.monotonic() - start)
         if rc != 0:
             satz = "Die Auswertung brach ab; der nächste Lauf versucht es wieder." if dauer < self.zeit else \
                    "Die Auswertung dauerte zu lange und wurde abgebrochen; der nächste Lauf macht weiter."
             return self.zeigen({"zustand": "fehler", "at": jetzt(), "anlass": anlass, "lauf": lauf, "detail": satz,
-                                "einzelheiten": " | ".join(letzte)})
-        self.zeigen({"zustand": "fertig", "at": jetzt(), "anlass": anlass, "lauf": lauf, "detail": satz_lauf(lauf, anlass)})
+                                "einzelheiten": " | ".join(letzte), "findings": befunde})
+        self.zeigen({"zustand": "fertig", "at": jetzt(), "anlass": anlass, "lauf": lauf, "detail": satz_lauf(lauf, anlass),
+                     "findings": befunde})
 
     def melden(self, roh):
         """one message for the owner: a file in laib-notify's eingang, whole or not at all"""
@@ -175,6 +180,22 @@ class Auswertung:
         scan.AUSWERTUNG.update(stand)
         if self.dienst is not None:
             self.dienst.neu_zeigen = True
+
+
+def leere_absender(rec):
+    """laib#737, dokumente#5: a household person the helper cleared off its documents stays a
+    correspondent (Paperless marks none as made by its AI), for the owner to delete"""
+    try:
+        leer = (rec.get("korrespondenten") or {}).get("leer") or []
+    except AttributeError:
+        return []
+    if not leer:
+        return []
+    return [{"severity": "gelb",
+             "detail": "Absender aus dem Haushalt ohne Dokumente: %s (Dokumente hat sie von den Dokumenten genommen, die KI hatte "
+                       "sie als Absender eingetragen)" % ", ".join("„%s“" % n for n in leer[:10]),
+             "fix": "in Paperless unter Korrespondenten löschen, wenn sie niemand braucht; Dokumente löscht keine, "
+                    "weil Paperless nicht kennzeichnet, welche die KI angelegt hat"}]
 
 
 def satz_lauf(lauf, anlass):

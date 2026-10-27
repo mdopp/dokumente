@@ -152,3 +152,31 @@ class Lauf(Basis):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Absender(Basis):
+    """laib#737, dokumente#5: a household correspondent left without documents is a yellow finding"""
+
+    def test_left_household_correspondents_are_a_yellow_finding_in_the_status(self):
+        cfg = scan.Config.from_env({})
+        cfg.data = self.tmp
+        d = scan.Dienst(cfg)
+        a = dienst.Auswertung(self.env, d)
+        a.lauf("stündlich")   # the fake writes a record without them
+        d.zeige()
+        st = json.loads(Path(self.tmp, "laib-status.json").read_text())
+        self.assertFalse([f for f in st.get("findings", []) if "Haushalt" in f["detail"]], "none: nothing to say")
+        self.assertEqual(dienst.leere_absender({"korrespondenten": {"leer": ["Erika Mustermann", "Familie Mustermann"]}})[0]["severity"], "gelb")
+        rec = os.path.join(self.tmp, "laib-vertraege.json")
+        orig = Path(self.zaehler).parent / "fake.py"
+        # the next run's record names two (the fake keeps korrespondenten when told to)
+        Path(orig).write_text(Path(orig).read_text().replace(
+            '"pruefen": 1}}', '"pruefen": 1}, "korrespondenten": {"leer": ["Erika Mustermann", "Familie Mustermann"]}}'))
+        a.lauf("stündlich")
+        d.zeige()
+        st = json.loads(Path(self.tmp, "laib-status.json").read_text())
+        [f] = [f for f in st["findings"] if "Haushalt" in f["detail"]]
+        self.assertEqual(f["severity"], "gelb")
+        self.assertIn("„Erika Mustermann“, „Familie Mustermann“", f["detail"])
+        self.assertIn("Korrespondenten", f["fix"])
+        self.assertTrue(os.path.exists(rec))
