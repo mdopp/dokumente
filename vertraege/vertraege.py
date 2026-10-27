@@ -94,7 +94,11 @@ Haushalt URL and token come from the unit. The standard library only.
    is asked, sent or recorded.
 
 What it filled and reminded is kept in laib-vertraege.json in Paperless' data
-folder (backed up), so a run never asks or reminds twice."""
+folder (backed up), so a run never asks or reminds twice. The record's lauf
+says what the last run did (#829): its start, the contracts and invoices read,
+the contacts Haus took, the reminders made, the documents marked `prüfen`, and
+whether the model did not answer; paperless-mail.py's check makes the status
+line of it ("Vertragshelfer: zuletzt 13:05, 3 Rechnungen gelesen …")."""
 import base64, calendar, hashlib, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
 from datetime import date, timedelta
 
@@ -172,6 +176,8 @@ VERLAENGERT = re.compile(r"verlänger\w*[^.;]{0,100}?" + UM, re.I)
 # the text layer (#721): word-shaped tokens, and the short words every German or English text has
 WORT = re.compile(r"[a-zäöüß]{2,}|[A-ZÄÖÜ][a-zäöüß]+|[A-ZÄÖÜ]{2,}")
 NEUTRAL = re.compile(r"[\d.,:;/%€+=*#&|\-–—()\[\]{}'\"„“”‚‘»«]+")
+LAUF = {"vertraege": 0, "rechnungen": 0, "kontakte": 0, "erinnerungen": 0}   # this run, for the record's lauf (#829)
+GEPRUEFT = set()                                                              # the documents this run marked prüfen
 HAEUFIG = set("der die das und ist in zu den dem des ein eine einer eines einem einen mit von für auf im an als bei nicht "
               "sie ihr ihre ihren wir sich es ich oder auch nach bis zum zur wird werden sind wurde aus über vom am sowie "
               "uns dass durch kann the and of to for is on with you your this that are".split())
@@ -495,6 +501,8 @@ def lesen(api, doc, antwort, felder, prüfen_tag, rechnung=False, was="Vertragsd
         have.update({fid: v for fid, (_, v) in neu.items()})
         body["custom_fields"] = [{"field": f, "value": v} for f, v in have.items()]   # the list replaces the document's
         gefuellt = [name for name, _ in neu.values()]
+    if verworfen:
+        GEPRUEFT.add(doc["id"])
     if verworfen and prüfen_tag() not in (doc.get("tags") or []):
         body["tags"] = (doc.get("tags") or []) + [prüfen_tag()]
     api("PATCH", "/api/documents/%d/" % doc["id"], body)
@@ -534,6 +542,7 @@ def verlaengerung(text):
 
 def markieren(api, doc_id, note, prüfen_tag):
     """the tag prüfen and a note on a document"""
+    GEPRUEFT.add(doc_id)
     d = api("GET", "/api/documents/%d/" % doc_id)
     if prüfen_tag() not in (d.get("tags") or []):
         api("PATCH", "/api/documents/%d/" % doc_id, {"tags": (d.get("tags") or []) + [prüfen_tag()]})
@@ -708,6 +717,7 @@ def kontakte(api, rec, prüfen_tag):
             a = {}
         felder = a.get("felder") or {}
         rec["kontakte"][k] = {"status": a.get("status") or "?", "felder": felder, "am": am}
+        LAUF["kontakte"] += a.get("status") != "unveraendert"
         print("vertraege: Dokument %s: Kontakt „%s“ %s" % (k, firma, a.get("status") or text.split("\n")[0]))
         if felder.get("iban") == "abweichend":   # the fake-invoice trick: a known firm with a new account
             try:
@@ -746,8 +756,17 @@ def verlaengern(api, d, fid, termin, heute, markiert, prüfen_tag):
     return neu
 
 
+def speichern(path, rec, am):
+    rec["lauf"] = {"am": am, **LAUF, "pruefen": len(GEPRUEFT)}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
 def main():
     heute = datum(E.get("HEUTE")) or date.today()
+    am = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     path = E.get("VERTRAEGE_FILE", "/usr/src/paperless/data/laib-vertraege.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -761,7 +780,8 @@ def main():
     felder = {n: have[n.casefold()] for n in {**FELDER, **RECHNUNG_FELDER} if n.casefold() in have}
     if any(n not in felder for n in FELDER):
         print("vertraege: Paperless fehlen Vertragsfelder (%s): laib apply paperless legt sie an" % ", ".join(n for n in FELDER if n not in felder))
-        return
+        LAUF["fehlt"] = "Vertragsfelder fehlen"
+        return speichern(path, rec, am)
     ohne = [n for n in RECHNUNG_FELDER if n not in felder]
     if ohne:
         print("vertraege: Paperless fehlen Rechnungsfelder (%s): Rechnungen werden nicht gelesen, laib apply paperless legt sie an" % ", ".join(ohne))
@@ -823,6 +843,7 @@ def main():
             continue
         if gelesen >= PRO_LAUF:
             print("vertraege: weitere Verträge und Rechnungen im nächsten Lauf")
+            LAUF["weitere"] = True
             break
         was = " und ".join(ARTEN[a][0] for a in arten)
         hilfen = {k: v for a in arten for k, v in ARTEN[a][2].items()}
@@ -831,6 +852,7 @@ def main():
                                    was + (" und den Absender" if kontakt else "")))
         except (OSError, ValueError, KeyError, IndexError) as e:
             print("vertraege: das Modell antwortet nicht (%s), der nächste Lauf fragt wieder" % e)
+            LAUF["modell_weg"] = True
             break
         antwort = antwort if isinstance(antwort, dict) else {}
         gelesen += 1
@@ -845,6 +867,7 @@ def main():
         if fertig:
             continue
         gefuellt, verworfen = lesen(api, d, antwort, f, prüfen_tag, "rechnung" in arten, was)
+        LAUF["rechnungen" if "rechnung" in arten else "vertraege"] += 1
         rec["dokumente"][str(d["id"])] = {"text": sha, "felder": sorted(f), "gefuellt": gefuellt, "verworfen": verworfen,
                                           "am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         print("vertraege: %s (%d): gefüllt %s%s" % (d.get("title"), d["id"], ", ".join(gefuellt) or "nichts",
@@ -905,12 +928,10 @@ def main():
             continue
         if ok:
             rec["erinnerungen"][key] = {"wann": wann, "bis": bis.isoformat()}
+            LAUF["erinnerungen"] += 1
             print("vertraege: Erinnerung am %s: %s" % (wann, text))
 
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(rec, fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+    speichern(path, rec, am)
 
 
 if __name__ == "__main__":
