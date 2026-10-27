@@ -57,6 +57,7 @@ UNFERTIG = (".part", ".tmp", ".crdownload", ".partial", "~")
 HELL = 0.94         # a blank page's mean brightness: blank backs 95-97 %, a printed front 92 % (#568)
 LEER_WOERTER = 4    # fewer words than this on a bright page: blank
 FAST_HELL = 0.88    # no text at all from here up: blank (#808), a photo is darker, handwriting reads as marks
+GLEICHMAESSIG = 12  # no text and this little spread of grey: a blank back of coloured paper, however dark (dokumente#2: 8-9)
 FENSTER, SCHRITT, AB_FENSTER = 30, 25, 40   # big stacks go to the model in overlapping windows
 EPSON2 = 1865       # the epson2 backend's network port (#589)
 TRENNER = "PATCH T" # a separator sheet's code (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING
@@ -178,6 +179,16 @@ def schreib_pnm(b, pfad):
 
 def helligkeit(b):
     return sum(b.data) / (len(b.data) * 255.0) if b.data else 1.0
+
+
+def streuung(b, schritt=7):
+    """the spread of a page's grey values (standard deviation, 0-255), from every seventh byte:
+    an empty sheet of coloured paper is even, a photo or a printed page is not"""
+    probe = b.data[::schritt]
+    if not probe:
+        return 0.0
+    m = sum(probe) / len(probe)
+    return (sum((x - m) * (x - m) for x in probe) / len(probe)) ** 0.5
 
 
 def _kanaele(data, c):
@@ -335,6 +346,9 @@ def pruefe_seite(pfad, nr, text=None, quelle=0):
     elif s.hell >= FAST_HELL and s.woerter == 0 and len(re.findall(r"\w", s.text)) < 5:
         # a face-up stack's fronts at 92-93 %: the print on their backs shows through, Tesseract reads nothing (#808)
         s.leer, s.warum = True, "fast hell, kein Text"
+    elif s.woerter == 0 and len(re.findall(r"\w", s.text)) < 5 and streuung(b) < GLEICHMAESSIG:
+        # the back of a sheet of grey or coloured paper (dokumente#2): dark, but even and wordless
+        s.leer, s.warum = True, "gleichmäßig, kein Text"
     elif s.hell >= HELL and s.woerter < 40:
         spiegel = s.bild + ".spiegel" + os.path.splitext(s.bild)[1]
         schreib_pnm(gespiegelt(b), spiegel)
@@ -470,8 +484,12 @@ def entscheidungen(antwort, teil):
 
 def laeufe(seiten, flags, meta):
     """documents as runs from one start to the next; the model's blank only for a bright page.
-    A page the model left out continues the document before it: nothing is lost, nothing doubled."""
+    A page the model left out continues the document before it: nothing is lost, nothing doubled.
+    A page two whose dates and numbers are not the document's before it waits for the next
+    document: when that one shares them, the page goes after its first page (dokumente#2: a
+    sheet two lay before sheet one); else it goes back where it came."""
     docs, leer, ken = [], [], None
+    wartet = []   # (page, its kennung, the index of the document it followed)
     for s in seiten:
         neu, ist_leer, absender = flags.get(s.nr, (False, False, ""))
         if ist_leer and s.hell >= HELL:
@@ -482,6 +500,9 @@ def laeufe(seiten, flags, meta):
         # documents as they have numbers and dates; a page that says it is page two starts none
         kopf, k = briefkopf(s.text), kennung(s.text)
         if docs and kopf < 0:
+            if anders(k, ken):   # a page two of another document: it waits for that one
+                wartet.append((s, k, len(docs) - 1))
+                continue
             neu = False
         elif docs and kopf > 0 and anders(k, ken):
             neu = True
@@ -490,9 +511,21 @@ def laeufe(seiten, flags, meta):
             d = meta.get(s.nr) or {}
             docs.append(Dokument(seiten=[s], art=str(d.get("art") or ""), absender=str(d.get("absender") or absender),
                                  datum=str(d.get("datum") or ""), titel=str(d.get("titel") or "")))
+            if wartet:   # only the next document may claim the pages waiting for it
+                for w in wartet:
+                    if not anders(w[1], k):
+                        docs[-1].seiten.append(w[0])
+                        ken = tuple(a | b for a, b in zip(ken, w[1]))
+                    else:
+                        docs[w[2]].seiten.append(w[0])
+                wartet = []
         else:
             docs[-1].seiten.append(s)
             ken = tuple(a | b for a, b in zip(ken, k))
+    for w in wartet:   # nobody claimed them: back where they came
+        docs[w[2]].seiten.append(w[0])
+    for d in docs:   # the first page stays first; the rest in stack order, a page come back in its place
+        d.seiten[1:] = sorted(d.seiten[1:], key=lambda x: x.nr)
     return docs, leer
 
 

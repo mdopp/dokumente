@@ -117,6 +117,15 @@ class Seiten(unittest.TestCase):
         scan.schreib_pnm(b, p)
         return scan.pruefe_seite(p, nr, text)
 
+    def test_the_blank_back_of_grey_paper_goes_a_wordless_photo_stays(self):
+        # dokumente#2: OS-Solar's grey sheets, backs at 74 % with a spread of 8-9, were kept as content
+        grau = seite(190, 1, w=60, h=60)
+        s = self.pruefe(grau, 1)
+        self.assertTrue(s.leer, s)
+        self.assertEqual(s.warum, "gleichmäßig, kein Text")
+        foto = scan.Bild(60, 60, 1, bytes((i * 37) % 256 for i in range(3600)))   # dark and uneven, no words
+        self.assertFalse(self.pruefe(foto, 2).leer, "a photo is no blank page")
+
     def test_blank_and_show_through_go_a_printed_front_stays(self):
         self.assertTrue(self.pruefe(leer(1)).leer)
         s = self.pruefe(durchscheinend(2))
@@ -331,6 +340,28 @@ class Trennen(unittest.TestCase):
         # the letterhead decides, not only the second ask's fallback
         docs, _ = scan.laeufe(seiten, {s.nr: (s.nr == 1, False, "") for s in seiten}, {})
         self.assertEqual(len(docs), 4)
+
+    def test_a_page_two_before_its_page_one_goes_to_its_own_document(self):
+        # dokumente#2, the box 2026-10-27: OS-Solar's sheet two lay before sheet one, behind Beckers'
+        # invoice; its „Seite 2“ joined Beckers, and the real first page then shared its date and
+        # did not start a document either. The page two waits for its document and goes after page one.
+        beckers = ("Christian Beckers Gartengestaltung\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\n"
+                   "Rechnung Nr. 20220922 vom 02.11.2022\nPflasterarbeiten")
+        beckers_2 = "[Rechnung 20220922]\nPos Menge Einh. Leistung\nNettosumme EUR 2.553,82\nRechnungsbetrag EUR 3.039,05"
+        solar_2 = ("Seite 2 OS - Solar GmbH * Wiesenstr. 1 * 49191 Belm\nRechnung - Nr. RE - 2023 -2390 13.01.2023\n"
+                   "Rechnungsbetrag 16.590,00 €\nabzgl. Anzahlungs- RG 2022-2355")
+        solar_1 = ("OS - Solar GmbH * Wiesenstr. 1 * 49191 Belm\nHerr Michael Beispiel\nMusterweg 1\n12345 Musterstadt\n"
+                   "Rechnung-Nr: RE-2023-2390 Datum 13.01.2023\nPhotovoltaikanlage")
+        seiten = briefe(beckers, beckers_2, solar_2, solar_1)
+        flags = {1: (True, False, ""), 2: (False, False, ""), 3: (True, False, ""), 4: (False, False, "")}
+        docs, _ = scan.laeufe(seiten, flags, {})
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2], [4, 3]])
+
+    def test_a_page_two_nobody_claims_goes_back_where_it_came(self):
+        fremd = "Seite 2\nAufstellung vom 05.05.2019\nPosten"
+        seiten = briefe(RECHNUNG % (2021, 21, 2021), fremd, "Anlage\nweitere Posten")
+        docs, _ = scan.laeufe(seiten, {1: (True, False, ""), 2: (False, False, ""), 3: (False, False, "")}, {})
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2, 3]], "nothing lost, nothing moved")
 
     def test_a_three_page_offer_stays_one_even_where_the_model_starts_its_page_two(self):
         seiten = briefe(ANGEBOT_1, ANGEBOT_2, "Arbeitszeiten\nNach Aufwand\nZwischensumme\nGesamtbetrag")
