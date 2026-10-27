@@ -82,6 +82,27 @@ class Bilder(unittest.TestCase):
                 scan.lies_pnm(p)
 
 
+class Trennblatt(unittest.TestCase):
+    """#814: the reader is the box's own libzbar, so this runs where libzbar0 is installed (CI, the image)"""
+    def test_libzbar_is_there(self):
+        self.assertIsNotNone(scan.zbar(), "libzbar.so.0 fehlt: apt-get install libzbar0")
+
+    def test_patch_t_reads_as_code128_and_as_qr_turned_or_not(self):
+        self.assertEqual(scan.strichcodes(strichcode(CODE128_PATCH_T)), ["PATCH T"])
+        self.assertEqual(scan.strichcodes(strichcode(QR_PATCH_T, modul=4, w=200, h=200)), ["PATCH T"])
+        self.assertEqual(scan.strichcodes(scan.gedreht(strichcode(CODE128_PATCH_T), 90)), ["PATCH T"])
+        self.assertEqual(scan.strichcodes(scan.gedreht(strichcode(CODE128_PATCH_T), 180)), ["PATCH T"])
+        farbe = strichcode(CODE128_PATCH_T)
+        farbe = scan.Bild(farbe.w, farbe.h, 3, bytes(v for v in farbe.data for _ in range(3)))
+        self.assertEqual(scan.strichcodes(farbe), ["PATCH T"])
+
+    def test_only_the_exact_payload_separates(self):
+        self.assertEqual(scan.strichcodes(strichcode(CODE128_ASN)), ["ASN00012"])
+        self.assertFalse(scan.ist_trenner(strichcode(CODE128_ASN)))
+        self.assertFalse(scan.ist_trenner(leer(1)))
+        self.assertTrue(scan.ist_trenner(strichcode(CODE128_PATCH_T)))
+
+
 class Seiten(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -106,6 +127,12 @@ class Seiten(unittest.TestCase):
         kurz = seite(250, 4)
         TEXTE[kurz.data] = "Kündigung zum Monatsende Mit freundlichen Grüßen Musterfrau"
         self.assertFalse(self.pruefe(kurz).leer)
+
+    def test_a_separator_is_no_blank_page_however_bright(self):
+        s = self.pruefe(strichcode(CODE128_PATCH_T, w=600, h=800))
+        self.assertTrue(s.hell >= scan.HELL, s.hell)
+        self.assertEqual((s.trenner, s.leer, s.warum), (True, False, "Trennblatt"))
+        self.assertFalse(self.pruefe(vorne(7, BRIEF_A1), 2).trenner)
 
     def test_a_page_upside_down_is_turned_only_when_osd_is_sure(self):
         b = vorne(5, "")
@@ -152,6 +179,30 @@ RECHNUNG = "Bezirksschornsteinfeger Rauch\nFamilie Beispiel\nMusterweg 1\n12345 
 BESCHEID = "Bezirksschornsteinfeger Rauch\nFamilie Beispiel\n12345 Musterstadt\nFeuerstättenbescheid Nr.: 4711-3-1\nDatum: 11.08.2020"
 ANGEBOT_1 = "Tischlerei Holzwurm\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\nAngebot Nr.: 2024-17\nDatum: 08.09.2024\nTreppe"
 ANGEBOT_2 = "Tischlerei Holzwurm\nFamilie Beispiel\n12345 Musterstadt\nDatum: 08.09.2024\nSeite 2 von 3\nMaterial Eiche"
+
+
+# separator sheets (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING, as Haus prints it; the
+# modules as python-barcode and qrcode lay them out, drawn here into a page
+CODE128_PATCH_T = "1101001000011101110110101000110001101110001010001000110110001010001101100110011011100010111011101101100011101011"
+CODE128_ASN = "110100100001010001100011011101000101110001101011101111011011001100110011011001011110111011001110010110000101001100011101011"
+QR_PATCH_T = """111111100110001111111 100000101101101000001 101110100111001011101 101110100000001011101 101110101010101011101
+100000100100101000001 111111101010101111111 000000000011100000000 101010100001000010010 101000011100001001101 000110110000100010010
+011011011010001000011 110111101010101010111 000000001011010101110 111111100111011100010 100000100101110110101 101110101101011100101
+101110100110001101110 101110101010100010101 100000100110001000011 111111101110101101101""".split()
+
+
+def strichcode(zeilen, modul=3, rand=40, hoehe=None, w=480, h=200):
+    """a bright page with the modules drawn dark, each `modul` pixels; a 1D code is one row drawn `hoehe` high"""
+    if isinstance(zeilen, str):
+        zeilen = [zeilen] * ((hoehe or 80) // modul)
+    data = bytearray([252]) * (w * h)
+    for r, zeile in enumerate(zeilen):
+        for c, bit in enumerate(zeile):
+            if bit == "1":
+                for y in range(rand + r * modul, rand + (r + 1) * modul):
+                    a = y * w + rand + c * modul
+                    data[a:a + modul] = bytes(modul)
+    return scan.Bild(w, h, 1, bytes(data))
 
 
 def briefe(*texte):
@@ -794,6 +845,83 @@ class Dienst(unittest.TestCase):
         dienst = scan.Dienst(self.cfg)
         dienst.tick()
         self.assertEqual(self.status()["detail"], "bereit · nur der Ordner scan-eingang, kein Scanner eingerichtet")
+
+    def test_separators_cut_the_stack_and_the_model_only_names_the_runs(self):
+        # #814, duplex, back first; reading order: A1 | separator | B, BRIEF_1 | separator (QR) | BRIEF_2.
+        # B and BRIEF_1 are two letterheads, but no separator between them: one document
+        sep, qr = strichcode(CODE128_PATCH_T), strichcode(QR_PATCH_T, modul=4, w=200, h=200)
+        self.runs(([leer(41), vorne(42, BRIEF_A1), leer(43), sep, leer(44), vorne(45, BRIEF_B),
+                    leer(46), vorne(47, BRIEF_1), leer(48), qr, leer(49), vorne(50, BRIEF_2)],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append((messages[0]["content"], gesendet(messages)))
+            erste = gesendet(messages)[0][1].split()[0]
+            return json.dumps({"art": "Brief", "absender": erste, "datum": "2024-01-0%d" % len(gefragt), "titel": "Titel %d" % len(gefragt)})
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage)
+        self.auftrag(dienst, "start")
+        # one question per run, never where to split, never a separator page
+        self.assertEqual([[t.split()[0] for _, t in g] for _, g in gefragt],
+                         [["Bezirksschornsteinfeger"], ["Abfallwirtschaft", "Stadtwerke"], ["Tischlerei"]])
+        self.assertNotIn("neu", gefragt[0][0])
+        self.assertEqual(self.abgelegt(), ["2024-01-01 Bezirksschornsteinfeger - Titel 1.pdf",
+                                           "2024-01-02 Abfallwirtschaft - Titel 2.pdf", "2024-01-03 Tischlerei - Titel 3.pdf"])
+        text = self.meldungen[-1][1]
+        self.assertTrue(text.startswith("Scan fertig: 6 Blatt, 12 Seiten, 6 leer entfernt, 3 Dokumente"), text)
+        self.assertIn("\n2 Trennblätter erkannt.", text)
+        ordner = os.path.join(self.cfg.data, self.status()["stapel"])
+        with open(os.path.join(ordner, "plan.json")) as f:
+            plan = json.load(f)
+        self.assertEqual([d["seiten"] for d in plan["dokumente"]], [[1], [5, 7], [11]])
+        self.assertEqual(plan["trennblaetter"], [3, 9])
+        self.assertTrue(os.path.exists(os.path.join(ordner, "modell-3.json")))
+
+    def test_a_face_up_stack_is_turned_before_its_separators_cut_it(self):
+        # #808 + #814: face up on the fi-6130, the last sheet first, each print on the scanned back
+        self.cfg.scanner, self.cfg.back_first = "fujitsu", False
+        self.runs(([leer(51), vorne(52, BRIEF_2), leer(53), strichcode(CODE128_PATCH_T), leer(54), vorne(55, BRIEF_1)],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(gesendet(messages)[0][1].split()[0])
+            return json.dumps({"art": "Brief", "absender": gefragt[-1], "datum": "", "titel": "Brief"})
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage)
+        self.auftrag(dienst, "start")
+        self.assertEqual(gefragt, ["Stadtwerke", "Tischlerei"])
+        text = self.meldungen[-1][1]
+        self.assertIn("1 Trennblatt erkannt.", text)
+        self.assertIn("die Reihenfolge ist umgedreht", text)
+        with open(os.path.join(self.cfg.data, self.status()["stapel"], "plan.json")) as f:
+            plan = json.load(f)
+        self.assertEqual(([d["seiten"] for d in plan["dokumente"]], plan["trennblaetter"]), ([[1], [5]], [3]))
+
+    def test_a_model_that_fails_keeps_the_separators_split(self):
+        self.runs(([leer(61), vorne(62, BRIEF_A1), leer(63), strichcode(CODE128_PATCH_T), leer(64), vorne(65, BRIEF_B)],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(1)
+            raise RuntimeError("kein Modell eingerichtet")
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage)
+        self.auftrag(dienst, "start")
+        self.assertEqual(self.abgelegt(), ["Dokument (2).pdf", "Dokument.pdf"])
+        self.assertEqual(gefragt, [1], "a model that is not there is asked once, not once per document")
+        self.assertIn("kein Modell eingerichtet", self.meldungen[-1][1])
+        self.assertEqual(len(self.meldungen), 1)
+
+    def test_a_probe_sheet_that_is_a_separator_says_so(self):
+        self.runs(([strichcode(CODE128_PATCH_T)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        self.auftrag(dienst, "probe")
+        p = self.status()["pruefung"]
+        self.assertTrue(p["ok"], p)
+        self.assertEqual(p["detail"], "Probeseite: Trennblatt erkannt (PATCH T)")
 
     def test_a_probe_sheet_is_read_and_never_filed(self):
         self.runs(([vorne(71, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
