@@ -485,6 +485,33 @@ class Dienst(unittest.TestCase):
         self.assertLess(time.monotonic() - t, 0.9, "the search waited for the slow knocks")
         self.assertEqual((self.status()["suche"]["zustand"], self.status()["suche"]["funde"]), ("fertig", []), "late is no find")
 
+    def test_an_idle_service_looks_again_every_15_minutes_and_says_what_it_saw(self):
+        # #785: the Box page read "bereit · geprüft vor 2 Tagen": the status was written on a change only
+        jetzt = [1000.0]
+        dienst = scan.Dienst(self.cfg, now=lambda: jetzt[0])
+        dienst.tick()
+        s = self.status()
+        self.assertEqual(s["detail"], "bereit · Scanner unter 192.0.2.7 an")
+        os.utime(os.path.join(self.cfg.data, "laib-status.json"), (0, 0))
+        alt = s["at"]
+        self.zu[("192.0.2.7", 1865)] = "timed out"
+        jetzt[0] += 60
+        dienst.tick()
+        self.assertEqual(self.status()["detail"], "bereit · Scanner unter 192.0.2.7 an", "not before 15 minutes")
+        jetzt[0] += 900
+        dienst.letzte = [{"stapel": "x", "ende": "fertig", "at": "2026-10-23T09:05:00Z", "dokumente": [{"titel": "a"}, {"titel": "b"}]}]
+        dienst.tick()
+        s = self.status()
+        self.assertEqual(s["detail"], "bereit · Scanner unter 192.0.2.7 aus oder nicht im Netz, der Ordner scan-eingang geht · zuletzt am 23.10.: 2 Dokumente abgelegt")
+        self.assertGreaterEqual(s["at"], alt)
+        self.assertEqual(self.meldungen, [], "a look is no stack: no message")
+
+    def test_without_a_scanner_the_look_says_only_the_folder(self):
+        self.cfg.scanner = ""
+        dienst = scan.Dienst(self.cfg)
+        dienst.tick()
+        self.assertEqual(self.status()["detail"], "bereit · nur der Ordner scan-eingang, kein Scanner eingerichtet")
+
     def test_a_probe_sheet_is_read_and_never_filed(self):
         self.runs(([vorne(71, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
         dienst = scan.Dienst(self.cfg)

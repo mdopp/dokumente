@@ -74,6 +74,7 @@ class Config:
     suche_s: float = 3.0         # the direct search's whole budget, after the wake (#589)
     weck_s: float = 1.5          # the wake's wait for ARP answers
     tcp_s: float = 1.5           # one knock on one port
+    blick_s: float = 900         # idle, the status looks again this often (#785): its age is a look's
 
     @classmethod
     def from_env(cls, env):
@@ -516,6 +517,7 @@ class Dienst:
         self.status = {}
         self.suche, self.pruefung = {}, {}   # the scanner's setup (#571), kept across every status
         self.aufgeraeumt = 0
+        self.geblickt = 0          # the last status written: idle, a look follows blick_s later (#785)
         os.makedirs(os.path.join(cfg.data, "auftrag"), exist_ok=True)
         self.wieder_an()
 
@@ -533,7 +535,7 @@ class Dienst:
         elif zustand == "wartet-auf-rest":
             s["findings"] = [{"severity": "info", "detail": "Ein Stapel wartet auf den Rest: " + detail,
                               "fix": "laib scan weiter | abschliessen | verwerfen"}]
-        self.status = s
+        self.status, self.geblickt = s, self.now()
         pfad = os.path.join(self.cfg.data, "laib-status.json")
         with open(pfad + ".tmp", "w") as f:
             json.dump(s, f, ensure_ascii=False, indent=1)
@@ -600,7 +602,7 @@ class Dienst:
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: Der Dienst wurde mitten im Stapel neu gestartet. %s "
                       "Neu trennen: „laib scan redo --stapel %s“." % (schon, stapel.zeit))
             return
-        self.zustand("bereit", "bereit")
+        self.blick()
 
     # the loop
 
@@ -631,6 +633,30 @@ class Dienst:
                 self.ordner_stapel(datei)
         if self.now() - self.aufgeraeumt > 3600:
             self.aufraeumen()
+        if not self.offen and self.status.get("zustand") in ("bereit", "fertig") and self.now() - self.geblickt >= self.cfg.blick_s:
+            self.blick()
+
+    def blick(self):
+        """idle: knock on the scanner's port and say what the last stack did (#785); SANE stays closed"""
+        ziel = adresse(self.cfg.scanner)
+        if not self.cfg.scanner:
+            teile = ["bereit", "nur der Ordner scan-eingang, kein Scanner eingerichtet"]
+        elif not ziel:
+            teile = ["bereit", "Scanner " + self.cfg.scanner]
+        elif tcp(ziel[0], ziel[1], self.cfg.tcp_s):
+            teile = ["bereit", "Scanner unter %s aus oder nicht im Netz, der Ordner scan-eingang geht" % ziel[0]]
+        else:
+            teile = ["bereit", "Scanner unter %s an" % ziel[0]]
+        if self.letzte:
+            l = self.letzte[0]
+            try:
+                tag = datetime.datetime.strptime(l.get("at") or "", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).astimezone().strftime("%d.%m.")
+            except ValueError:
+                tag = ""
+            was = "%d Dokumente abgelegt" % len(l.get("dokumente") or []) if l.get("ende") == "fertig" else (l.get("ende") or "")
+            if tag and was:
+                teile.append("zuletzt am %s: %s" % (tag, was))
+        self.zustand("bereit", " · ".join(teile))
 
     def auftrag(self, a):
         akt, person = a.get("aktion"), a.get("person") or ""
