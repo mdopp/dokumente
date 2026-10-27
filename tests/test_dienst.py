@@ -6,9 +6,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "scan"))
 import dienst  # noqa: E402
-import scan  # noqa: E402
+
+scan = dienst.scan
 
 # a stand-in for vertraege.py: counts its runs, says what it was given,
 # writes the run record and, when asked, a message for the owner

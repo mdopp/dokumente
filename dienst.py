@@ -17,12 +17,25 @@ The listener is for Paperless only: laib binds it where Paperless' pod
 reaches the host (as Haus's 8650) and keeps it from the LAN; the token is
 the box's, generated, never typed.
 """
-import hmac, json, os, subprocess, sys, threading, time, traceback
+import hmac, importlib.util, json, os, subprocess, sys, threading, time, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-sys.path.insert(0, os.environ.get("DOKUMENTE_LIB", os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan"))
-import scan  # noqa: E402
+
+def _lade_scan():
+    """scan.py beside this file (the image's /opt) or in scan/ (the repo), by its path:
+    in the repo a bare `import scan` would find the scan/ folder instead"""
+    hier = os.path.dirname(os.path.abspath(__file__))
+    for pfad in (os.path.join(hier, "scan.py"), os.path.join(hier, "scan", "scan.py")):
+        if os.path.exists(pfad):
+            spec = importlib.util.spec_from_file_location("dokumente_scan", pfad)
+            m = importlib.util.module_from_spec(spec)
+            sys.modules["dokumente_scan"] = m
+            spec.loader.exec_module(m)
+            return m
+    raise ImportError("scan.py fehlt")
+
+
+scan = _lade_scan()
 
 
 def log(msg):
