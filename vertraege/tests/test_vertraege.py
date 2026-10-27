@@ -4,7 +4,7 @@ a contract's text, keeps only values the text backs up word for word, fills
 only empty fields, notes what it filled, and makes one reminder in Haus's
 Haushalt per document and notice date. Against a fake Paperless, a fake model
 and a fake Haus, never real ones; no real names or addresses."""
-import base64, hashlib, json, os, subprocess, sys, tempfile, threading, unittest, urllib.parse
+import base64, hashlib, json, os, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -298,6 +298,8 @@ class Vertraege(Lauf):
         self.assertIn("Modell", r.stdout)
         self.assertEqual(p.doc(1)["custom_fields"], [])
         self.assertFalse([c for c in p.calls if c[0] == "PATCH"])
+        with open(self.record) as f:
+            self.assertTrue(json.load(f)["lauf"]["modell_weg"], "the status line says the model did not answer (#829)")
         m.code = 200
         self.run_job(p, m)
         self.assertEqual(p.value(1, F["Vertragsnummer"]), "SW-12345")
@@ -594,6 +596,17 @@ class Rechnungen(Lauf):
         for n in ("Betrag", "Rechnungsnummer", "Fällig am"):
             self.assertIn(n, p.notes[1][0])
 
+    def test_a_document_marked_pruefen_is_counted_once_in_the_run(self):
+        text = SHOP.replace("Zahlungsziel 14 Tage", "Der Betrag ist fällig am 30.06.2026.")
+        antwort = {"Betrag": {"wert": 870, "beleg": "Rechnungsbetrag: EUR 87,00"},
+                   "Rechnungsnummer": {"wert": "RE-88124", "beleg": "Rechnung Nr. RE-88123"}}
+        p = Paperless([rechnung(text=text, typ=2)])
+        r = self.run_job(p, Model(antwort))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.record) as f:
+            lauf = json.load(f)["lauf"]
+        self.assertEqual((lauf["rechnungen"], lauf["pruefen"]), (1, 1))
+
     def test_a_credit_note_or_a_negative_sum_is_never_an_invoice_amount(self):
         gutschrift = "Online-Shop Beispiel\nGutschrift Nr. GS-551\nzur Rechnung RE-88123\nWir erstatten Ihnen 49,90 €."
         minus = "Stadtwerke Beispielstadt\nRechnung Nr. 4711\nRechnungsbetrag -25,00 €"
@@ -763,6 +776,18 @@ class Kontakte(Lauf):
         p.doc(1)["custom_fields"] = []
         self.run_job(p, m, haus=h)
         self.assertEqual(len(h.kontakte()), 1, "a new text is read again, its sender is not sent again")
+
+    def test_the_record_says_what_the_last_run_did(self):
+        # #829: the status line reads it ("Vertragshelfer: zuletzt …"), so it counts this run only
+        p, m, h = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Haus()
+        r = self.run_job(p, m, haus=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lauf = self.rec()["lauf"]
+        self.assertRegex(lauf.pop("am"), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(lauf, {"vertraege": 0, "rechnungen": 1, "kontakte": 1, "erinnerungen": 0, "pruefen": 0})
+        self.run_job(p, m, haus=h)
+        lauf = self.rec()["lauf"]
+        self.assertEqual((lauf["rechnungen"], lauf["kontakte"]), (0, 0), "a run that read nothing new counts nothing")
 
     def test_a_value_left_out_is_not_sent_and_without_a_firm_nothing_is(self):
         antwort = {**KONTAKT_ANTWORT, "Ansprechpartner": None, "Anschrift": None, "E-Mail": {"wert": "", "beleg": ""},
@@ -1036,6 +1061,71 @@ class Sender(unittest.TestCase):
         self.assertNotIn("haustoken", argv)
         self.assertIn("-e HAUSHALT_TOKEN", argv)
         self.assertEqual(open(os.path.join(tmp, "stdin")).read(), "print('hallo')")
+
+    def fakes(self):
+        tmp = tempfile.mkdtemp()
+        for name, body in (("podman", "cat >/dev/null\necho 'vertraege: lief'\n"), ("systemctl", "echo \"$@\" >>%s/gestartet\n" % tmp)):
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(os.path.join(tmp, name), 0o755)
+        os.makedirs(os.path.join(tmp, "thumbnails"))
+        open(os.path.join(tmp, "skript.py"), "w").close()
+        return tmp, {"PATH": os.environ["PATH"], "PODMAN": os.path.join(tmp, "podman"), "SYSTEMCTL": os.path.join(tmp, "systemctl"),
+                     "VERTRAEGE_SKRIPT": os.path.join(tmp, "skript.py"), "VERTRAEGE_STAND": os.path.join(tmp, "stand", "lauf"),
+                     "VORSCHAU": os.path.join(tmp, "thumbnails"), "RUHE": "120", "NOTIFY_EINGANG": os.path.join(tmp, "eingang")}
+
+    def started(self, tmp):
+        try:
+            return Path(tmp, "gestartet").read_text().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def test_a_run_marks_its_start_and_refreshes_the_status(self):
+        # #829: the start is what neu compares against; the status line shows the run at once
+        tmp, env = self.fakes()
+        vorher = time.time()
+        r = subprocess.run(["sh", str(DIR / "paperless-vertraege.sh")], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertGreaterEqual(os.stat(env["VERTRAEGE_STAND"]).st_mtime, int(vorher))
+        self.assertEqual(self.started(tmp), ["--user start --no-block paperless-check.service"])
+
+    def test_new_documents_start_one_run_once_paperless_is_quiet(self):
+        # #829: Paperless writes a thumbnail for each document it files; neu (every two minutes) starts the
+        # run once that folder changed after the last run's start and has been quiet for RUHE seconds,
+        # so a stack of 13 documents is one run
+        tmp, env = self.fakes()
+        neu = lambda: subprocess.run(["sh", str(DIR / "paperless-vertraege.sh"), "neu"], env=env, capture_output=True, text=True, timeout=30)
+        jetzt = time.time()
+        os.utime(env["VORSCHAU"], (jetzt - 30, jetzt - 30))
+        r = neu()
+        self.assertEqual((r.returncode, self.started(tmp)), (0, []), "still filing: wait")
+        os.utime(env["VORSCHAU"], (jetzt - 300, jetzt - 300))
+        r = neu()
+        self.assertEqual((r.returncode, self.started(tmp)), (0, ["--user start --no-block paperless-vertraege.service"]),
+                         "quiet, and no run since: one run")
+        os.makedirs(os.path.dirname(env["VERTRAEGE_STAND"]))
+        open(env["VERTRAEGE_STAND"], "w").close()
+        os.utime(env["VERTRAEGE_STAND"], (jetzt - 200, jetzt - 200))
+        neu()
+        self.assertEqual(len(self.started(tmp)), 1, "nothing new since the last run started")
+        os.utime(env["VORSCHAU"], (jetzt - 150, jetzt - 150))
+        neu()
+        self.assertEqual(len(self.started(tmp)), 2, "filed during or after that run: once more")
+        env["VORSCHAU"] = os.path.join(tmp, "fehlt")
+        r = neu()
+        self.assertEqual((r.returncode, len(self.started(tmp))), (0, 2), "no folder to look at: the hourly run stays, never a red unit")
+        self.assertEqual(r.stdout + r.stderr, "", "and no line every two minutes")
+
+    def test_the_units_wire_neu_to_the_thumbnails_and_the_run(self):
+        timer = (DIR / "paperless-vertraege-neu.timer").read_text()
+        unit = (DIR / "paperless-vertraege-neu.service").read_text()
+        self.assertIn("OnUnitActiveSec=2min", timer)
+        self.assertIn("[Install]", timer)
+        self.assertNotIn("[Install]", unit, "a timer's oneshot: inactive between ticks, only a failed one counts")
+        self.assertIn('Environment="VORSCHAU=${DATA_DIR}/paperless/media/documents/thumbnails"', unit)
+        self.assertIn("paperless-vertraege.sh neu", unit)
+        self.assertIn("OnCalendar=hourly", (DIR / "paperless-vertraege.timer").read_text(), "the hourly catch-all stays")
+        self.assertNotIn("POST_CONSUME", (DIR / "paperless.container").read_text(), "nothing new inside the container")
 
 
 if __name__ == "__main__":
