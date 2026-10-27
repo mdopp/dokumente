@@ -277,7 +277,7 @@ class Dokument:
 ANWEISUNG = """Du trennst einen gescannten Papierstapel in einzelne Dokumente. Du bekommst den OCR-Text jeder Seite in der Reihenfolge des Stapels.
 
 Für jede Seite:
-- neu: true, wenn auf dieser Seite ein neues Dokument beginnt (ein neuer Brief, eine neue Rechnung, ein neuer Bescheid). Auch derselbe Absender schreibt oft mehrere Dokumente: ein anderes Datum, ein anderer Betreff oder eine andere Beleg- oder Rechnungsnummer heißt neu. Folgeseiten („Seite 2 von 3“, Fortsetzung, Anlage, AGB, Überweisungsträger) gehören zum Dokument davor. Ein anderer Absender ist ein starker Hinweis auf ein neues Dokument, aber kein Beweis.
+- neu: true, wenn auf dieser Seite ein neues Dokument beginnt (ein neuer Brief, eine neue Rechnung, ein neuer Bescheid). Derselbe Absender schreibt oft mehrere Dokumente, im Stapel direkt hintereinander: jede Seite mit eigenem Datum und eigener Rechnungs-, Bescheid-, Beleg- oder Angebotsnummer ist neu, auch wenn der Absender derselbe ist wie davor. Ein Anschreiben, das Anlagen nennt, ist ein eigenes Dokument; jede Anlage mit eigenem Briefkopf, Datum oder eigener Nummer ist wieder neu. Nicht neu ist nur eine echte Folgeseite ohne neues Datum und ohne neue Nummer („Seite 2 von 3“, AGB, Überweisungsträger, eine Liste, die weiterläuft). Ein anderer Absender ist ein starker Hinweis auf ein neues Dokument, aber kein Beweis.
 - leer: true nur für eine Seite ohne Inhalt (Rauschen, durchscheinende Schrift der Rückseite).
 - absender: kurz, wer die Seite geschrieben hat.
 - grund: ein kurzer Satz, warum neu oder nicht.
@@ -303,11 +303,40 @@ def nachricht(seiten):
 
 
 # a first page: the recipient's address and a date or a number; a page two says so (#808)
-FOLGESEITE = re.compile(r"\bSeite\s*(?:[2-9]|[1-9]\d)\b|\b(?:Fortsetzung|Übertrag)\b", re.I)
+FOLGESEITE = re.compile(r"(?<!siehe )(?<!auf )(?<!vgl\. )\bSeite\s*(?:[2-9]|[1-9]\d)\b|\b(?:Fortsetzung|Übertrag)\b", re.I)
 ANSCHRIFT = re.compile(r"(?m)^\W{0,3}(?:\d{5}\s+[A-ZÄÖÜ][a-zäöüß]|(?:Herrn?|Frau|Familie|Firma)\b)")
 DATUM = re.compile(r"\b\d{1,2}\s?\.\s?\d{1,2}\s?\.\s?(?:\d{4}|\d{2})\b")
 NUMMER = re.compile(r"\b(?:Rech(?:nung)?s?|Beleg|Angebots?|Bescheid|Liefer(?:schein)?|Kunden|Auftrags?|Vertrags?)[\s.-]*(?:Nr|Nummer)\b"
                     r"|\bRechnung\s+\d{3,}", re.I)
+
+
+# what tells two documents of one sender apart (#808): a document's own number, else its date;
+# never a customer, object or district number, which every letter of that sender carries
+BELEGNR = re.compile(r"\b(Rech(?:nung)?s?|Beleg|Angebots?|\w*bescheid|Liefer(?:schein)?|Gutschrift)[\s.-]*(?:Nr|Nummer)\b\.?"
+                     r"(?:\s*[:#]?\s*([A-Z]{0,3}\d[\d/.-]*\d|\d))?|\b(Rechnung)\s+(\d{3,})\b", re.I)
+TAG = re.compile(r"\b(\d{1,2})\s?\.\s?(\d{1,2})\s?\.\s?(\d{4}|\d{2})\b")
+
+
+def kennung(text):
+    """a page's dates (day, month, two-digit year), document numbers and kinds (the labels the numbers
+    stand by: an OCR that puts a label and its value apart still keeps the label), from its head"""
+    kopf = "\n".join((text or "").splitlines()[:40])
+    funde = BELEGNR.findall(kopf)
+    art = lambda w: "bescheid" if w.lower().endswith("bescheid") else w.lower()[:4]
+    return ({(int(d), int(m), int(j) % 100) for d, m, j in TAG.findall(kopf)},
+            {(n or n2).rstrip(".-/") for _, n, _, n2 in funde if n or n2},
+            {art(w or w2) for w, _, w2, _ in funde})
+
+
+def anders(seite, dok):
+    """another document: numbers on both and none shared; else kinds on both and none shared (an
+    invoice after a notice); else dates on both and none shared"""
+    (t1, n1, a1), (t2, n2, a2) = seite, dok
+    if n1 and n2:
+        return not n1 & n2
+    if a1 and a2 and not a1 & a2:
+        return True
+    return bool(t1 and t2 and not t1 & t2)
 
 
 def briefkopf(text):
@@ -348,19 +377,28 @@ def entscheidungen(antwort, teil):
 def laeufe(seiten, flags, meta):
     """documents as runs from one start to the next; the model's blank only for a bright page.
     A page the model left out continues the document before it: nothing is lost, nothing doubled."""
-    docs, leer = [], []
+    docs, leer, ken = [], [], None
     for s in seiten:
         neu, ist_leer, absender = flags.get(s.nr, (False, False, ""))
         if ist_leer and s.hell >= HELL:
             s.leer, s.warum = True, "das Modell: leer"
             leer.append(s)
             continue
+        # the letterhead decides beside the model (#808): one sender's invoices in a row are as many
+        # documents as they have numbers and dates; a page that says it is page two starts none
+        kopf, k = briefkopf(s.text), kennung(s.text)
+        if docs and kopf < 0:
+            neu = False
+        elif docs and kopf > 0 and anders(k, ken):
+            neu = True
         if not docs or neu:
+            ken = k
             d = meta.get(s.nr) or {}
             docs.append(Dokument(seiten=[s], art=str(d.get("art") or ""), absender=str(d.get("absender") or absender),
                                  datum=str(d.get("datum") or ""), titel=str(d.get("titel") or "")))
         else:
             docs[-1].seiten.append(s)
+            ken = tuple(a | b for a, b in zip(ken, k))
     return docs, leer
 
 

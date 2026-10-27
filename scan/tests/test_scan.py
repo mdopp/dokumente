@@ -148,6 +148,12 @@ BRIEF_3 = "Bezirksschornsteinfeger Rauch\nFrau Erika Beispiel\nRech.-Nr.: 77/24/
 FOLGE = "Fortsetzung der Leistungen\nSeite 2 von 2\nZwischensumme Gesamtbetrag"
 
 
+RECHNUNG = "Bezirksschornsteinfeger Rauch\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\nDatum: 02.07.%d\nRech.-Nr.: 77/%02d/1\nRechnung Kehrarbeiten %d"
+BESCHEID = "Bezirksschornsteinfeger Rauch\nFamilie Beispiel\n12345 Musterstadt\nFeuerstättenbescheid Nr.: 4711-3-1\nDatum: 11.08.2020"
+ANGEBOT_1 = "Tischlerei Holzwurm\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\nAngebot Nr.: 2024-17\nDatum: 08.09.2024\nTreppe"
+ANGEBOT_2 = "Tischlerei Holzwurm\nFamilie Beispiel\n12345 Musterstadt\nDatum: 08.09.2024\nSeite 2 von 3\nMaterial Eiche"
+
+
 def briefe(*texte):
     return [scan.Seite(nr=n, bild="", hell=0.5, text=t, woerter=10) for n, t in enumerate(texte, 1)]
 
@@ -246,8 +252,9 @@ class Trennen(unittest.TestCase):
         self.assertEqual(docs[0].titel, "Abschlag", "the model's details stay")
 
     def test_a_plausible_answer_is_asked_once_and_the_model_decides(self):
-        # letterheads on 1 and 3, the model starts 1 and 2: a judgment, not an incomplete answer
-        seiten = briefe(BRIEF_1, FOLGE, BRIEF_2, FOLGE)
+        # letterheads on 1 and 3, the model starts 1 and 2: a judgment, not an incomplete answer; page 3
+        # names no date or number to tell it from page 2, so the model's run stands
+        seiten = briefe(BRIEF_1, "Allgemeine Geschaeftsbedingungen", BRIEF_2, "Material Eiche")
         calls = []
         docs, _ = scan.trennen(seiten, lambda m: calls.append(m) or json.dumps(
             {"seiten": [{"seite": i, "neu": i in (1, 2)} for i in range(1, 5)]}))
@@ -263,6 +270,52 @@ class Trennen(unittest.TestCase):
         self.assertEqual(scan.briefkopf("Familie Beispiel\nMusterweg 1\n12345 Musterstadt\nViele Gruesse"), 0, "an address alone is no letterhead")
         self.assertEqual(scan.briefkopf("Rechnung Nr. 4711 vom 01.02.2024 Betrag"), 0, "nor a number without an address")
         self.assertEqual(scan.briefkopf(""), 0)
+
+    def test_one_sender_with_four_invoices_is_four_documents_whatever_the_model_says(self):
+        # #808 redo: the model named each page's own invoice in its grund, and still called it Fortsetzung
+        seiten = briefe(*[RECHNUNG % (jahr, jahr % 100, jahr) for jahr in (2018, 2020, 2021, 2023)])
+        alles_eins = lambda m: json.dumps({"seiten": [{"seite": i, "neu": i == 1} for i in range(1, 5)]})
+        docs, _ = scan.trennen(seiten, alles_eins)
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1], [2], [3], [4]])
+        # the letterhead decides, not only the second ask's fallback
+        docs, _ = scan.laeufe(seiten, {s.nr: (s.nr == 1, False, "") for s in seiten}, {})
+        self.assertEqual(len(docs), 4)
+
+    def test_a_three_page_offer_stays_one_even_where_the_model_starts_its_page_two(self):
+        seiten = briefe(ANGEBOT_1, ANGEBOT_2, "Arbeitszeiten\nNach Aufwand\nZwischensumme\nGesamtbetrag")
+        calls = []
+        docs, _ = scan.trennen(seiten, lambda m: calls.append(m) or json.dumps(
+            {"seiten": [{"seite": 1, "neu": True}, {"seite": 2, "neu": True}, {"seite": 3}]}))
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1, 2, 3]])
+        self.assertEqual(len(calls), 1)
+
+    def test_a_page_two_with_its_letterhead_and_the_same_number_continues(self):
+        zwei = RECHNUNG % (2021, 21, 2021) + "\nZwischensumme Gesamtbetrag"
+        seiten = briefe(RECHNUNG % (2021, 21, 2021), zwei)
+        docs, _ = scan.laeufe(seiten, {1: (True, False, ""), 2: (False, False, "")}, {})
+        self.assertEqual(len(docs), 1)
+
+    def test_a_cover_letter_naming_its_attachments_stays_its_own_document(self):
+        anschreiben = ("Bezirksschornsteinfeger Rauch\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\n"
+                       "Datum: 20.06.2024\nSehr geehrte Familie Beispiel, anbei die Unterlagen.\nAnlagen: Rechnung, Bescheid")
+        seiten = briefe(anschreiben, RECHNUNG % (2023, 23, 2023), BESCHEID)
+        docs, _ = scan.trennen(seiten, lambda m: json.dumps({"seiten": [{"seite": i, "neu": i == 1, "grund": "Anlage"} for i in range(1, 4)]}))
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1], [2], [3]])
+
+    def test_the_prompt_says_one_sender_writes_many_documents(self):
+        self.assertIn("Derselbe Absender", scan.ANWEISUNG)
+        self.assertIn("eigenem Datum", scan.ANWEISUNG)
+        self.assertNotIn("Anlage, AGB", scan.ANWEISUNG, "an attachment with its own letterhead is no page of the letter")
+
+    def test_a_document_is_known_by_its_numbers_then_its_dates(self):
+        self.assertEqual(scan.kennung(RECHNUNG % (2021, 21, 2021)), ({(2, 7, 21)}, {"77/21/1"}, {"rech"}))
+        self.assertEqual(scan.kennung(BESCHEID)[1:], ({"4711-3-1"}, {"bescheid"}))
+        self.assertEqual(scan.kennung("Kunden-Nr.: 10886 Objektnummer 5"), (set(), set(), set()), "a customer number is on every invoice")
+        # an invoice whose number the OCR set apart from its label, after a notice of the same day
+        rechnung = "Familie Beispiel\n12345 Musterstadt\nDatum:\nRech.-Nr.:\n11.08.2020\n77/20/5"
+        self.assertTrue(scan.anders(scan.kennung(rechnung), scan.kennung(BESCHEID)))
+        self.assertFalse(scan.anders(scan.kennung(rechnung), scan.kennung(rechnung)))
+        self.assertEqual(scan.briefkopf("Familie Beispiel\n12345 Musterstadt\nDatum: 01.02.2024\nsiehe Seite 2"), 1, "a reference is no page two")
 
     def test_names_are_paperless_titles_and_never_collide(self):
         self.assertEqual(scan.dateiname(scan.Dokument([], absender="Mosel", datum="2023-05-01", titel="Rechnung")), "2023-05-01 Mosel - Rechnung")
