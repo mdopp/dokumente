@@ -814,6 +814,8 @@ class Dienst:
             z = min(self.nachholen)
             s["findings"] = [{"severity": "info", "detail": "Das Trennen von Stapel %s wird nachgeholt, sobald das Hausmodell wieder antwortet" % z,
                               "fix": "nichts zu tun; sofort: laib scan redo --stapel %s" % z}]
+        if AUSWERTUNG.get("findings"):   # dokumente#5: the evaluation's own, beside the scan's
+            s["findings"] = s.get("findings", []) + list(AUSWERTUNG["findings"])
         self.status, self.geblickt = s, self.now()
         pfad = os.path.join(self.cfg.data, "laib-status.json")
         with open(pfad + ".tmp", "w") as f:

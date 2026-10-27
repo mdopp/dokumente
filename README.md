@@ -41,7 +41,8 @@ One container, `Network=host` (SANE finds and reaches the scanner).
 
 | Mount | |
 |---|---|
-| `/data` (rw) | the scan's folder: orders, stacks, `laib-status.json`; the helper's record `laib-vertraege.json` |
+| `/data` (rw) | the scan's transient folder: orders, stacks, `laib-status.json` |
+| `/dokumente` (rw, backed up) | the helper's record `laib-vertraege.json` (`VERTRAEGE_FILE=/dokumente/laib-vertraege.json`, the default when the folder is there): what it read, reminded and cleared, so it never asks or reminds twice |
 | `/eingang` (rw), `/consume` (rw) | the inbox folder and Paperless' consume folder, as the scan has them |
 | `/meldungen` (rw) | laib-notify's `eingang`: one `dokumente-*.json` per reminder, `{"an", "betreff", "text", "at"}` |
 
@@ -53,4 +54,6 @@ http://host.containers.internal:8720/hook` with the header.
 `auswertung`: `{"zustand": "aus | läuft | fertig | fehler", "at",
 "anlass": "neue Dokumente | stündlich", "detail" (German, for the family),
 "lauf": {"am", "vertraege", "rechnungen", "kontakte", "erinnerungen",
-"pruefen", "fehlt"?}, "einzelheiten"? (the last log lines of a failed run)}`.
+"pruefen", "fehlt"?}, "einzelheiten"? (the last log lines of a failed run),
+"findings"? }`; its findings (a household correspondent left without
+documents, yellow) are also in the status's top-level `findings`.
