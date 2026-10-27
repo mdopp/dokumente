@@ -14,6 +14,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t dokumente:test -f Containerfile .
       - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py
+      # the image as laib starts it: dienst.py finds scan.py and vertraege.py beside it in /opt
+      - run: docker run --rm --entrypoint python3 dokumente:test -c "import sys; sys.path.insert(0, '/opt'); import dienst; a = dienst.Auswertung({}); assert dienst.scan.__file__ == '/opt/scan.py' and a.skript == '/opt/vertraege.py', (dienst.scan.__file__, a.skript); print('ok')"
   image:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
