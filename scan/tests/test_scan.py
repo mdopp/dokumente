@@ -1138,6 +1138,212 @@ class Dienst(unittest.TestCase):
         self.assertEqual(self.meldungen, [])
 
 
+class FakePaperless:
+    """Paperless as far as a stack „nur für mich“ needs it: users, tags, uploads that wait to be
+    consumed, documents with an owner, and its rule that only the owner (or anyone, on an unowned
+    document) may give a document to someone else"""
+    ICH = 7
+
+    def __init__(self):
+        self.users = {"dokumente": self.ICH, "mama": 3, "papa": 4}
+        self.perms = ["view_document", "change_document", "add_document"]
+        self.tags, self.docs, self.wartet, self.anfragen = {}, [], [], []
+        self.weg = False
+
+    def anfrage(self, method, path, body=None, form=None):
+        self.anfragen.append((method, path))
+        if self.weg:
+            raise scan.PaperlessWeg("Paperless: [Errno 111] Connection refused")
+        url = __import__("urllib.parse").parse
+        q = dict(url.parse_qsl(url.urlsplit(path).query))
+        pfad = url.urlsplit(path).path
+        if pfad == "/api/ui_settings/":
+            return {"permissions": list(self.perms)}
+        if pfad == "/api/users/":
+            return {"results": [{"id": i, "username": n} for n, i in self.users.items() if n == q["username__iexact"].lower()]}
+        if pfad == "/api/tags/" and method == "GET":
+            return {"results": [{"id": i, "name": n} for n, i in self.tags.items() if n.lower() == q["name__iexact"].lower()]}
+        if pfad == "/api/tags/":
+            self.tags[body["name"]] = 100 + len(self.tags)
+            return {"id": self.tags[body["name"]], "name": body["name"]}
+        if pfad == "/api/documents/post_document/":
+            if "add_document" not in self.perms:
+                raise scan.PaperlessWeg("Paperless: 403 bei POST /api/documents/post_document/", 403)
+            teile = dict(form)
+            name, inhalt = teile["document"]
+            self.wartet.append({"name": name, "title": teile["title"], "tags": [int(teile["tags"])],
+                                "md5": __import__("hashlib").md5(inhalt).hexdigest(), "owner": self.ICH, "view": []})
+            return "task-%d" % len(self.wartet)
+        if pfad == "/api/documents/" and method == "GET":
+            return {"results": [{"id": d["id"], "owner": d["owner"]} for d in self.docs
+                                if d["md5"] == q["checksum__iexact"] and (d["owner"] in (None, self.ICH) or self.ICH in d["view"])]}
+        if pfad.startswith("/api/documents/") and method == "PATCH":
+            d = next(d for d in self.docs if d["id"] == int(pfad.split("/")[3]))
+            if d["owner"] not in (None, self.ICH):
+                raise scan.PaperlessWeg("Paperless: 403 bei PATCH " + pfad, 403)
+            d["owner"], d["view"] = body["owner"], body["set_permissions"]["view"]["users"]
+            return {"id": d["id"]}
+        raise AssertionError("unerwartet: %s %s" % (method, path))
+
+    def einlesen(self):
+        """Paperless consumes what was uploaded; a file it has already is refused"""
+        for d in self.wartet:
+            if not any(x["md5"] == d["md5"] for x in self.docs):
+                self.docs.append({**d, "id": 1 + len(self.docs)})
+        self.wartet = []
+
+
+class NurFuerMich(unittest.TestCase):
+    """a stack „nur für mich“ (2026-10-28): its documents become the person's, never the household's"""
+
+    def setUp(self):
+        Dienst.setUp(self)
+        self.cfg.paperless_url, self.cfg.paperless_token, self.cfg.uebergabe_s = "http://paperless", "geheim", 0
+        self.pl, pl = FakePaperless(), None
+        pl = self.pl
+        self.alt_pl = scan.Paperless
+
+        class Fake(scan.Paperless):
+            def anfrage(self_, *a, **k):
+                return pl.anfrage(*a, **k)
+        scan.Paperless = Fake
+        # each document's own bytes: two identical PDFs would be one in Paperless
+        scan.pdf_aus_bildern = lambda cfg, bilder, ziel: schreib(ziel, ("%%PDF %s" % ",".join(bilder)).encode())
+
+    def tearDown(self):
+        scan.Paperless = self.alt_pl
+        Dienst.tearDown(self)
+
+    auftrag, status, abgelegt, runs, hole = Dienst.auftrag, Dienst.status, Dienst.abgelegt, Dienst.runs, Dienst.hole
+
+    def dienst(self):
+        self.runs(([leer(61), vorne(62, BRIEF_A1), leer(63), vorne(64, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        d = scan.Dienst(self.cfg)
+        d.verarbeiten = lambda stapel, frage=None, v=d.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2))
+        return d
+
+    def consume(self):
+        p = os.path.join(self.cfg.consume, "Stapel")
+        return sorted(os.listdir(p)) if os.path.isdir(p) else []
+
+    def test_the_documents_go_in_as_dokumentes_upload_and_become_the_persons(self):
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        self.assertEqual(self.consume(), [], "never through the consume folder: that files for the household")
+        self.assertEqual(sorted(d["title"] for d in self.pl.wartet), ["2021-02-03 ASV - Abfallgebühren", "2023-05-01 Mosel - Rechnung Schornsteinfeger"])
+        self.assertEqual({d["owner"] for d in self.pl.wartet}, {FakePaperless.ICH}, "Dokumente's until Paperless filed them: no one else in the family sees them")
+        self.assertEqual(self.pl.wartet[0]["tags"], [self.pl.tags["Stapel"]])
+        self.assertEqual(len(self.meldungen), 1)
+        person, text = self.meldungen[0]
+        self.assertEqual(person, "mama")
+        self.assertIn("2 Dokumente nur für dich in Paperless", text)
+        self.assertIn("Administrator ist, sieht alle Dokumente", text)
+        s = self.status()
+        self.assertEqual((s["zustand"], s["fuer"], s["letzte"][0]["fuer"]), ("fertig", "person", "person"))
+        self.assertEqual(s["uebergabe"][0]["offen"], 2)
+
+        dienst.tick()   # Paperless still reading: nothing to give yet
+        self.assertEqual(self.status()["uebergabe"][0]["offen"], 2)
+        self.pl.einlesen()
+        dienst.tick()
+        self.assertEqual([(d["owner"], d["view"]) for d in self.pl.docs], [(3, [FakePaperless.ICH])] * 2, "mama's, Dokumente still sees them")
+        self.assertEqual(self.status()["uebergabe"], [])
+        self.assertEqual(len(self.meldungen), 1, "all went as the closing message said: no second one")
+
+    def test_a_stack_without_the_choice_or_for_the_household_files_as_before(self):
+        for fuer in ({}, {"fuer": ""}, {"fuer": "haushalt"}):   # laib-haushalt sends "" for the default
+            dienst = self.dienst()
+            self.auftrag(dienst, "start", person="mama", **fuer)
+            self.assertEqual(self.status()["fuer"], "haushalt")
+        self.assertEqual(len(self.consume()), 6)   # the later stacks' names were taken: „(2)“, „(3)“
+        self.assertEqual(self.pl.anfragen, [], "the household's stacks never ask Paperless")
+
+    def test_it_does_not_start_when_it_could_not_keep_the_documents_private(self):
+        faelle = [("weg", {}, "Paperless antwortet nicht"),
+                  ("kein konto", {"person": "kind"}, "Du hast in Paperless noch kein Konto. Melde dich einmal unter https://paperless.example bei Paperless an"),
+                  ("kein recht", {}, "Dokumente darf in Paperless noch nichts hochladen"),
+                  ("ohne person", {"person": ""}, "braucht die Person"),
+                  ("unbekannt", {"fuer": "nachbar"}, "nur „haushalt“ oder „person“")]
+        self.cfg.paperless_public_url = "https://paperless.example"
+        for fall, mehr, erwartet in faelle:
+            self.pl.weg, self.pl.perms = fall == "weg", [] if fall == "kein recht" else ["add_document"]
+            self.meldungen = []
+            dienst = self.dienst()
+            self.auftrag(dienst, "start", **{"person": "mama", "fuer": "person", **mehr})
+            self.assertEqual(len(self.meldungen), 1, fall)
+            self.assertIn(erwartet, self.meldungen[0][1], fall)
+            self.assertIn("Nichts gescannt", self.meldungen[0][1], fall)
+            self.assertEqual(glob_stapel(self.cfg), [], fall + ": no stack begun")
+        self.cfg.paperless_token = ""
+        self.meldungen = []
+        self.auftrag(self.dienst(), "start", person="mama", fuer="person")
+        self.assertIn("Dokumente hat keinen Zugang zu Paperless", self.meldungen[0][1])
+        self.assertEqual(self.consume(), [])
+
+    def test_paperless_away_at_filing_waits_and_the_person_hears_once_they_are_theirs(self):
+        dienst = self.dienst()
+        echt = dienst.privat_weiter
+
+        def weg_beim_ablegen(stapel):
+            self.pl.weg = True
+            echt(stapel)
+        dienst.privat_weiter = weg_beim_ablegen
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        dienst.privat_weiter = echt
+        self.assertEqual((self.consume(), self.pl.wartet), ([], []))
+        text = self.meldungen[-1][1]
+        self.assertTrue(text.startswith("Scan gelesen:"), text)
+        self.assertIn("Paperless antwortet gerade nicht, 2 davon sind noch nicht dort", text)
+        s = self.status()
+        self.assertEqual(s["letzte"][0]["ende"], "wartet")
+        self.assertIn("Connection refused", s["uebergabe"][0]["grund"])
+        self.assertTrue(any("nur für mama" in f["detail"] for f in s["findings"]))
+
+        dienst = scan.Dienst(self.cfg)   # a restart in between: the wait goes on
+        dienst.tick()
+        self.assertEqual(self.pl.wartet, [])
+        self.pl.weg = False
+        dienst.tick()
+        self.assertEqual(len(self.pl.wartet), 2)
+        self.pl.einlesen()
+        dienst.tick()
+        self.assertEqual({d["owner"] for d in self.pl.docs}, {3})
+        self.assertEqual(len(self.meldungen), 2)
+        self.assertIn("ist jetzt in Paperless", self.meldungen[-1][1])
+        self.assertEqual(self.meldungen[-1][1].count("gehört jetzt dir"), 2)
+
+    def test_a_file_paperless_has_already_is_said_and_left_as_it_was(self):
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        erstes = self.pl.wartet[0]
+        self.pl.docs.append({**erstes, "id": 50, "owner": None})   # the household's, from before
+        self.pl.einlesen()
+        dienst.tick()
+        self.assertEqual(next(d["owner"] for d in self.pl.docs if d["id"] == 50), None, "what was there stays the household's")
+        self.assertEqual([d["owner"] for d in self.pl.docs], [None, 3])
+        self.assertIn("lag schon in Paperless und bleibt, wie es war", self.meldungen[-1][1])
+        self.assertEqual(self.status()["uebergabe"], [])
+
+    def test_weiter_and_redo_keep_the_stack_its_starters(self):
+        self.runs(([leer(71), vorne(72, BRIEF_A1)], "scanimage: sane_start: Error during device I/O"),
+                  ([leer(73), vorne(74, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage=None, v=dienst.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2))
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        self.auftrag(dienst, "weiter", person="papa")
+        zeit = self.status()["stapel"]
+        self.assertEqual(self.status()["person"], "mama")
+        self.auftrag(dienst, "redo", stapel=zeit, person="papa")
+        self.assertIn("erst neu, wenn seine Dokumente „nur für mama“ in Paperless sind", self.meldungen[-1][1])
+        self.pl.einlesen()
+        dienst.tick()
+        self.assertEqual({d["owner"] for d in self.pl.docs}, {3})
+
+
+def glob_stapel(cfg):
+    return [p for p in os.listdir(cfg.data) if scan.ZEIT.match(p)]
+
+
 class Modell(unittest.TestCase):
     """#831: what counts as the model failing, and the probe that says it is back"""
 

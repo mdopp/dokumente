@@ -48,9 +48,38 @@ One container, `Network=host` (SANE finds and reaches the scanner).
 
 **Paperless' side** (laib's post-deploy): the user and its token, the
 workflow „Dokument hinzugefügt“ → webhook `POST
-http://host.containers.internal:8720/hook` with the header.
+http://host.containers.internal:8720/hook` with the header. For stacks
+„nur für mich“ the user also needs `add_document`; without it such a stack
+is refused before a sheet is scanned, and the household's stacks go on.
 
-**Status:** `/data/laib-status.json` as the scan wrote it, plus
+**For the household or for one person** (decided 2026-10-28). The order
+`start` (`laib scan start`, written by laib-haushalt) may carry
+`"fuer": "haushalt" | "person"`; missing means `haushalt`, the default.
+`"fuer": "person"` with `"person": "<login>"` is a stack „nur für mich“:
+
+- Before scanning, Dokumente checks it can keep the documents private:
+  Paperless answers, its user may upload, and the person has a Paperless
+  account (they logged in once). If not, nothing is scanned and the person
+  is told why; it never falls back to the household.
+- Its documents do not go through the consume folder (that files without
+  an owner, for everyone) but as uploads through the API: Paperless gives
+  an upload to its uploader, so it is Dokumente's while Paperless reads it,
+  seen by no one in the family. Dokumente finds each one by its checksum
+  once filed and gives it to the person (`owner`), keeping its own view and
+  change for the contracts and invoices. Until then the PDFs stay in the
+  stack's archive (`/data/<zeit>/privat/`); Paperless away is waited out.
+- `weiter`, `abschliessen` and `redo` never change a private stack's
+  person; a redo waits until its documents are the person's.
+- **Paperless' administrators see every document.** „Nur für mich“ keeps a
+  document from the other family members, not from an admin. The closing
+  message says so, and so must every place that offers the choice.
+- Stacks from the inbox folder are the household's.
+
+**Status:** `/data/laib-status.json` as the scan wrote it (with `fuer`
+beside `person`, `fuer` in each of `letzte`, whose `ende` may be `wartet`:
+Paperless was away when a private stack closed; and `uebergabe`: `[{"stapel",
+"person", "offen", "grund"}]`, the private stacks not yet all the person's,
+with a finding, yellow after a day), plus
 `auswertung`: `{"zustand": "aus | läuft | fertig | fehler", "at",
 "anlass": "neue Dokumente | stündlich", "detail" (German, for the family),
 "lauf": {"am", "vertraege", "rechnungen", "kontakte", "erinnerungen",
