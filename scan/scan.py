@@ -16,7 +16,9 @@ letterheads fill in, #808); documents are runs from one start to the next,
 never page groups the model makes up. A duplex run whose print is on the
 backs only lay the wrong way up and is turned round. Each
 document becomes a PDF in Paperless' consume folder under SCAN_TAG, named
-as Paperless titles it: "JJJJ-MM-TT Absender - Titel".
+as Paperless titles it: "JJJJ-MM-TT Absender - Titel". A stack „nur für
+mich“ (the order's fuer: person, 2026-10-28) goes in through Paperless' API
+instead and is then given to the person who started it (class Paperless).
 
 One stack at a time, and exactly one closing message per stack through
 bote-notify: FERTIG, WARTET (the scanner stopped mid-stack: clear the jam,
@@ -47,7 +49,7 @@ Stdlib only, apart from Pillow and img2pdf for images and PDFs and libzbar
 (scanimage, tesseract, pdftoppm, pdftotext, qpdf) come with the image
 (scan/Containerfile).
 """
-import concurrent.futures, ctypes, datetime, glob, http.client, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.error, urllib.request
+import concurrent.futures, ctypes, datetime, glob, hashlib, http.client, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.error, urllib.parse, urllib.request
 from dataclasses import dataclass, field
 
 ZEIT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
@@ -63,6 +65,7 @@ EPSON2 = 1865       # the epson2 backend's network port (#589)
 TRENNER = "PATCH T" # a separator sheet's code (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING
 NACHHOLEN, EIN_TAG = 3, 86400    # a split the model failed: redone at most 3 times within a day (#831)
 WARTEN = (600, 3600, 4 * 3600)   # before each try, from the last failure: llama back from a restart, then longer
+NICHT_ANGENOMMEN = 3600          # an upload Paperless has not filed after this long: refused (a duplicate, mostly)
 
 
 # AUSWERTUNG is the contract helper's last run (ADR 0028), set by dienst.py;
@@ -104,6 +107,11 @@ class Config:
     blick_s: float = 900         # idle, the status looks again this often (#785): its age is a look's
     usb_sys: str = "/sys/bus/usb/devices"   # the host's USB tree (#801)
     usb_dev: str = "/dev/bus/usb"           # the nodes podman passed at the start (AddDevice=/dev/bus/usb)
+    paperless_url: str = ""      # a stack „nur für mich“ goes in through the API, as Dokumente's user
+    paperless_token: str = ""
+    paperless_user: str = "dokumente"
+    paperless_public_url: str = ""
+    uebergabe_s: float = 10      # its uploads: Paperless asked whether it filed them at most this often
 
     @classmethod
     def from_env(cls, env):
@@ -120,7 +128,11 @@ class Config:
                    keep_days=int(env.get("SCAN_KEEP_DAYS") or 14),
                    notify_url=(env.get("NOTIFY_URL") or "").strip(), notify_token=(env.get("NOTIFY_TOKEN") or "").strip(),
                    model_url=here(env.get("MODEL_URL")).rstrip("/"), model_lease=here(env.get("MODEL_LEASE")),
-                   model_key=(env.get("MODEL_KEY") or "").strip(), model_name=(env.get("MODEL_NAME") or "").strip())
+                   model_key=(env.get("MODEL_KEY") or "").strip(), model_name=(env.get("MODEL_NAME") or "").strip(),
+                   paperless_url=(env.get("PAPERLESS_URL") or "").strip().rstrip("/"),
+                   paperless_token=(env.get("PAPERLESS_TOKEN") or "").strip(),
+                   paperless_user=(env.get("PAPERLESS_USER") or "dokumente").strip(),
+                   paperless_public_url=(env.get("PAPERLESS_PUBLIC_URL") or "").strip().rstrip("/"))
 
 
 def log(*a):
@@ -822,6 +834,101 @@ def melde(cfg, person, text):
     return False
 
 
+# ---- a stack „nur für mich“: through Paperless' API, then the person's ----
+
+class PaperlessWeg(Exception):
+    """Paperless did not answer, or refused (code): what waits for it is tried again later"""
+    def __init__(self, text, code=0):
+        super().__init__(text)
+        self.code = code
+
+
+def formular(teile, grenze):
+    """multipart/form-data: (name, text) or (name, (file name, bytes))"""
+    out = b""
+    for name, wert in teile:
+        out += b"--" + grenze.encode() + b"\r\n"
+        if isinstance(wert, tuple):
+            out += ('Content-Disposition: form-data; name="%s"; filename="%s"\r\nContent-Type: application/pdf\r\n\r\n'
+                    % (name, wert[0].replace('"', "'"))).encode() + wert[1]
+        else:
+            out += ('Content-Disposition: form-data; name="%s"\r\n\r\n%s' % (name, wert)).encode()
+        out += b"\r\n"
+    return out + b"--" + grenze.encode() + b"--\r\n"
+
+
+class Paperless:
+    """Paperless' API as Dokumente's user (PAPERLESS_TOKEN). The consume folder files without an
+    owner, for the whole household; an upload belongs to who uploaded it, so a stack „nur für mich“
+    goes in as Dokumente's upload, which no one else in the family sees, is found again by its
+    checksum once Paperless filed it, and is then given to the person (only the owner may give a
+    document away, or anyone an unowned one). Dokumente keeps view and change, as on every
+    document, for the contracts and invoices. Paperless' administrators see every document."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def anfrage(self, method, path, body=None, form=None):
+        if not self.cfg.paperless_url or not self.cfg.paperless_token:
+            raise PaperlessWeg("kein PAPERLESS_URL oder PAPERLESS_TOKEN")
+        headers = {"Authorization": "Token " + self.cfg.paperless_token, "Accept": "application/json"}
+        data = None
+        if form is not None:
+            grenze = "dokumente-%d" % time.monotonic_ns()
+            data, headers["Content-Type"] = formular(form, grenze), "multipart/form-data; boundary=" + grenze
+        elif body is not None:
+            data, headers["Content-Type"] = json.dumps(body).encode(), "application/json"
+        r = urllib.request.Request(self.cfg.paperless_url + path, method=method, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(r, timeout=120) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            raise PaperlessWeg("Paperless: %d bei %s %s" % (e.code, method, path.split("?")[0]), e.code) from None
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise PaperlessWeg("Paperless: %s" % (str(e) or type(e).__name__)) from None
+
+    def benutzer(self, login):
+        """the Paperless user's id for a login, None when Paperless has none (never logged in)"""
+        res = self.anfrage("GET", "/api/users/?username__iexact=" + urllib.parse.quote(login)) or {}
+        return next((u["id"] for u in res.get("results") or [] if str(u.get("username", "")).casefold() == login.casefold()), None)
+
+    def tag(self, name):
+        res = self.anfrage("GET", "/api/tags/?name__iexact=" + urllib.parse.quote(name)) or {}
+        t = next((t for t in res.get("results") or [] if str(t.get("name", "")).casefold() == name.casefold()), None)
+        if t is None:   # as the consume folder makes it: for the whole household
+            t = self.anfrage("POST", "/api/tags/", {"name": name, "matching_algorithm": 0, "owner": None})
+        return t["id"]
+
+    def hochladen(self, pdf, name, tag):
+        with open(pdf, "rb") as f:
+            inhalt = f.read()
+        self.anfrage("POST", "/api/documents/post_document/", form=[("document", (name, inhalt)), ("title", name[:-4]), ("tags", str(tag))])
+
+    def mit_pruefsumme(self, md5):
+        """the documents Dokumente sees with this original's checksum: (id, owner)"""
+        res = self.anfrage("GET", "/api/documents/?checksum__iexact=%s&fields=id,owner" % md5) or {}
+        return [(d["id"], d.get("owner")) for d in res.get("results") or []]
+
+    def geben(self, doc, besitzer, ich):
+        self.anfrage("PATCH", "/api/documents/%d/" % doc, {"owner": besitzer, "set_permissions": {
+            "view": {"users": [ich], "groups": []}, "change": {"users": [ich], "groups": []}}})
+
+
+def offen(stapel):
+    """a stack's documents „nur für mich“ that are not the person's yet (a Stapel or its stapel.json)"""
+    privat = stapel.get("privat") if isinstance(stapel, dict) else stapel.privat
+    return [e for e in privat or [] if not e.get("fertig")]
+
+
+def pruefsumme(pfad):
+    h = hashlib.md5()
+    with open(pfad, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 # ---- the stack, its archive and the status ----
 
 @dataclass
@@ -837,6 +944,9 @@ class Stapel:
     erinnert: bool = False
     abgelegt: list = field(default_factory=list)  # file names in the consume folder
     nachholen: dict = field(default_factory=dict)  # the model failed the split (#831): seit, versuche, naechster, grund
+    fuer: str = ""                 # "person": „nur für mich“, its documents become the person's; "": the household's
+    privat: list = field(default_factory=list)     # „nur für mich“, per document: name, md5, hochgeladen, fertig, wie, grund
+    spaet: bool = False            # Paperless was away when it closed: the person hears again once all are theirs
 
 
 class Dienst:
@@ -851,6 +961,8 @@ class Dienst:
         self.geblickt = 0          # the last status written: idle, a look follows blick_s later (#785)
         self.nachholen = {}        # zeit → a stack whose split waits for the model (#831)
         self.gepingt = 0           # when the model was last asked whether it answers
+        self.uebergabe = {}        # zeit → a stack „nur für mich“ whose documents are not all the person's yet
+        self.uebergeben_at = 0
         os.makedirs(os.path.join(cfg.data, "auftrag"), exist_ok=True)
         self.wieder_an()
 
@@ -859,11 +971,14 @@ class Dienst:
     def zustand(self, zustand, detail, stapel=None, **mehr):
         s = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "detail": detail,
              "zustand": zustand, "scanner": bool(self.cfg.scanner), "eingang": "scan-eingang",
-             "stapel": stapel.zeit if stapel else "", "person": stapel.person if stapel else "", "letzte": self.letzte,
+             "stapel": stapel.zeit if stapel else "", "person": stapel.person if stapel else "",
+             "fuer": (stapel.fuer or "haushalt") if stapel else "", "letzte": self.letzte,
              "suche": self.suche, "pruefung": self.pruefung,
              "nachholen": [{"stapel": z, "versuche": st.nachholen.get("versuche", 0), "grund": st.nachholen.get("grund", ""),
                             "naechster": datetime.datetime.fromtimestamp(st.nachholen.get("naechster", 0), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-                           for z, st in sorted(self.nachholen.items())]}
+                           for z, st in sorted(self.nachholen.items())],
+             "uebergabe": [{"stapel": z, "person": st.person, "offen": len(offen(st)), "grund": next((e.get("grund") for e in offen(st) if e.get("grund")), "")}
+                           for z, st in sorted(self.uebergabe.items())]}
         s.update(mehr)
         if AUSWERTUNG:
             s["auswertung"] = dict(AUSWERTUNG)
@@ -877,6 +992,13 @@ class Dienst:
             z = min(self.nachholen)
             s["findings"] = [{"severity": "info", "detail": "Das Trennen von Stapel %s wird nachgeholt, sobald das Hausmodell wieder antwortet" % z,
                               "fix": "nichts zu tun; sofort: laib scan redo --stapel %s" % z}]
+        if self.uebergabe:
+            z = min(self.uebergabe)
+            alt = self.now() - min(e.get("hochgeladen") or self.now() for e in offen(self.uebergabe[z])) > EIN_TAG
+            s["findings"] = s.get("findings", []) + [{"severity": "gelb" if alt else "info",
+                "detail": "Dokumente „nur für %s“ aus Stapel %s sind noch nicht ganz in Paperless%s" % (
+                    self.uebergabe[z].person, z, " (seit über einem Tag)" if alt else ""),
+                "fix": "laib logs scan; Paperless erreichbar, und darf der Benutzer %s hochladen (add_document)?" % self.cfg.paperless_user}]
         if AUSWERTUNG.get("findings"):   # dokumente#5: the evaluation's own, beside the scan's
             s["findings"] = s.get("findings", []) + list(AUSWERTUNG["findings"])
         self.status, self.geblickt = s, self.now()
@@ -894,7 +1016,9 @@ class Dienst:
             self.nachholen[stapel.zeit] = stapel
         else:
             self.nachholen.pop(stapel.zeit, None)
-        self.letzte = ([{"stapel": stapel.zeit, "ende": ende, "quelle": stapel.quelle, "datei": stapel.datei,
+        if offen(stapel):
+            self.uebergabe[stapel.zeit] = stapel
+        self.letzte = ([{"stapel": stapel.zeit, "ende": ende, "quelle": stapel.quelle, "datei": stapel.datei, "fuer": stapel.fuer or "haushalt",
                          "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "dokumente": [{"titel": t[:-4], "datei": t} for t in dokumente], "meldung": meldung, **zahlen}]
                        + [l for l in self.letzte if l.get("stapel") != stapel.zeit])[:10]
@@ -941,6 +1065,9 @@ class Dienst:
                 if raw.get("nachholen") and not raw.get("abgelegt"):
                     st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
                     self.nachholen[st.zeit] = st
+                elif offen(raw):
+                    st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
+                    self.uebergabe[st.zeit] = st
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
         zeit = alt.get("stapel") or ""
@@ -1003,6 +1130,8 @@ class Dienst:
                 self.ordner_stapel(datei)
             elif self.nachholen:
                 self.nachholen_pruefen()
+        if self.uebergabe and self.now() - self.uebergeben_at >= self.cfg.uebergabe_s:
+            self.uebergeben()
         if self.now() - self.aufgeraeumt > 3600:
             self.aufraeumen()
         if not self.offen and self.status.get("zustand") in ("bereit", "fertig") and self.now() - self.geblickt >= self.cfg.blick_s:
@@ -1056,16 +1185,23 @@ class Dienst:
         akt, person = a.get("aktion"), a.get("person") or ""
         person = person if PERSON.match(person) else ""
         log("auftrag %s von %s" % (akt, a.get("von") or "?"))
+        fuer = a.get("fuer") or "haushalt"
         if akt == "start":
-            if self.offen:
+            grund = "" if fuer == "haushalt" else self.privat_moeglich(fuer, person)
+            if grund:
+                melde(self.cfg, person or self.cfg.notify, grund)
+            elif self.offen:
                 melde(self.cfg, person or self.offen.person, "Es wartet noch ein Stapel auf den Rest (ab Blatt %d): erst „weiter“, „abschliessen“ oder „verwerfen“." % (self.offen.blatt + 1))
             elif not self.cfg.scanner:
                 melde(self.cfg, person or self.cfg.notify, "Hier ist kein Scanner eingerichtet: lass den Scanner auf \\\\<box>\\data\\scan-eingang scannen.")
             else:
-                self.scanner_stapel(self.neuer_stapel("scanner", person))
+                stapel = self.neuer_stapel("scanner", person)
+                stapel.fuer = "person" if fuer == "person" else ""
+                self.speichern(stapel)
+                self.scanner_stapel(stapel)
         elif akt in ("weiter", "abschliessen", "verwerfen") and self.offen:
             stapel, self.offen = self.offen, None
-            if person:
+            if person and not stapel.fuer:   # „nur für mich“ stays the starter's
                 stapel.person = person
             if akt == "weiter":
                 self.scanner_stapel(stapel)
@@ -1092,7 +1228,12 @@ class Dienst:
         except (OSError, ValueError, TypeError):
             melde(self.cfg, person or self.cfg.notify, "Den Stapel %s gibt es im Archiv nicht (mehr)." % zeit)
             return
-        stapel.person, stapel.abgelegt = person or stapel.person, []
+        if zeit in self.uebergabe:   # its uploads would be left Dokumente's, seen by no one in the family
+            melde(self.cfg, person or stapel.person, "Den Stapel %s trenne ich erst neu, wenn seine Dokumente „nur für %s“ in Paperless sind: "
+                  "Paperless hat sie noch nicht alle angenommen. Ich versuche es weiter." % (zeit, stapel.person))
+            return
+        stapel.person = person if person and not stapel.fuer else stapel.person
+        stapel.abgelegt, stapel.privat, stapel.spaet = [], [], False
         self.verarbeiten(stapel)
 
     # way in A: the inbox folder
@@ -1435,6 +1576,10 @@ class Dienst:
         self.zustand("legt-ab", "legt %d Dokumente ab" % len(docs), stapel)
         vergeben = set()
         ordner = os.path.join(self.cfg.consume, self.cfg.tag)
+        if stapel.fuer:   # „nur für mich“: kept in the archive until Paperless has them as the person's
+            ordner = os.path.join(self.ordner(stapel), "privat")
+            shutil.rmtree(ordner, ignore_errors=True)
+            os.makedirs(ordner)
         for i, d in enumerate(docs, 1):
             pdf = os.path.join(self.ordner(stapel), "dokument-%d.pdf" % i)
             if original.lower().endswith(".pdf"):
@@ -1442,15 +1587,34 @@ class Dienst:
             else:
                 pdf_aus_bildern(self.cfg, [s.bild for s in d.seiten], pdf)
             name = frei(ordner, dateiname(d), vergeben)
-            ablegen(self.cfg, pdf, name)
-            os.unlink(pdf)
+            if stapel.fuer:
+                os.rename(pdf, os.path.join(ordner, name))
+                stapel.privat.append({"name": name, "md5": pruefsumme(os.path.join(ordner, name))})
+            else:
+                ablegen(self.cfg, pdf, name)
+                os.unlink(pdf)
             stapel.abgelegt.append(name)
             self.speichern(stapel)
             self.protokoll(stapel, "abgelegt: %s (Seiten %s)" % (name, ",".join(str(s.nr) for s in d.seiten)))
+        if stapel.fuer:
+            self.privat_weiter(stapel)   # every upload now; Paperless files them, the loop gives them to the person
         leer = len(seiten) - len(inhalt) - len(trenner) + len(leer_modell)
         kopf = ("%d Blatt, " % ((len(seiten) + 1) // 2 if self.cfg.duplex else len(seiten))) if stapel.quelle == "scanner" else ("%s: " % stapel.datei)
-        text = "Scan fertig: %s%d Seiten, %d leer entfernt, %d Dokumente in Paperless (Tag %s):\n%s" % (
-            kopf, len(seiten), leer, len(docs), self.cfg.tag, "\n".join("- " + n[:-4] for n in stapel.abgelegt))
+        liste = "\n".join("- " + n[:-4] for n in stapel.abgelegt)
+        draussen = [e for e in stapel.privat if not e.get("hochgeladen")]
+        if not stapel.fuer:
+            text = "Scan fertig: %s%d Seiten, %d leer entfernt, %d Dokumente in Paperless (Tag %s):\n%s" % (
+                kopf, len(seiten), leer, len(docs), self.cfg.tag, liste)
+        elif not draussen:
+            text = ("Scan fertig: %s%d Seiten, %d leer entfernt, %d Dokumente nur für dich in Paperless (Tag %s):\n%s\n"
+                    "Paperless liest sie gerade ein, dann gehören sie dir. Andere in der Familie sehen sie nicht; wer in Paperless "
+                    "Administrator ist, sieht alle Dokumente." % (kopf, len(seiten), leer, len(docs), self.cfg.tag, liste))
+        else:
+            stapel.spaet = True
+            text = ("Scan gelesen: %s%d Seiten, %d leer entfernt, %d Dokumente nur für dich:\n%s\n"
+                    "Paperless antwortet gerade nicht, %d davon sind noch nicht dort. Sie liegen sicher im Archiv und niemand sonst sieht sie; "
+                    "ich lege sie ab, sobald Paperless wieder antwortet, und sage dir dann Bescheid."
+                    % (kopf, len(seiten), leer, len(docs), liste, len(draussen)))
         if trenner:
             text += "\n" + ("1 Trennblatt erkannt." if len(trenner) == 1 else "%d Trennblätter erkannt." % len(trenner))
         if gewendet:
@@ -1460,7 +1624,95 @@ class Dienst:
         elif stapel.nachholen:
             text += "\nDas Trennen ist nachgeholt."
         stapel.nachholen = {}
-        self.ende(stapel, "fertig", text, stapel.abgelegt, seiten=len(seiten), leer=leer)
+        self.ende(stapel, "wartet" if stapel.spaet else "fertig", text, stapel.abgelegt, seiten=len(seiten), leer=leer)
+
+    # a stack „nur für mich“
+
+    def privat_moeglich(self, fuer, person):
+        """why a stack for `fuer` cannot start now, German for the person; "" when it can. Checked
+        before a sheet is scanned: a stack meant for one person is never filed for the household."""
+        if fuer != "person":
+            return "Diesen Stapel verstehe ich nicht (für „%s“): nur „haushalt“ oder „person“. Nichts gescannt." % str(fuer)[:40]
+        if not person:
+            return "„Nur für mich“ braucht die Person, die den Stapel startet. Nichts gescannt."
+        if not self.cfg.paperless_url or not self.cfg.paperless_token:
+            return "„Nur für mich“ geht hier noch nicht: Dokumente hat keinen Zugang zu Paperless. Nichts gescannt; „für den Haushalt“ geht."
+        pl = Paperless(self.cfg)
+        try:
+            if "add_document" not in ((pl.anfrage("GET", "/api/ui_settings/") or {}).get("permissions") or []):
+                log("nur für %s: der Benutzer %s darf in Paperless nicht hochladen (add_document fehlt)" % (person, self.cfg.paperless_user))
+                return "„Nur für mich“ geht hier noch nicht: Dokumente darf in Paperless noch nichts hochladen. Nichts gescannt; „für den Haushalt“ geht."
+            if pl.benutzer(person) is None:
+                wo = " unter " + self.cfg.paperless_public_url if self.cfg.paperless_public_url else ""
+                return ("„Nur für mich“ geht noch nicht: Du hast in Paperless noch kein Konto. Melde dich einmal%s bei Paperless an, "
+                        "dann starte den Stapel noch einmal. Nichts gescannt." % wo)
+            if pl.benutzer(self.cfg.paperless_user) is None:
+                log("nur für %s: Paperless nennt den Benutzer %s nicht" % (person, self.cfg.paperless_user))
+                return "„Nur für mich“ geht gerade nicht: Dokumente findet sich in Paperless nicht. Nichts gescannt; „für den Haushalt“ geht."
+        except PaperlessWeg as e:
+            log("nur für %s: %s" % (person, e))
+            return "„Nur für mich“ geht gerade nicht: Paperless antwortet nicht. Nichts gescannt; versuche es in ein paar Minuten noch einmal."
+        return ""
+
+    def uebergeben(self):
+        self.uebergeben_at = self.now()
+        for zeit in sorted(self.uebergabe):
+            self.privat_weiter(self.uebergabe[zeit])
+
+    def privat_weiter(self, stapel):
+        """its documents „nur für mich“ one step on: uploaded (Dokumente's then, no one else in the
+        family sees them), found by checksum once Paperless filed them, given to the person. Paperless
+        away is waited out: nothing goes to the household instead."""
+        pl, ordner, ich, wem, tag = Paperless(self.cfg), os.path.join(self.ordner(stapel), "privat"), None, None, None
+        for e in offen(stapel):
+            try:
+                if not e.get("hochgeladen"):
+                    if tag is None:
+                        tag = pl.tag(self.cfg.tag)
+                    pl.hochladen(os.path.join(ordner, e["name"]), e["name"], tag)
+                    e.update(hochgeladen=self.now(), grund="")
+                    self.protokoll(stapel, "hochgeladen, nur für %s: %s" % (stapel.person, e["name"]))
+                    continue   # Paperless reads it first
+                if ich is None:
+                    ich, wem = pl.benutzer(self.cfg.paperless_user), pl.benutzer(stapel.person)
+                docs = pl.mit_pruefsumme(e["md5"])
+                eigen = [d for d, o in docs if o is not None and o == ich]
+                if eigen and wem is not None:
+                    for d in eigen:
+                        pl.geben(d, wem, ich)
+                    e.update(fertig=True, wie="übergeben", id=eigen[0], grund="")
+                elif docs and not eigen:   # the same file was in Paperless before, not as this upload
+                    e.update(fertig=True, wie="schon da", id=docs[0][0], grund="")
+                elif not docs and self.now() - e["hochgeladen"] > NICHT_ANGENOMMEN:
+                    e.update(fertig=True, wie="nicht angenommen", grund="")
+                elif eigen:
+                    e["grund"] = "Paperless kennt %s nicht (mehr)" % stapel.person
+                    continue
+                else:
+                    continue
+                self.protokoll(stapel, "%s, nur für %s: %s" % (e["wie"], stapel.person, e["name"]))
+            except PaperlessWeg as ex:
+                e["grund"] = str(ex)[:160]
+                log("nur für %s, %s: %s" % (stapel.person, e["name"], ex))
+                break
+            finally:
+                self.speichern(stapel)
+        if stapel.zeit in self.uebergabe and not offen(stapel):
+            del self.uebergabe[stapel.zeit]
+            self.privat_fertig(stapel)
+            self.zeige()
+
+    def privat_fertig(self, stapel):
+        """the one message after the closing one: when Paperless was away then, or a document did not become theirs"""
+        anders = [e for e in stapel.privat if e.get("wie") != "übergeben"]
+        if not stapel.spaet and not anders:
+            return
+        zeilen = []
+        for e in stapel.privat:
+            wie = {"übergeben": "gehört jetzt dir", "schon da": "lag schon in Paperless und bleibt, wie es war (vielleicht für alle sichtbar)",
+                   "nicht angenommen": "hat Paperless nicht angenommen, meist weil es die Datei schon hat; sie liegt noch im Archiv"}[e["wie"]]
+            zeilen.append("- %s: %s" % (e["name"][:-4], wie))
+        melde(self.cfg, stapel.person, "Stapel %s, nur für dich, ist jetzt in Paperless:\n%s" % (stapel.zeit, "\n".join(zeilen)))
 
     def nachholen_pruefen(self):
         """the next split to redo (#831): after its wait, once the model answers; after a day, unsorted"""
@@ -1486,7 +1738,7 @@ class Dienst:
         grenze = self.now() - self.cfg.keep_days * 86400
         for pfad in glob.glob(os.path.join(self.cfg.data, "*")):
             zeit = os.path.basename(pfad)
-            if not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit or zeit in self.nachholen:
+            if not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit or zeit in self.nachholen or zeit in self.uebergabe:
                 continue
             try:
                 alt = os.path.getmtime(os.path.join(pfad, "stapel.json")) < grenze
