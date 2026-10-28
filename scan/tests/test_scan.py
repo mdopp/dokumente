@@ -1251,11 +1251,11 @@ class NurFuerMich(unittest.TestCase):
         self.assertEqual(len(self.meldungen), 1, "all went as the closing message said: no second one")
 
     def test_a_stack_without_the_choice_or_for_the_household_files_as_before(self):
-        for fuer in ({}, {"fuer": "haushalt"}):
+        for fuer in ({}, {"fuer": ""}, {"fuer": "haushalt"}):   # laib-haushalt sends "" for the default
             dienst = self.dienst()
             self.auftrag(dienst, "start", person="mama", **fuer)
             self.assertEqual(self.status()["fuer"], "haushalt")
-        self.assertEqual(len(self.consume()), 4)   # the second stack's names were taken: „(2)“
+        self.assertEqual(len(self.consume()), 6)   # the later stacks' names were taken: „(2)“, „(3)“
         self.assertEqual(self.pl.anfragen, [], "the household's stacks never ask Paperless")
 
     def test_it_does_not_start_when_it_could_not_keep_the_documents_private(self):
