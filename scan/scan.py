@@ -420,7 +420,7 @@ NUMMER = re.compile(r"\b(?:Rech(?:nung)?s?|Beleg|Angebots?|Bescheid|Liefer(?:sch
 
 # what tells two documents of one sender apart (#808): a document's own number, else its date;
 # never a customer, object or district number, which every letter of that sender carries
-BELEGNR = re.compile(r"\b(Rech(?:nung)?s?|Beleg|Angebots?|\w*bescheid|Liefer(?:schein)?|Gutschrift)[\s.-]*(?:Nr|Nummer)\b\.?"
+BELEGNR = re.compile(r"\b(Rech(?:nung)?s?|Beleg|Angebots?|\w*bescheid|Liefer(?:schein)?|Gutschrift|(?:PA\s*/\s*)?LS)[\s.-]*(?:Nr|Nummer)\b\.?\.?"
                      r"(?:\s*[:#]?\s*([A-Z]{0,3}\d[\d/.-]*\d|\d))?|\b(Rechnung)\s+(\d{3,})\b", re.I)
 TAG = re.compile(r"\b(\d{1,2})\s?\.\s?(\d{1,2})\s?\.\s?(\d{4}|\d{2})\b")
 
@@ -430,7 +430,7 @@ def kennung(text):
     stand by: an OCR that puts a label and its value apart still keeps the label), from its head"""
     kopf = "\n".join((text or "").splitlines()[:40])
     funde = BELEGNR.findall(kopf)
-    art = lambda w: "bescheid" if w.lower().endswith("bescheid") else w.lower()[:4]
+    art = lambda w: "bescheid" if w.lower().endswith("bescheid") else "lief" if w.lower().replace(" ", "").endswith("ls") else w.lower()[:4]
     return ({(int(d), int(m), int(j) % 100) for d, m, j in TAG.findall(kopf)},
             {(n or n2).rstrip(".-/") for _, n, _, n2 in funde if n or n2},
             {art(w or w2) for w, _, w2, _ in funde})
@@ -482,14 +482,34 @@ def entscheidungen(antwort, teil):
     return seiten, dokumente
 
 
+def wer(absender):
+    """a sender as the model wrote it, comparable: lower case, letters and digits only, no legal form"""
+    w = re.sub(r"[^a-z0-9äöüß]+", " ", (absender or "").casefold())
+    w = re.sub(r"\b(gmbh|ag|kg|co|mbh|ug|e ?k|ohg|gbr|se)\b", " ", w)
+    return " ".join(w.split())
+
+
+def anderer(a, b):
+    """two senders the model named, both known and not the same (one may be the other's short form)"""
+    a, b = wer(a), wer(b)
+    return bool(a and b and a not in b and b not in a)
+
+
+def teilt(text, ken):
+    """the current document's own number (five digits and more) is on this page too"""
+    return bool(ken) and any(len(re.sub(r"\D", "", n)) >= 5 and n in (text or "") for n in ken[1])
+
+
 def laeufe(seiten, flags, meta):
     """documents as runs from one start to the next; the model's blank only for a bright page.
     A page the model left out continues the document before it: nothing is lost, nothing doubled.
-    A page two whose dates and numbers are not the document's before it waits for the next
-    document: when that one shares them, the page goes after its first page (dokumente#2: a
-    sheet two lay before sheet one); else it goes back where it came."""
+    A page two whose dates and numbers, or whose sender as the model names it, are not the
+    document's before it waits for the next document: when that one shares them, the page goes
+    after its first page (dokumente#2: a sheet two lay before sheet one); else it goes back where
+    it came. A letterhead page from another sender starts a document, whatever its dates
+    (dokumente#2: OS-Solar's page one, its date not in its head's text)."""
     docs, leer, ken = [], [], None
-    wartet = []   # (page, its kennung, the index of the document it followed)
+    wartet = []   # (page, its kennung, its sender, the index of the document it followed)
     for s in seiten:
         neu, ist_leer, absender = flags.get(s.nr, (False, False, ""))
         if ist_leer and (s.hell >= HELL or s.woerter < LEER_WOERTER):   # dokumente#2: a near-wordless page the model also calls blank
@@ -499,13 +519,18 @@ def laeufe(seiten, flags, meta):
         # the letterhead decides beside the model (#808): one sender's invoices in a row are as many
         # documents as they have numbers and dates; a page that says it is page two starts none
         kopf, k = briefkopf(s.text), kennung(s.text)
+        fremd = bool(docs) and anderer(absender, docs[-1].absender)
         if docs and kopf < 0:
-            if anders(k, ken):   # a page two of another document: it waits for that one
-                wartet.append((s, k, len(docs) - 1))
+            if anders(k, ken) or fremd:   # a page two of another document: it waits for that one
+                wartet.append((s, k, absender, len(docs) - 1))
                 continue
             neu = False
-        elif docs and kopf > 0 and anders(k, ken):
+        elif docs and kopf > 0 and (anders(k, ken) or fremd):
             neu = True
+        elif docs and neu and not fremd and kopf >= 0 and teilt(s.text, ken):
+            # one document over several sheets, each with its head and the same number (dokumente#2:
+            # Krapp's delivery note, „Blatt“ 1-4, PA/LS-Nr. 251466 on every front)
+            neu = False
         if not docs or neu:
             ken = k
             d = meta.get(s.nr) or {}
@@ -513,17 +538,18 @@ def laeufe(seiten, flags, meta):
                                  datum=str(d.get("datum") or ""), titel=str(d.get("titel") or "")))
             if wartet:   # only the next document may claim the pages waiting for it
                 for w in wartet:
-                    if not anders(w[1], k):
+                    # its own: not another sender's, and the same sender named on both, or its dates and numbers
+                    if not anderer(w[2], docs[-1].absender) and ((wer(w[2]) and wer(docs[-1].absender)) or not anders(w[1], k)):
                         docs[-1].seiten.append(w[0])
                         ken = tuple(a | b for a, b in zip(ken, w[1]))
                     else:
-                        docs[w[2]].seiten.append(w[0])
+                        docs[w[3]].seiten.append(w[0])
                 wartet = []
         else:
             docs[-1].seiten.append(s)
             ken = tuple(a | b for a, b in zip(ken, k))
     for w in wartet:   # nobody claimed them: back where they came
-        docs[w[2]].seiten.append(w[0])
+        docs[w[3]].seiten.append(w[0])
     for d in docs:   # the first page stays first; the rest in stack order, a page come back in its place
         d.seiten[1:] = sorted(d.seiten[1:], key=lambda x: x.nr)
         if not d.titel:   # the model named a page of it that came in late (dokumente#2): what is still empty

@@ -379,6 +379,22 @@ class Trennen(unittest.TestCase):
         self.assertEqual([s.nr for s in leer], [3])
         self.assertEqual((docs[1].absender, docs[1].titel), ("OS - Solar GmbH", "Abschlussrechnung PV-Anlage"))
 
+    def test_the_stack_of_2026_10_27_splits_the_same_whatever_the_model_answered(self):
+        # dokumente#2: stack 2026-10-27T19-32-41 on the box, split three times with three different
+        # model answers (2, 1 and 4 Krapp documents; OS-Solar into Beckers twice). The fixture is the
+        # pages as the rules read them, the household's data replaced (same rules, same outcome, checked
+        # when it was made), and the three answers as they came. The owner's split: Krapp's delivery
+        # note is one document over four sheets, OS-Solar its own with page one first.
+        with open(os.path.join(os.path.dirname(__file__), "fixtures", "stapel-2026-10-27.json"), encoding="utf-8") as f:
+            fx = json.load(f)
+        erwartet = [[1, 2, 3, 4, 5, 6], [7], [9], [11], [13, 14, 15, 16], [17, 18, 19, 20, 21, 22, 23, 24], [25], [27], [29, 31], [35, 33]]
+        for i, lauf in enumerate(fx["laeufe"], 1):
+            seiten = [scan.Seite(nr=n, bild="", hell=fx["seiten"][str(n)]["hell"], woerter=fx["seiten"][str(n)]["woerter"],
+                                 text=fx["seiten"][str(n)]["text"]) for n in lauf["seiten"]]
+            docs, _ = scan.trennen(seiten, lambda m, a=lauf["antwort"]: a)
+            self.assertEqual([[s.nr for s in d.seiten] for d in docs], erwartet, "run %d" % i)
+            self.assertTrue(docs[-1].titel and docs[-1].absender, "OS-Solar named, run %d" % i)
+
     def test_a_page_two_nobody_claims_goes_back_where_it_came(self):
         fremd = "Seite 2\nAufstellung vom 05.05.2019\nPosten"
         seiten = briefe(RECHNUNG % (2021, 21, 2021), fremd, "Anlage\nweitere Posten")
