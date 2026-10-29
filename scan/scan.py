@@ -905,10 +905,17 @@ class Paperless:
             inhalt = f.read()
         self.anfrage("POST", "/api/documents/post_document/", form=[("document", (name, inhalt)), ("title", name[:-4]), ("tags", str(tag))])
 
-    def mit_pruefsumme(self, md5):
-        """the documents Dokumente sees with this original's checksum: (id, owner)"""
-        res = self.anfrage("GET", "/api/documents/?checksum__iexact=%s&fields=id,owner" % md5) or {}
-        return [(d["id"], d.get("owner")) for d in res.get("results") or []]
+    def mit_pruefsumme(self, summen):
+        """the documents Dokumente sees with this original's checksum: (id, owner). Paperless 3 keeps
+        the SHA-256 of the original, Paperless 2 its MD5 (the box's 3.0 answered 0 to every MD5 and
+        13 documents stayed Dokumente's, 2026-10-29): asked with each sum the entry has, SHA-256 first."""
+        for k in ("sha256", "md5"):
+            if summen.get(k):
+                res = self.anfrage("GET", "/api/documents/?checksum__iexact=%s&fields=id,owner" % summen[k]) or {}
+                docs = [(d["id"], d.get("owner")) for d in res.get("results") or []]
+                if docs:
+                    return docs
+        return []
 
     def geben(self, doc, besitzer, ich):
         self.anfrage("PATCH", "/api/documents/%d/" % doc, {"owner": besitzer, "set_permissions": {
@@ -921,12 +928,14 @@ def offen(stapel):
     return [e for e in privat or [] if not e.get("fertig")]
 
 
-def pruefsumme(pfad):
-    h = hashlib.md5()
+def pruefsummen(pfad):
+    """the original's checksums as Paperless may keep them: {"md5", "sha256"} (one pass over the file)"""
+    hs = {"md5": hashlib.md5(), "sha256": hashlib.sha256()}
     with open(pfad, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
+            for h in hs.values():
+                h.update(block)
+    return {k: h.hexdigest() for k, h in hs.items()}
 
 
 # ---- the stack, its archive and the status ----
@@ -945,7 +954,7 @@ class Stapel:
     abgelegt: list = field(default_factory=list)  # file names in the consume folder
     nachholen: dict = field(default_factory=dict)  # the model failed the split (#831): seit, versuche, naechster, grund
     fuer: str = ""                 # "person": „nur für mich“, its documents become the person's; "": the household's
-    privat: list = field(default_factory=list)     # „nur für mich“, per document: name, md5, hochgeladen, fertig, wie, grund
+    privat: list = field(default_factory=list)     # „nur für mich“, per document: name, md5, sha256, hochgeladen, fertig, wie, grund
     spaet: bool = False            # Paperless was away when it closed: the person hears again once all are theirs
 
 
@@ -1589,7 +1598,7 @@ class Dienst:
             name = frei(ordner, dateiname(d), vergeben)
             if stapel.fuer:
                 os.rename(pdf, os.path.join(ordner, name))
-                stapel.privat.append({"name": name, "md5": pruefsumme(os.path.join(ordner, name))})
+                stapel.privat.append({"name": name, **pruefsummen(os.path.join(ordner, name))})
             else:
                 ablegen(self.cfg, pdf, name)
                 os.unlink(pdf)
@@ -1675,12 +1684,17 @@ class Dienst:
                     continue   # Paperless reads it first
                 if ich is None:
                     ich, wem = pl.benutzer(self.cfg.paperless_user), pl.benutzer(stapel.person)
-                docs = pl.mit_pruefsumme(e["md5"])
+                if not e.get("sha256") and os.path.isfile(os.path.join(ordner, e["name"])):   # uploaded before Dokumente kept the SHA-256
+                    e.update(pruefsummen(os.path.join(ordner, e["name"])))
+                docs = pl.mit_pruefsumme(e)
                 eigen = [d for d, o in docs if o is not None and o == ich]
+                ihre = [d for d, o in docs if wem is not None and o == wem]   # given by hand meanwhile: nothing left to do
                 if eigen and wem is not None:
                     for d in eigen:
                         pl.geben(d, wem, ich)
                     e.update(fertig=True, wie="übergeben", id=eigen[0], grund="")
+                elif ihre:
+                    e.update(fertig=True, wie="übergeben", id=ihre[0], grund="")
                 elif docs and not eigen:   # the same file was in Paperless before, not as this upload
                     e.update(fertig=True, wie="schon da", id=docs[0][0], grund="")
                 elif not docs and self.now() - e["hochgeladen"] > NICHT_ANGENOMMEN:
