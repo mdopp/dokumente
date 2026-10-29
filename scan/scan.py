@@ -922,6 +922,20 @@ class Paperless:
             "view": {"users": [ich], "groups": []}, "change": {"users": [ich], "groups": []}}})
 
 
+def rohseiten(roh, duplex):
+    """the readable raw pages of a stack's roh/ in scan order, up to the first broken one; never half a sheet"""
+    bilder = []
+    for pfad in sorted(glob.glob(os.path.join(roh, "bild-*.pnm"))):
+        try:
+            lies_pnm(pfad)
+        except ValueError:
+            break
+        bilder.append(pfad)
+    if duplex and len(bilder) % 2:
+        bilder = bilder[:-1]
+    return bilder
+
+
 def offen(stapel):
     """a stack's documents „nur für mich“ that are not the person's yet (a Stapel or its stapel.json)"""
     privat = stapel.get("privat") if isinstance(stapel, dict) else stapel.privat
@@ -1242,6 +1256,12 @@ class Dienst:
                   "Paperless hat sie noch nicht alle angenommen. Ich versuche es weiter." % (zeit, stapel.person))
             return
         stapel.person = person if person and not stapel.fuer else stapel.person
+        if not stapel.bilder and stapel.quelle == "scanner":
+            # killed after the scanner was through but before the page list was saved (the box, 2026-10-29
+            # 17:54: 80 pages in roh/, "alle 0 Seiten sind leer"): the raw pages are the stack
+            stapel.bilder = rohseiten(os.path.join(self.ordner(stapel), "roh"), self.cfg.duplex)
+            if stapel.bilder:
+                self.protokoll(stapel, "redo mit %d Rohseiten aus dem Archiv" % len(stapel.bilder))
         stapel.abgelegt, stapel.privat, stapel.spaet = [], [], False
         self.verarbeiten(stapel)
 

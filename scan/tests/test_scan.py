@@ -1365,6 +1365,29 @@ class NurFuerMich(unittest.TestCase):
         self.assertEqual([m for m, p in self.pl.anfragen if m == "PATCH"], [], "nothing to change")
         self.assertEqual(len(self.meldungen), 1, "as the closing message said: no second one")
 
+    def test_a_redo_after_a_kill_before_the_page_list_was_saved_takes_the_raw_pages(self):
+        """the box 2026-10-29 17:54: SIGKILL after "Batch terminated, 80 pages scanned", before stapel.json had
+        the page list; the redo by hand said „alle 0 Seiten sind leer“ with 80 pages in roh/"""
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama")
+        zeit = self.status()["letzte"][0]["stapel"]
+        vorher = self.consume()
+        self.assertEqual(len(vorher), 2)
+        p = os.path.join(self.cfg.data, zeit, "stapel.json")
+        with open(p) as f:
+            raw = json.load(f)
+        raw.update(bilder=[], abgelegt=[], ende="fehler")
+        with open(p, "w") as f:
+            json.dump(raw, f)
+        wieder = scan.Dienst(self.cfg)
+        wieder.verarbeiten = lambda stapel, frage=None, v=wieder.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2))
+        self.auftrag(wieder, "redo", stapel=zeit)
+        s = self.status()
+        self.assertEqual(s["letzte"][0]["ende"], "fertig", s["letzte"][0]["meldung"])
+        self.assertEqual(len(self.consume()), 4, "the two documents again, from the raw pages")
+        with open(os.path.join(self.cfg.data, zeit, "log.txt")) as f:
+            self.assertIn("redo mit 4 Rohseiten aus dem Archiv", f.read())
+
     def test_weiter_and_redo_keep_the_stack_its_starters(self):
         self.runs(([leer(71), vorne(72, BRIEF_A1)], "scanimage: sane_start: Error during device I/O"),
                   ([leer(73), vorne(74, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
