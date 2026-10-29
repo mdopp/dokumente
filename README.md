@@ -65,7 +65,8 @@ is refused before a sheet is scanned, and the household's stacks go on.
   an owner, for everyone) but as uploads through the API: Paperless gives
   an upload to its uploader, so it is Dokumente's while Paperless reads it,
   seen by no one in the family. Dokumente finds each one by its checksum
-  once filed and gives it to the person (`owner`), keeping its own view and
+  (Paperless 3 keeps the original's SHA-256, Paperless 2 its MD5; both are
+  kept and asked, SHA-256 first) once filed and gives it to the person (`owner`), keeping its own view and
   change for the contracts and invoices. Until then the PDFs stay in the
   stack's archive (`/data/<zeit>/privat/`); Paperless away is waited out.
 - `weiter`, `abschliessen` and `redo` never change a private stack's

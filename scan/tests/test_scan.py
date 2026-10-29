@@ -1148,7 +1148,7 @@ class FakePaperless:
         self.users = {"dokumente": self.ICH, "mama": 3, "papa": 4}
         self.perms = ["view_document", "change_document", "add_document"]
         self.tags, self.docs, self.wartet, self.anfragen = {}, [], [], []
-        self.weg = False
+        self.weg, self.summe = False, "sha256"
 
     def anfrage(self, method, path, body=None, form=None):
         self.anfragen.append((method, path))
@@ -1171,12 +1171,14 @@ class FakePaperless:
                 raise scan.PaperlessWeg("Paperless: 403 bei POST /api/documents/post_document/", 403)
             teile = dict(form)
             name, inhalt = teile["document"]
-            self.wartet.append({"name": name, "title": teile["title"], "tags": [int(teile["tags"])],
-                                "md5": __import__("hashlib").md5(inhalt).hexdigest(), "owner": self.ICH, "view": []})
+            hashlib = __import__("hashlib")
+            self.wartet.append({"name": name, "title": teile["title"], "tags": [int(teile["tags"])], "md5": hashlib.md5(inhalt).hexdigest(),
+                                "sha256": hashlib.sha256(inhalt).hexdigest(), "owner": self.ICH, "view": []})
             return "task-%d" % len(self.wartet)
         if pfad == "/api/documents/" and method == "GET":
+            # Paperless 3 keeps the SHA-256 as `checksum`, Paperless 2 the MD5: the fake is one or the other
             return {"results": [{"id": d["id"], "owner": d["owner"]} for d in self.docs
-                                if d["md5"] == q["checksum__iexact"] and (d["owner"] in (None, self.ICH) or self.ICH in d["view"])]}
+                                if d[self.summe] == q["checksum__iexact"] and (d["owner"] in (None, self.ICH) or self.ICH in d["view"])]}
         if pfad.startswith("/api/documents/") and method == "PATCH":
             d = next(d for d in self.docs if d["id"] == int(pfad.split("/")[3]))
             if d["owner"] not in (None, self.ICH):
@@ -1324,6 +1326,45 @@ class NurFuerMich(unittest.TestCase):
         self.assertIn("lag schon in Paperless und bleibt, wie es war", self.meldungen[-1][1])
         self.assertEqual(self.status()["uebergabe"], [])
 
+    def test_paperless_2_keeps_the_md5_and_the_documents_still_become_the_persons(self):
+        self.pl.summe = "md5"
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        self.pl.einlesen()
+        dienst.tick()
+        self.assertEqual({d["owner"] for d in self.pl.docs}, {3})
+        self.assertEqual(self.status()["uebergabe"], [])
+        summen = [p.split("checksum__iexact=")[1].split("&")[0] for m, p in self.pl.anfragen if m == "GET" and "checksum__iexact" in p]
+        self.assertTrue(summen and len(summen) % 2 == 0, summen)
+        self.assertEqual([len(x) for x in summen], [64, 32] * (len(summen) // 2), "each document asked with the SHA-256 first, then the MD5")
+
+    def test_a_stack_uploaded_before_the_sha256_was_kept_gets_it_from_the_archive(self):
+        """the box's stack of 2026-10-29: 13 entries with an MD5 only, Paperless 3 answering 0 to each; the
+        new code hashes the archived PDF again and finds them"""
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        stapel = dienst.uebergabe[min(dienst.uebergabe)]
+        for e in stapel.privat:
+            del e["sha256"]
+        dienst.speichern(stapel)
+        self.pl.einlesen()
+        dienst = scan.Dienst(self.cfg)   # restarted with the new code
+        dienst.tick()
+        self.assertEqual({d["owner"] for d in self.pl.docs}, {3})
+        self.assertEqual(self.status()["uebergabe"], [])
+        self.assertTrue(all(len(e.get("sha256", "")) == 64 for e in dienst_privat(self.cfg)))
+
+    def test_a_document_given_to_the_person_by_hand_counts_as_given(self):
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        self.pl.einlesen()
+        for d in self.pl.docs:
+            d["owner"], d["view"] = 3, [FakePaperless.ICH]   # an admin did it in Paperless meanwhile
+        dienst.tick()
+        self.assertEqual(self.status()["uebergabe"], [])
+        self.assertEqual([m for m, p in self.pl.anfragen if m == "PATCH"], [], "nothing to change")
+        self.assertEqual(len(self.meldungen), 1, "as the closing message said: no second one")
+
     def test_weiter_and_redo_keep_the_stack_its_starters(self):
         self.runs(([leer(71), vorne(72, BRIEF_A1)], "scanimage: sane_start: Error during device I/O"),
                   ([leer(73), vorne(74, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
@@ -1342,6 +1383,17 @@ class NurFuerMich(unittest.TestCase):
 
 def glob_stapel(cfg):
     return [p for p in os.listdir(cfg.data) if scan.ZEIT.match(p)]
+
+
+def dienst_privat(cfg):
+    """every stack's „nur für mich“ entries as stapel.json has them"""
+    out = []
+    for z in glob_stapel(cfg):
+        p = os.path.join(cfg.data, z, "stapel.json")
+        if os.path.isfile(p):
+            with open(p) as f:
+                out += json.load(f).get("privat") or []
+    return out
 
 
 class Modell(unittest.TestCase):
