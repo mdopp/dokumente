@@ -934,8 +934,14 @@ class Paperless:
         return True
 
     def geben(self, doc, besitzer, ich):
-        self.anfrage("PATCH", "/api/documents/%d/" % doc, {"owner": besitzer, "set_permissions": {
-            "view": {"users": [ich], "groups": []}, "change": {"users": [ich], "groups": []}}})
+        """the person owns it; who could see and change it still can (the workflow gave Gesundheit
+        view and change: set_permissions replaces, and a record „nur für mich“ was lost to it), and Dokumente too"""
+        alt = (self.anfrage("GET", "/api/documents/%d/?full_perms=true" % doc) or {}).get("permissions") or {}
+        rechte = {}
+        for k in ("view", "change"):
+            users = [u for u in ((alt.get(k) or {}).get("users") or []) if u != besitzer]
+            rechte[k] = {"users": sorted(set(users) | {ich}), "groups": list((alt.get(k) or {}).get("groups") or [])}
+        self.anfrage("PATCH", "/api/documents/%d/" % doc, {"owner": besitzer, "set_permissions": rechte})
 
 
 def rohseiten(roh, duplex):

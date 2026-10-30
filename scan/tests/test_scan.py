@@ -1180,7 +1180,9 @@ class FakePaperless:
             return {"results": [{"id": i, "name": n} for n, i in self.felder.items() if n.lower() == q["name__iexact"].lower()]}
         if pfad.startswith("/api/documents/") and pfad != "/api/documents/" and method == "GET":
             d = next(d for d in self.docs if d["id"] == int(pfad.split("/")[3]))
-            return {"id": d["id"], "custom_fields": list(d.get("custom_fields") or [])}
+            return {"id": d["id"], "custom_fields": list(d.get("custom_fields") or []),
+                    "permissions": {"view": {"users": list(d.get("view") or []) + list(d.get("andere") or []), "groups": []},
+                                    "change": {"users": list(d.get("andere") or []), "groups": []}}}
         if pfad.startswith("/api/documents/") and method == "PATCH" and "custom_fields" in body:
             d = next(d for d in self.docs if d["id"] == int(pfad.split("/")[3]))
             if d["owner"] not in (None, self.ICH) and self.ICH not in d["view"]:
@@ -1271,6 +1273,15 @@ class NurFuerMich(unittest.TestCase):
         self.pl.einlesen()
         dienst.tick()
         self.assertEqual([(d["owner"], d["view"]) for d in self.pl.docs], [(3, [FakePaperless.ICH])] * 2, "mama's, Dokumente still sees them")
+
+    def test_who_else_could_see_a_document_still_can_once_it_is_the_persons(self):
+        dienst = self.dienst()
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        self.pl.einlesen()
+        for d in self.pl.docs:
+            d["andere"] = [9]   # the workflow gave Gesundheit view and change (gesundheit#3: records „nur für mich“ were lost to it)
+        dienst.tick()
+        self.assertEqual([(d["owner"], d["view"]) for d in self.pl.docs], [(3, [FakePaperless.ICH, 9])] * 2)
         self.assertEqual(self.status()["uebergabe"], [])
         self.assertEqual(len(self.meldungen), 1, "all went as the closing message said: no second one")
         zeit = self.status()["letzte"][0]["stapel"]
