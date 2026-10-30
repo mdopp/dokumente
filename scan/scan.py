@@ -1066,7 +1066,7 @@ class Dienst:
             self.uebergabe[stapel.zeit] = stapel
         if offen(stapel, "ablage"):
             self.markieren[stapel.zeit] = stapel
-        self.letzte = ([{"stapel": stapel.zeit, "ende": ende, "quelle": stapel.quelle, "datei": stapel.datei, "fuer": stapel.fuer or "haushalt",
+        self.letzte = ([{"stapel": stapel.zeit, "ende": ende, "quelle": stapel.quelle, "datei": stapel.datei, "fuer": stapel.fuer or "haushalt", "person": stapel.person,
                          "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                          "dokumente": [self.dokument(stapel, t) for t in dokumente], "meldung": meldung, **zahlen}]
                        + [l for l in self.letzte if l.get("stapel") != stapel.zeit])[:10]

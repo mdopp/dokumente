@@ -88,7 +88,7 @@ documents from Paperless by the field (`custom_field_query=["Stapel",
 "exact", "<id>"]`); a split or merge in Paperless keeps it.
 
 **Status:** `/data/laib-status.json` as the scan wrote it (with `fuer`
-beside `person`, `fuer` in each of `letzte`, whose `ende` may be `wartet`:
+beside `person`, `fuer` and `person` in each of `letzte`, whose `ende` may be `wartet`:
 Paperless was away when a private stack closed; and `uebergabe`: `[{"stapel",
 "person", "offen", "grund"}]`, the private stacks not yet all the person's,
 with a finding, yellow after a day; each document of `letzte` with its
