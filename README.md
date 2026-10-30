@@ -76,11 +76,27 @@ is refused before a sheet is scanned, and the household's stacks go on.
   message says so, and so must every place that offers the choice.
 - Stacks from the inbox folder are the household's.
 
+**Every filed document carries its stack** (#15): Paperless' custom field
+`Stapel` (made by laib's paperless template, laib#909) is set to the stack
+id (`2026-10-29T17-07-46`) on each document Dokumente files, the
+household's (found by checksum once the consume folder filed it) and the
+private ones (before they are given to the person). A field already naming
+another stack stays (the same file filed before). Each document's Paperless
+id goes into `stapel.json` and the status; one Paperless did not take within
+the hour says `"paperless": "nicht angenommen"`. Haus lists a stack's
+documents from Paperless by the field (`custom_field_query=["Stapel",
+"exact", "<id>"]`); a split or merge in Paperless keeps it.
+
 **Status:** `/data/laib-status.json` as the scan wrote it (with `fuer`
-beside `person`, `fuer` in each of `letzte`, whose `ende` may be `wartet`:
+beside `person`, `fuer` and `person` in each of `letzte`, whose `ende` may be `wartet`:
 Paperless was away when a private stack closed; and `uebergabe`: `[{"stapel",
 "person", "offen", "grund"}]`, the private stacks not yet all the person's,
-with a finding, yellow after a day), plus
+with a finding, yellow after a day; each document of `letzte` with its
+Paperless `id` once known; and `auftrag`: `{"aktion", "at", "angenommen",
+"fuer", "person", "grund"?}`, the last order as Dokumente took it (#16): a
+refused `start` or `weiter` (`angenommen: false`) leaves its German `grund`
+there at once, the stack's `zustand` as it was; a taken `start` is there
+with the stack's first `scannt`, before the scanner runs), plus
 `auswertung`: `{"zustand": "aus | läuft | fertig | fehler", "at",
 "anlass": "neue Dokumente | stündlich", "detail" (German, for the family),
 "lauf": {"am", "vertraege", "rechnungen", "kontakte", "erinnerungen",
