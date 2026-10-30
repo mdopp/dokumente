@@ -917,6 +917,22 @@ class Paperless:
                     return docs
         return []
 
+    def feld(self, name):
+        """a custom field's id by its name (laib's paperless template makes „Stapel“, laib#909); None without it"""
+        res = self.anfrage("GET", "/api/custom_fields/?name__iexact=" + urllib.parse.quote(name)) or {}
+        return next((f["id"] for f in res.get("results") or [] if str(f.get("name", "")).casefold() == name.casefold()), None)
+
+    def stapel_setzen(self, doc, feld, zeit):
+        """the document's „Stapel“ is the stack's id; one that names another stack stays (a file filed
+        before, by another stack). The list replaces the document's, so its other fields go back as they were."""
+        have = {c["field"]: c.get("value") for c in (self.anfrage("GET", "/api/documents/%d/" % doc) or {}).get("custom_fields") or []}
+        if have.get(feld) not in (None, "", zeit):
+            return False
+        if have.get(feld) != zeit:
+            have[feld] = zeit
+            self.anfrage("PATCH", "/api/documents/%d/" % doc, {"custom_fields": [{"field": f, "value": v} for f, v in have.items()]})
+        return True
+
     def geben(self, doc, besitzer, ich):
         self.anfrage("PATCH", "/api/documents/%d/" % doc, {"owner": besitzer, "set_permissions": {
             "view": {"users": [ich], "groups": []}, "change": {"users": [ich], "groups": []}}})
@@ -936,9 +952,10 @@ def rohseiten(roh, duplex):
     return bilder
 
 
-def offen(stapel):
-    """a stack's documents „nur für mich“ that are not the person's yet (a Stapel or its stapel.json)"""
-    privat = stapel.get("privat") if isinstance(stapel, dict) else stapel.privat
+def offen(stapel, liste="privat"):
+    """a stack's documents „nur für mich“ that are not the person's yet (a Stapel or its stapel.json);
+    with "ablage", the household's whose Paperless id is not known yet"""
+    privat = stapel.get(liste) if isinstance(stapel, dict) else getattr(stapel, liste)
     return [e for e in privat or [] if not e.get("fertig")]
 
 
@@ -969,6 +986,7 @@ class Stapel:
     nachholen: dict = field(default_factory=dict)  # the model failed the split (#831): seit, versuche, naechster, grund
     fuer: str = ""                 # "person": „nur für mich“, its documents become the person's; "": the household's
     privat: list = field(default_factory=list)     # „nur für mich“, per document: name, md5, sha256, hochgeladen, fertig, wie, grund
+    ablage: list = field(default_factory=list)     # the household's, per document in the consume folder: name, md5, sha256, seit, fertig, wie, id (dokumente#15)
     spaet: bool = False            # Paperless was away when it closed: the person hears again once all are theirs
 
 
@@ -985,6 +1003,9 @@ class Dienst:
         self.nachholen = {}        # zeit → a stack whose split waits for the model (#831)
         self.gepingt = 0           # when the model was last asked whether it answers
         self.uebergabe = {}        # zeit → a stack „nur für mich“ whose documents are not all the person's yet
+        self.markieren = {}        # zeit → a household stack whose documents Paperless has not shown with their id yet (dokumente#15)
+        self.letzter_auftrag = {}  # the last order and whether it was taken (dokumente#16): Haus shows a refusal in place
+        self.stapel_feld, self.feld_gefragt = 0, -3600   # Paperless' „Stapel“ field id, asked once; while missing, hourly
         self.uebergeben_at = 0
         os.makedirs(os.path.join(cfg.data, "auftrag"), exist_ok=True)
         self.wieder_an()
@@ -1002,6 +1023,8 @@ class Dienst:
                            for z, st in sorted(self.nachholen.items())],
              "uebergabe": [{"stapel": z, "person": st.person, "offen": len(offen(st)), "grund": next((e.get("grund") for e in offen(st) if e.get("grund")), "")}
                            for z, st in sorted(self.uebergabe.items())]}
+        if self.letzter_auftrag:
+            s["auftrag"] = self.letzter_auftrag
         s.update(mehr)
         if AUSWERTUNG:
             s["auswertung"] = dict(AUSWERTUNG)
@@ -1041,13 +1064,32 @@ class Dienst:
             self.nachholen.pop(stapel.zeit, None)
         if offen(stapel):
             self.uebergabe[stapel.zeit] = stapel
+        if offen(stapel, "ablage"):
+            self.markieren[stapel.zeit] = stapel
         self.letzte = ([{"stapel": stapel.zeit, "ende": ende, "quelle": stapel.quelle, "datei": stapel.datei, "fuer": stapel.fuer or "haushalt",
                          "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                         "dokumente": [{"titel": t[:-4], "datei": t} for t in dokumente], "meldung": meldung, **zahlen}]
+                         "dokumente": [self.dokument(stapel, t) for t in dokumente], "meldung": meldung, **zahlen}]
                        + [l for l in self.letzte if l.get("stapel") != stapel.zeit])[:10]
         zu = {"fertig": "fertig", "fehler": "fehler"}.get(ende, "bereit")
         self.zustand(zu, meldung.splitlines()[0], stapel)
         self.speichern(stapel, ende=ende)
+
+    def dokument(self, stapel, datei):
+        """one document of a stack's line in the status: its Paperless id once known (dokumente#15),
+        and when Paperless did not take it, so"""
+        d = {"titel": datei[:-4], "datei": datei}
+        e = next((e for e in stapel.privat + stapel.ablage if e.get("name") == datei), {})
+        if e.get("id"):
+            d["id"] = e["id"]
+        if e.get("wie") in ("nicht angenommen", "schon da"):
+            d["paperless"] = e["wie"]
+        return d
+
+    def ids_zeigen(self, stapel):
+        """the ids found since the stack closed, into its line of the last stacks"""
+        for l in self.letzte:
+            if l.get("stapel") == stapel.zeit:
+                l["dokumente"] = [self.dokument(stapel, d.get("datei", "")) for d in l.get("dokumente") or []]
 
     def ordner(self, stapel):
         return os.path.join(self.cfg.data, stapel.zeit)
@@ -1081,6 +1123,7 @@ class Dienst:
             alt = {}
         self.letzte = alt.get("letzte") or []
         self.suche, self.pruefung = alt.get("suche") or {}, alt.get("pruefung") or {}
+        self.letzter_auftrag = alt.get("auftrag") or {}
         for pfad in sorted(glob.glob(os.path.join(self.cfg.data, "*", "stapel.json"))):
             try:
                 with open(pfad) as f:
@@ -1088,9 +1131,12 @@ class Dienst:
                 if raw.get("nachholen") and not raw.get("abgelegt"):
                     st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
                     self.nachholen[st.zeit] = st
-                elif offen(raw):
+                elif offen(raw) or offen(raw, "ablage"):
                     st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
-                    self.uebergabe[st.zeit] = st
+                    if offen(st):
+                        self.uebergabe[st.zeit] = st
+                    if offen(st, "ablage"):
+                        self.markieren[st.zeit] = st
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
         zeit = alt.get("stapel") or ""
@@ -1153,7 +1199,7 @@ class Dienst:
                 self.ordner_stapel(datei)
             elif self.nachholen:
                 self.nachholen_pruefen()
-        if self.uebergabe and self.now() - self.uebergeben_at >= self.cfg.uebergabe_s:
+        if (self.uebergabe or self.markieren) and self.now() - self.uebergeben_at >= self.cfg.uebergabe_s:
             self.uebergeben()
         if self.now() - self.aufgeraeumt > 3600:
             self.aufraeumen()
@@ -1211,18 +1257,22 @@ class Dienst:
         fuer = a.get("fuer") or "haushalt"
         if akt == "start":
             grund = "" if fuer == "haushalt" else self.privat_moeglich(fuer, person)
+            if not grund and self.offen:
+                grund = "Es wartet noch ein Stapel auf den Rest (ab Blatt %d): erst „weiter“, „abschliessen“ oder „verwerfen“." % (self.offen.blatt + 1)
+            elif not grund and not self.cfg.scanner:
+                grund = "Hier ist kein Scanner eingerichtet: lass den Scanner auf \\\\<box>\\data\\scan-eingang scannen."
             if grund:
-                melde(self.cfg, person or self.cfg.notify, grund)
-            elif self.offen:
-                melde(self.cfg, person or self.offen.person, "Es wartet noch ein Stapel auf den Rest (ab Blatt %d): erst „weiter“, „abschliessen“ oder „verwerfen“." % (self.offen.blatt + 1))
-            elif not self.cfg.scanner:
-                melde(self.cfg, person or self.cfg.notify, "Hier ist kein Scanner eingerichtet: lass den Scanner auf \\\\<box>\\data\\scan-eingang scannen.")
+                self.abgelehnt(a, person or (self.offen.person if self.offen else "") or self.cfg.notify, grund)
             else:
                 stapel = self.neuer_stapel("scanner", person)
                 stapel.fuer = "person" if fuer == "person" else ""
                 self.speichern(stapel)
+                self.angenommen(a)   # in the status with the stack's first „scannt“, before scanimage runs
                 self.scanner_stapel(stapel)
-        elif akt in ("weiter", "abschliessen", "verwerfen") and self.offen:
+        elif akt in ("weiter", "abschliessen", "verwerfen") and not self.offen:
+            self.abgelehnt(a, person or self.cfg.notify, "Es wartet gerade kein Stapel auf den Rest: „%s“ hat nichts zu tun." % akt, melden=False)
+        elif akt in ("weiter", "abschliessen", "verwerfen"):
+            self.angenommen(a)
             stapel, self.offen = self.offen, None
             if person and not stapel.fuer:   # „nur für mich“ stays the starter's
                 stapel.person = person
@@ -1243,6 +1293,19 @@ class Dienst:
         else:
             log("auftrag %s: nichts zu tun (offen: %s)" % (akt, bool(self.offen)))
 
+    def angenommen(self, a):
+        """the order as the status carries it (dokumente#16): Haus tells a taken one from one not read yet"""
+        self.letzter_auftrag = {"aktion": a.get("aktion") or "", "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "angenommen": True, "fuer": a.get("fuer") or "haushalt", "person": a.get("person") or ""}
+
+    def abgelehnt(self, a, an, grund, melden=True):
+        """a refused order: its reason in the status at once, the stack's state as it was (dokumente#16), and to the person"""
+        self.angenommen(a)
+        self.letzter_auftrag.update(angenommen=False, grund=grund)
+        if melden:
+            melde(self.cfg, an, grund)
+        self.zeige()
+
     def neu(self, zeit, person):
         try:
             with open(os.path.join(self.cfg.data, zeit, "stapel.json")) as f:
@@ -1262,7 +1325,8 @@ class Dienst:
             stapel.bilder = rohseiten(os.path.join(self.ordner(stapel), "roh"), self.cfg.duplex)
             if stapel.bilder:
                 self.protokoll(stapel, "redo mit %d Rohseiten aus dem Archiv" % len(stapel.bilder))
-        stapel.abgelegt, stapel.privat, stapel.spaet = [], [], False
+        stapel.abgelegt, stapel.privat, stapel.ablage, stapel.spaet = [], [], [], False
+        self.markieren.pop(zeit, None)
         self.verarbeiten(stapel)
 
     # way in A: the inbox folder
@@ -1620,6 +1684,8 @@ class Dienst:
                 os.rename(pdf, os.path.join(ordner, name))
                 stapel.privat.append({"name": name, **pruefsummen(os.path.join(ordner, name))})
             else:
+                if self.cfg.paperless_url and self.cfg.paperless_token:   # found again by its checksum, to carry its stack (dokumente#15)
+                    stapel.ablage.append({"name": name, "seit": self.now(), **pruefsummen(pdf)})
                 ablegen(self.cfg, pdf, name)
                 os.unlink(pdf)
             stapel.abgelegt.append(name)
@@ -1687,6 +1753,46 @@ class Dienst:
         self.uebergeben_at = self.now()
         for zeit in sorted(self.uebergabe):
             self.privat_weiter(self.uebergabe[zeit])
+        for zeit in sorted(self.markieren):
+            self.haushalt_weiter(self.markieren[zeit])
+
+    def feld(self, pl):
+        """„Stapel“'s id, asked until Paperless has it (laib's template makes it); 0: not there"""
+        if not self.stapel_feld and self.now() - self.feld_gefragt >= 3600:
+            self.stapel_feld, self.feld_gefragt = pl.feld("Stapel") or 0, self.now()
+            if not self.stapel_feld:
+                log("Paperless hat kein Feld „Stapel“: die Dokumente tragen ihren Stapel nicht (laib apply paperless macht es)")
+        return self.stapel_feld
+
+    def markiere(self, pl, stapel, e, doc):
+        """the document carries its stack in Paperless; its id goes into the stack and the status"""
+        e["id"] = doc
+        if self.feld(pl) and not pl.stapel_setzen(doc, self.stapel_feld, stapel.zeit):
+            self.protokoll(stapel, "%s (%d) trägt schon einen anderen Stapel, bleibt so" % (e["name"], doc))
+
+    def haushalt_weiter(self, stapel):
+        """its documents in the consume folder: once Paperless filed one, found by checksum, it gets
+        the field „Stapel“ and its id is kept (dokumente#15). One Paperless did not take within the
+        hour (a file it had already) is said so in the status."""
+        pl = Paperless(self.cfg)
+        for e in offen(stapel, "ablage"):
+            try:
+                docs = pl.mit_pruefsumme(e)
+                if docs:
+                    self.markiere(pl, stapel, e, docs[0][0])
+                    e.update(fertig=True, wie="abgelegt")
+                elif self.now() - e["seit"] > NICHT_ANGENOMMEN:
+                    e.update(fertig=True, wie="nicht angenommen")
+                    self.protokoll(stapel, "nicht angenommen: %s" % e["name"])
+            except PaperlessWeg as ex:
+                log("Stapel %s, %s: %s" % (stapel.zeit, e["name"], ex))
+                break
+            finally:
+                self.speichern(stapel)
+        if not offen(stapel, "ablage"):
+            self.markieren.pop(stapel.zeit, None)
+            self.ids_zeigen(stapel)
+            self.zeige()
 
     def privat_weiter(self, stapel):
         """its documents „nur für mich“ one step on: uploaded (Dokumente's then, no one else in the
@@ -1710,13 +1816,16 @@ class Dienst:
                 eigen = [d for d, o in docs if o is not None and o == ich]
                 ihre = [d for d, o in docs if wem is not None and o == wem]   # given by hand meanwhile: nothing left to do
                 if eigen and wem is not None:
+                    self.markiere(pl, stapel, e, eigen[0])   # while it is still Dokumente's
                     for d in eigen:
                         pl.geben(d, wem, ich)
-                    e.update(fertig=True, wie="übergeben", id=eigen[0], grund="")
+                    e.update(fertig=True, wie="übergeben", grund="")
                 elif ihre:
-                    e.update(fertig=True, wie="übergeben", id=ihre[0], grund="")
+                    self.markiere(pl, stapel, e, ihre[0])
+                    e.update(fertig=True, wie="übergeben", grund="")
                 elif docs and not eigen:   # the same file was in Paperless before, not as this upload
-                    e.update(fertig=True, wie="schon da", id=docs[0][0], grund="")
+                    self.markiere(pl, stapel, e, docs[0][0])
+                    e.update(fertig=True, wie="schon da", grund="")
                 elif not docs and self.now() - e["hochgeladen"] > NICHT_ANGENOMMEN:
                     e.update(fertig=True, wie="nicht angenommen", grund="")
                 elif eigen:
@@ -1734,6 +1843,7 @@ class Dienst:
         if stapel.zeit in self.uebergabe and not offen(stapel):
             del self.uebergabe[stapel.zeit]
             self.privat_fertig(stapel)
+            self.ids_zeigen(stapel)
             self.zeige()
 
     def privat_fertig(self, stapel):
@@ -1772,7 +1882,8 @@ class Dienst:
         grenze = self.now() - self.cfg.keep_days * 86400
         for pfad in glob.glob(os.path.join(self.cfg.data, "*")):
             zeit = os.path.basename(pfad)
-            if not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit or zeit in self.nachholen or zeit in self.uebergabe:
+            if (not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit
+                    or zeit in self.nachholen or zeit in self.uebergabe or zeit in self.markieren):
                 continue
             try:
                 alt = os.path.getmtime(os.path.join(pfad, "stapel.json")) < grenze
