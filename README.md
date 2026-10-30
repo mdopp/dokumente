@@ -87,6 +87,42 @@ the hour says `"paperless": "nicht angenommen"`. Haus lists a stack's
 documents from Paperless by the field (`custom_field_query=["Stapel",
 "exact", "<id>"]`); a split or merge in Paperless keeps it.
 
+**One stack scans while the one before is split** (#14). The scanner is free
+as soon as its feeder is empty: the stack is saved with its page list
+(`stapel.json`, `phase: gescannt`) and queued; one worker splits and files
+the queue in order, one stack at a time. A `start` is refused only while a
+stack waits for the rest (`wartet-auf-rest`), never because another is being
+split. `abschliessen`, `redo` and the inbox folder's files join the same
+queue; `weiter` still belongs to the stack at the scanner. After a restart
+the queue is picked up again from the stacks' `phase`, nothing is scanned
+twice; a stack cut off mid-split before anything was filed is split again
+from its start, one cut off mid-scan or mid-filing gets its FEHLER as before.
+
+In the status, beside what was there:
+
+- `zustand` stays the busiest part, so laib's Operator sees a stack in work
+  whichever part has it: `scannt`, else `wartet-auf-rest`, else `trennt` or
+  `legt-ab` (the worker; a queue nobody has picked up yet is `trennt` too),
+  else `bereit | fertig | fehler`. `stapel`, `person`, `fuer` and the
+  `seite` / `blatt` / `grund` beside it are that part's.
+- `einzug`: the scanner alone, `frei | scannt | wartet-auf-rest`. Haus offers
+  „Stapel scannen“ when it is `frei` (mdopp/haus follow-up).
+- `trennt` (only while the worker has a stack): `{"stapel", "person", "fuer",
+  "schritt": "trennt | legt-ab", "detail", "seite"?, "seiten"?}`, the page
+  while it reads them.
+- `warten`: the queue, `[{"stapel", "person", "fuer", "quelle", "seiten"?,
+  "datei"?, "seit"}]`, first in line first.
+
+**A doubtful split is named** (#12). Each document a split makes is a run of
+pages in reading order: a page only ever extends the document of the page
+right before it (the one move left: a page one found right behind its page
+two goes first). A window the model answers incompletely twice is asked
+again in pieces of 8 pages. A document whose pages the model never answered
+for, that starts with a page two, or that runs 6 pages and more with hardly
+a page that says it goes on, is named in the closing message („Bitte in
+Paperless prüfen, ob richtig getrennt …“), in `plan.json` and in its line of
+`letzte` as `"pruefen": "<why>"`.
+
 **Status:** `/data/laib-status.json` as the scan wrote it (with `fuer`
 beside `person`, `fuer` and `person` in each of `letzte`, whose `ende` may be `wartet`:
 Paperless was away when a private stack closed; and `uebergabe`: `[{"stapel",

@@ -20,7 +20,11 @@ as Paperless titles it: "JJJJ-MM-TT Absender - Titel". A stack „nur für
 mich“ (the order's fuer: person, 2026-10-28) goes in through Paperless' API
 instead and is then given to the person who started it (class Paperless).
 
-One stack at a time, and exactly one closing message per stack through
+The scanner is free once its feeder is empty (dokumente#14): a scanned stack is saved with its page
+list and queued (gescannt), and one worker splits and files the queue in order, one stack at a time
+(the model's lease is one at a time anyway), while the next stack is scanned. The queue is on disk
+(each stack's stapel.json, its phase): a restart picks it up again, nothing is scanned twice.
+Exactly one closing message per stack through
 bote-notify: FERTIG, WARTET (the scanner stopped mid-stack: clear the jam,
 put the rest in, then weiter, abschliessen or verwerfen), ABGEBROCHEN
 (nothing filed) or FEHLER (also after a crash, with what is filed
@@ -49,7 +53,7 @@ Stdlib only, apart from Pillow and img2pdf for images and PDFs and libzbar
 (scanimage, tesseract, pdftoppm, pdftotext, qpdf) come with the image
 (scan/Containerfile).
 """
-import concurrent.futures, ctypes, datetime, glob, hashlib, http.client, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, time, traceback, urllib.error, urllib.parse, urllib.request
+import concurrent.futures, ctypes, datetime, glob, hashlib, http.client, ipaddress, json, os, re, shutil, socket, ssl, subprocess, sys, threading, time, traceback, urllib.error, urllib.parse, urllib.request
 from dataclasses import dataclass, field
 
 ZEIT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$")
@@ -61,6 +65,8 @@ LEER_WOERTER = 4    # fewer words than this on a bright page: blank
 FAST_HELL = 0.88    # no text at all from here up: blank (#808), a photo is darker, handwriting reads as marks
 GLEICHMAESSIG = 12  # no text and this little spread of grey: a blank back of coloured paper, however dark (dokumente#2: 8-9)
 FENSTER, SCHRITT, AB_FENSTER = 30, 25, 40   # big stacks go to the model in overlapping windows
+KLEIN = 8           # pages a window's answer left out twice: asked again in pieces this big (dokumente#12)
+LANG = 6            # a document this long whose pages hardly say they go on: the person is asked to check it
 EPSON2 = 1865       # the epson2 backend's network port (#589)
 TRENNER = "PATCH T" # a separator sheet's code (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING
 NACHHOLEN, EIN_TAG = 3, 86400    # a split the model failed: redone at most 3 times within a day (#831)
@@ -380,6 +386,7 @@ class Dokument:
     absender: str = ""
     datum: str = ""
     titel: str = ""
+    pruefen: str = ""        # why its split is doubtful (dokumente#12): the closing message names it
 
 
 ANWEISUNG = """Du trennst einen gescannten Papierstapel in einzelne Dokumente. Du bekommst den OCR-Text jeder Seite in der Reihenfolge des Stapels.
@@ -513,30 +520,29 @@ def teilt(text, ken):
 
 
 def laeufe(seiten, flags, meta):
-    """documents as runs from one start to the next; the model's blank only for a bright page.
-    A page the model left out continues the document before it: nothing is lost, nothing doubled.
-    A page two whose dates and numbers, or whose sender as the model names it, are not the
-    document's before it waits for the next document: when that one shares them, the page goes
-    after its first page (dokumente#2: a sheet two lay before sheet one); else it goes back where
-    it came. A letterhead page from another sender starts a document, whatever its dates
-    (dokumente#2: OS-Solar's page one, its date not in its head's text)."""
+    """documents as runs from one start to the next, in reading order; the model's blank only for a
+    bright page. A page the model left out continues the document before it: nothing is lost, nothing
+    doubled. A page only ever extends the document of the page right before it (dokumente#12: a page
+    two that waited for „its“ document landed in one 10 pages on, 14,16,26; and a run of one sender's
+    one-page reports was taken by the next start, 27,18,20,…). The letterhead decides beside the model
+    (#808): a page that says it is a page two continues the document, unless the model starts one there
+    and its dates and numbers are another's, or the model names another sender for it; a letterhead
+    page whose dates, numbers or sender are not the document's starts one. The one move left: a
+    document that begins with its page two and has its page one right behind (dokumente#2: OS-Solar's
+    sheet two lay before sheet one) gets page one first."""
     docs, leer, ken = [], [], None
-    wartet = []   # (page, its kennung, its sender, the index of the document it followed)
     for s in seiten:
         neu, ist_leer, absender = flags.get(s.nr, (False, False, ""))
         if ist_leer and (s.hell >= HELL or s.woerter < LEER_WOERTER):   # dokumente#2: a near-wordless page the model also calls blank
             s.leer, s.warum = True, "das Modell: leer"
             leer.append(s)
             continue
-        # the letterhead decides beside the model (#808): one sender's invoices in a row are as many
-        # documents as they have numbers and dates; a page that says it is page two starts none
         kopf, k = briefkopf(s.text), kennung(s.text)
         fremd = bool(docs) and anderer(absender, docs[-1].absender)
         if docs and kopf < 0:
-            if anders(k, ken) or fremd:   # a page two of another document: it waits for that one
-                wartet.append((s, k, absender, len(docs) - 1))
-                continue
-            neu = False
+            # a page two: of this document, unless the model starts one here on other dates and numbers,
+            # or names another sender (dokumente#12: the Klinikum's page among the clinic's)
+            neu = fremd or (neu and anders(k, ken))
         elif docs and kopf > 0 and (anders(k, ken) or fremd):
             neu = True
         elif docs and neu and not fremd and kopf >= 0 and teilt(s.text, ken):
@@ -548,27 +554,35 @@ def laeufe(seiten, flags, meta):
             d = meta.get(s.nr) or {}
             docs.append(Dokument(seiten=[s], art=str(d.get("art") or ""), absender=str(d.get("absender") or absender),
                                  datum=str(d.get("datum") or ""), titel=str(d.get("titel") or "")))
-            if wartet:   # only the next document may claim the pages waiting for it
-                for w in wartet:
-                    # its own: not another sender's, and the same sender named on both, or its dates and numbers
-                    if not anderer(w[2], docs[-1].absender) and ((wer(w[2]) and wer(docs[-1].absender)) or not anders(w[1], k)):
-                        docs[-1].seiten.append(w[0])
-                        ken = tuple(a | b for a, b in zip(ken, w[1]))
-                    else:
-                        docs[w[3]].seiten.append(w[0])
-                wartet = []
         else:
             docs[-1].seiten.append(s)
             ken = tuple(a | b for a, b in zip(ken, k))
-    for w in wartet:   # nobody claimed them: back where they came
-        docs[w[3]].seiten.append(w[0])
-    for d in docs:   # the first page stays first; the rest in stack order, a page come back in its place
-        d.seiten[1:] = sorted(d.seiten[1:], key=lambda x: x.nr)
+    for d in docs:
+        if len(d.seiten) >= 2:
+            eins, zwei = d.seiten[:2]
+            if briefkopf(eins.text) < 0 and briefkopf(zwei.text) > 0 and not anders(kennung(eins.text), kennung(zwei.text)):
+                d.seiten[:2] = [zwei, eins]   # its page one lay behind its page two
         if not d.titel:   # the model named a page of it that came in late (dokumente#2): what is still empty
             m = next((meta[p.nr] for p in d.seiten if meta.get(p.nr)), None)
             if m:
                 d.art, d.absender, d.datum, d.titel = (getattr(d, k) or str(m.get(k) or "") for k in ("art", "absender", "datum", "titel"))
     return docs, leer
+
+
+def zweifel(d, geraten=()):
+    """why a document's split is doubtful, German for the closing message, or "": pages the model never
+    answered for (they went by their letterhead), a first page that says it is a page two (dokumente#12:
+    another hospital's page among a clinic's reports), or a long run of pages of which few say they are a
+    page two (dokumente#12: 28 one-page reports of a rehab file filed as one „Lungenfunktionsprüfung“)"""
+    ohne = [s.nr for s in d.seiten if s.nr in geraten]
+    if ohne:
+        return "das Modell hat für %s nicht geantwortet" % ("Seite %d" % ohne[0] if len(ohne) == 1 else "%d Seiten" % len(ohne))
+    if briefkopf(d.seiten[0].text) < 0:
+        return "beginnt mit einer Folgeseite, der Anfang fehlt oder liegt in einem anderen Dokument"
+    folge = d.seiten[1:]
+    if len(d.seiten) >= LANG and 2 * sum(1 for s in folge if FOLGESEITE.search(s.text or "")) < len(folge):
+        return "%d Seiten, kaum eine sagt, dass sie weitergeht" % len(d.seiten)
+    return ""
 
 
 def fenster(n):
@@ -584,8 +598,11 @@ def fenster(n):
 
 
 def befragen(teil, frage, roh, fenster_nr):
-    """one window's decisions. An answer that leaves pages out, or starts far fewer documents than the
-    pages' letterheads show, is asked again once; what is still missing then goes by the letterhead
+    """one window's decisions, and the pages the model never answered for. An answer that leaves pages
+    out, or starts far fewer documents than the pages' letterheads show, is asked again once; pages
+    still missing then are asked in pieces of KLEIN, each with the page before as its context
+    (dokumente#12: the box's second window, 25 pages, answered for its first page twice, and the rest
+    went by the letterhead into one document); what is missing after that goes by the letterhead
     (#808). Every answer lands in roh as it came."""
     kopf = [briefkopf(s.text) for s in teil]
     text_neu = {teil[0].nr} | {s.nr for s, k in zip(teil, kopf) if k > 0}
@@ -616,28 +633,64 @@ def befragen(teil, frage, roh, fenster_nr):
                          % (len(neu), ", ".join(str(i) for i, k in enumerate(kopf, 1) if k > 0)))
         messages = messages + [{"role": "assistant", "content": text},
                                {"role": "user", "content": "Prüfe noch einmal: %s. Antworte für jede Seite 1 bis %d, im selben JSON." % ("; ".join(warum), len(teil))}]
+    if len(teil) > KLEIN and any(s.nr not in f for s in teil):
+        stueck_fragen(teil, f, m, frage, roh, fenster_nr)
+    geraten = set()
     for s, k in zip(teil, kopf):
         if s.nr not in f:
             f[s.nr] = (k > 0, False, "")
+            geraten.add(s.nr)
         elif zu_wenig and k > 0:
             f[s.nr] = (True,) + f[s.nr][1:]
-    return f, m
+    return f, m, geraten
+
+
+def stueck_fragen(teil, f, m, frage, roh, fenster_nr):
+    """the pages of teil the model left out, asked in pieces of at most KLEIN, each after the page before
+    it: that one is the piece's first page, always „neu“ to the model, so its answer is not taken. A
+    piece whose answer is no JSON stays unanswered; a model that fails fails the split (#831)."""
+    versuch, i = 2, 0
+    while i < len(teil):
+        if teil[i].nr in f:
+            i += 1
+            continue
+        a = max(0, i - 1)
+        stueck = teil[a:i + KLEIN]
+        versuch += 1
+        text = frage(nachricht(stueck))
+        roh.append({"fenster": fenster_nr, "versuch": versuch, "seiten": [s.nr for s in stueck], "antwort": text})
+        try:
+            f2, m2 = entscheidungen(json_aus(text), stueck)
+        except ValueError:
+            f2, m2 = {}, {}
+        for s in stueck[i - a:]:
+            if s.nr in f2 and s.nr not in f:
+                f[s.nr] = f2[s.nr]
+                if s.nr in m2:
+                    m[s.nr] = m2[s.nr]
+        i += KLEIN
 
 
 def trennen(seiten, frage, roh=None):
     """the stack's documents from the model's answers (frage: messages → answer text); a window's
     page counts from its fourth page on, the first three are the window before's call"""
-    flags, meta, roh = {}, {}, [] if roh is None else roh
+    flags, meta, roh, geraten = {}, {}, [] if roh is None else roh, set()
     for i, (a, b) in enumerate(fenster(len(seiten))):
-        f, m = befragen(seiten[a:b], frage, roh, i + 1)
+        f, m, g = befragen(seiten[a:b], frage, roh, i + 1)
         for pos, s in enumerate(seiten[a:b]):
             if i == 0 or pos >= 3:
                 flags[s.nr] = f.get(s.nr, (False, False, ""))
+                geraten.discard(s.nr)
+                if s.nr in g:
+                    geraten.add(s.nr)
                 if s.nr in m:
                     meta[s.nr] = m[s.nr]
                 else:
                     meta.pop(s.nr, None)
-    return laeufe(seiten, flags, meta)
+    docs, leer = laeufe(seiten, flags, meta)
+    for d in docs:
+        d.pruefen = zweifel(d, geraten)
+    return docs, leer
 
 
 def stuecke(seiten):
@@ -994,6 +1047,9 @@ class Stapel:
     privat: list = field(default_factory=list)     # „nur für mich“, per document: name, md5, sha256, hochgeladen, fertig, wie, grund
     ablage: list = field(default_factory=list)     # the household's, per document in the consume folder: name, md5, sha256, seit, fertig, wie, id (dokumente#15)
     spaet: bool = False            # Paperless was away when it closed: the person hears again once all are theirs
+    phase: str = ""                # scannt | wartet-auf-rest | gescannt (queued) | trennt; "" once it ended (dokumente#14)
+    eingereiht: float = 0          # when it joined the queue: a restart keeps the order
+    pruefen: dict = field(default_factory=dict)    # document name → why its split is doubtful (dokumente#12)
 
 
 class Dienst:
@@ -1013,16 +1069,62 @@ class Dienst:
         self.letzter_auftrag = {}  # the last order and whether it was taken (dokumente#16): Haus shows a refusal in place
         self.stapel_feld, self.feld_gefragt = 0, -3600   # Paperless' „Stapel“ field id, asked once; while missing, hourly
         self.uebergeben_at = 0
+        # dokumente#14: the scanner and the split run side by side. The status shows both: the scanner's
+        # stack (scannt, wartet-auf-rest), the one being split (trennt, legt-ab), the queue between them,
+        # and what the last one did (bereit, fertig, fehler)
+        self.reihe = []            # the stacks scanned and waiting for the split, in order
+        self.in_arbeit = None      # the stack the worker splits and files
+        self.lage_scan = self.lage_arbeit = self.lage_ruhe = None
+        self.lock = threading.RLock()
+        self.wach = threading.Event()
+        self.faden = None          # the worker thread (schleife); without one, tick() works the queue itself
+        self.halt = False
         os.makedirs(os.path.join(cfg.data, "auftrag"), exist_ok=True)
         self.wieder_an()
 
     # status
 
     def zustand(self, zustand, detail, stapel=None, **mehr):
+        """one part's state: the scanner's (scannt, wartet-auf-rest), the worker's (trennt, legt-ab), or
+        the rest's (bereit, fertig, fehler; a stack's end clears its part); then the status as a whole"""
+        with self.lock:
+            lage = {"zustand": zustand, "detail": detail, "stapel": stapel, "mehr": mehr}
+            if zustand in ("scannt", "wartet-auf-rest"):
+                self.lage_scan = lage
+            elif zustand in ("trennt", "legt-ab"):
+                self.lage_arbeit = lage
+            else:
+                self.lage_ruhe = lage
+                if stapel is not None:
+                    self.lage_scan = None if gleich(self.lage_scan, stapel) else self.lage_scan
+                    self.lage_arbeit = None if gleich(self.lage_arbeit, stapel) else self.lage_arbeit
+            self.schreiben()
+
+    def schreiben(self):
+        """the status file: `zustand` is the busiest part (scannt, wartet-auf-rest, then trennt or
+        legt-ab, a queue alone is trennt too, then the rest), so laib's Operator sees a stack in work
+        whichever part has it; beside it `einzug` (the scanner: frei, scannt, wartet-auf-rest), `trennt`
+        (the stack the worker has, with its page) and `warten` (the queue), dokumente#14"""
+        with self.lock:
+            self._schreiben()
+
+    def _schreiben(self):
+        ruhe = self.lage_ruhe or {"zustand": "bereit", "detail": "bereit", "stapel": None, "mehr": {}}
+        oben = self.lage_scan or self.lage_arbeit or ruhe
+        if not self.lage_scan and not self.lage_arbeit and self.reihe:
+            n = len(self.reihe)
+            oben = {"zustand": "trennt", "detail": "1 Stapel wartet aufs Trennen" if n == 1 else "%d Stapel warten aufs Trennen" % n,
+                    "stapel": self.reihe[0], "mehr": {}}
+        zustand, detail, stapel, mehr = oben["zustand"], oben["detail"], oben["stapel"], oben["mehr"]
         s = {"at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "detail": detail,
              "zustand": zustand, "scanner": bool(self.cfg.scanner), "eingang": "scan-eingang",
              "stapel": stapel.zeit if stapel else "", "person": stapel.person if stapel else "",
              "fuer": (stapel.fuer or "haushalt") if stapel else "", "letzte": self.letzte,
+             "einzug": self.lage_scan["zustand"] if self.lage_scan else "frei",
+             "warten": [{"stapel": st.zeit, "person": st.person, "fuer": st.fuer or "haushalt", "quelle": st.quelle,
+                         **({"seiten": len(st.bilder)} if st.bilder else {}), **({"datei": st.datei} if st.datei else {}),
+                         "seit": datetime.datetime.fromtimestamp(st.eingereiht or self.now(), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+                        for st in self.reihe],
              "suche": self.suche, "pruefung": self.pruefung,
              "nachholen": [{"stapel": z, "versuche": st.nachholen.get("versuche", 0), "grund": st.nachholen.get("grund", ""),
                             "naechster": datetime.datetime.fromtimestamp(st.nachholen.get("naechster", 0), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
@@ -1031,7 +1133,11 @@ class Dienst:
                            for z, st in sorted(self.uebergabe.items())]}
         if self.letzter_auftrag:
             s["auftrag"] = self.letzter_auftrag
-        s.update(mehr)
+        if self.lage_arbeit:
+            a = self.lage_arbeit
+            s["trennt"] = {"stapel": a["stapel"].zeit, "person": a["stapel"].person, "fuer": a["stapel"].fuer or "haushalt",
+                           "schritt": a["zustand"], "detail": a["detail"], **{k: v for k, v in a["mehr"].items() if k in ("seite", "seiten")}}
+        s.update({k: v for k, v in mehr.items() if not (zustand in ("trennt", "legt-ab") and k in ("seite", "seiten"))})
         if AUSWERTUNG:
             s["auswertung"] = dict(AUSWERTUNG)
         if zustand == "fehler":
@@ -1064,6 +1170,11 @@ class Dienst:
         (#831) says so once, and its outcome replaces that line"""
         if melden:
             melde(self.cfg, stapel.person, meldung)
+        with self.lock:
+            self._ende(stapel, ende, meldung, dokumente, **zahlen)
+
+    def _ende(self, stapel, ende, meldung, dokumente, **zahlen):
+        stapel.phase = ""
         if stapel.nachholen:
             self.nachholen[stapel.zeit] = stapel
         else:
@@ -1089,6 +1200,8 @@ class Dienst:
             d["id"] = e["id"]
         if e.get("wie") in ("nicht angenommen", "schon da"):
             d["paperless"] = e["wie"]
+        if (stapel.pruefen or {}).get(datei):
+            d["pruefen"] = stapel.pruefen[datei]   # dokumente#12: Haus can mark it
         return d
 
     def ids_zeigen(self, stapel):
@@ -1101,8 +1214,12 @@ class Dienst:
         return os.path.join(self.cfg.data, stapel.zeit)
 
     def speichern(self, stapel, **mehr):
-        with open(os.path.join(self.ordner(stapel), "stapel.json"), "w") as f:
-            json.dump({**stapel.__dict__, **mehr}, f, ensure_ascii=False, indent=1)
+        """stapel.json, whole or not at all: a queued stack is this file (dokumente#14)"""
+        pfad = os.path.join(self.ordner(stapel), "stapel.json")
+        with self.lock:
+            with open(pfad + ".tmp", "w") as f:
+                json.dump({**stapel.__dict__, **mehr}, f, ensure_ascii=False, indent=1)
+            os.replace(pfad + ".tmp", pfad)
 
     def neuer_stapel(self, quelle, person="", datei=""):
         while True:
@@ -1121,7 +1238,9 @@ class Dienst:
             f.write(datetime.datetime.now().strftime("%H:%M:%S ") + zeile + "\n")
 
     def wieder_an(self):
-        """after a restart: a waiting stack waits on, one cut off mid-work gets its FEHLER"""
+        """after a restart: a waiting stack waits on; the queue is picked up again, the stack cut off
+        mid-split first when nothing of it was filed (dokumente#14); one cut off mid-scan, or mid-filing,
+        gets its FEHLER"""
         try:
             with open(os.path.join(self.cfg.data, "laib-status.json")) as f:
                 alt = json.load(f)
@@ -1130,6 +1249,7 @@ class Dienst:
         self.letzte = alt.get("letzte") or []
         self.suche, self.pruefung = alt.get("suche") or {}, alt.get("pruefung") or {}
         self.letzter_auftrag = alt.get("auftrag") or {}
+        kaputt = []   # cut off mid-scan or mid-filing, whichever part the status showed
         for pfad in sorted(glob.glob(os.path.join(self.cfg.data, "*", "stapel.json"))):
             try:
                 with open(pfad) as f:
@@ -1137,6 +1257,15 @@ class Dienst:
                 if raw.get("nachholen") and not raw.get("abgelegt"):
                     st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
                     self.nachholen[st.zeit] = st
+                elif raw.get("phase") == "gescannt" or (raw.get("phase") == "trennt" and not raw.get("abgelegt")):
+                    st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
+                    if st.phase == "trennt":
+                        st.eingereiht = 0   # it was first: it is first again
+                        self.protokoll(st, "nach einem Neustart wieder in der Reihe, das Trennen beginnt neu")
+                    st.phase = "gescannt"
+                    self.reihe.append(st)
+                elif raw.get("phase") in ("scannt", "trennt"):
+                    kaputt.append(Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__}))
                 elif offen(raw) or offen(raw, "ablage"):
                     st = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
                     if offen(st):
@@ -1145,8 +1274,11 @@ class Dienst:
                         self.markieren[st.zeit] = st
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
+        self.reihe.sort(key=lambda st: (st.eingereiht, st.zeit))
         zeit = alt.get("stapel") or ""
         stapel = None
+        if any(st.zeit == zeit for st in self.reihe):
+            zeit = ""   # in the queue again, not failed
         if zeit in self.nachholen:
             stapel = self.nachholen[zeit]
         elif ZEIT.match(zeit):
@@ -1156,24 +1288,28 @@ class Dienst:
                 stapel = Stapel(**{k: v for k, v in raw.items() if k in Stapel.__dataclass_fields__})
             except (OSError, ValueError, TypeError):
                 stapel = None
+        if stapel and stapel.zeit in self.nachholen and alt.get("zustand") == "trennt":
+            stapel = None   # cut off in a redo before anything was filed: the next try redoes it (#831)
+        if stapel and alt.get("zustand") in ("scannt", "trennt", "legt-ab") and stapel.zeit not in [st.zeit for st in kaputt]:
+            kaputt.append(stapel)   # a stack from before the queue kept its phase
+        for st in kaputt:
+            st.nachholen = {}
+            schon = "Schon in Paperless: %d Dokumente." % len(st.abgelegt) if st.abgelegt else "In Paperless liegt noch nichts davon."
+            self.ende(st, "fehler", "Scan fehlgeschlagen: Der Dienst wurde mitten im Stapel neu gestartet. %s "
+                      "Neu trennen: „laib scan redo --stapel %s“." % (schon, st.zeit))
         if stapel and alt.get("zustand") == "wartet-auf-rest":
             self.offen = stapel
+            stapel.phase = "wartet-auf-rest"
             self.zustand("wartet-auf-rest", alt.get("detail") or "", stapel, blatt=stapel.blatt + 1, grund=stapel.grund)
-            return
-        if stapel and stapel.zeit in self.nachholen and alt.get("zustand") == "trennt":
-            self.blick()   # cut off in a redo before anything was filed: the next try redoes it (#831)
-            return
-        if stapel and alt.get("zustand") in ("scannt", "trennt", "legt-ab"):
-            stapel.nachholen = {}
-            schon = "Schon in Paperless: %d Dokumente." % len(stapel.abgelegt) if stapel.abgelegt else "In Paperless liegt noch nichts davon."
-            self.ende(stapel, "fehler", "Scan fehlgeschlagen: Der Dienst wurde mitten im Stapel neu gestartet. %s "
-                      "Neu trennen: „laib scan redo --stapel %s“." % (schon, stapel.zeit))
-            return
-        self.blick()
+        elif not kaputt:
+            self.blick()
 
     # the loop
 
     def schleife(self):
+        """the orders, the scanner and the inbox here; the queue in a thread of its own (dokumente#14)"""
+        self.faden = threading.Thread(target=self.arbeiter, name="trennen", daemon=True)
+        self.faden.start()
         while True:
             try:
                 self.tick()
@@ -1181,11 +1317,51 @@ class Dienst:
                 log(traceback.format_exc())
             time.sleep(self.cfg.poll_s)
 
+    def arbeiter(self):
+        while not self.halt:
+            try:
+                self.arbeiten()
+            except Exception:
+                log(traceback.format_exc())
+            self.wach.wait(self.cfg.poll_s or 1)
+            self.wach.clear()
+
+    def arbeiten(self):
+        """the queue, one stack after another; with nothing queued, a split to redo (#831)"""
+        while True:
+            with self.lock:
+                if not self.reihe:
+                    break
+                stapel = self.reihe.pop(0)
+            self.verarbeiten(stapel)
+        if self.nachholen:
+            self.nachholen_pruefen()
+
+    def einreihen(self, stapel):
+        """a stack scanned (or taken from the inbox, or to redo) into the queue, saved first: the scanner
+        is free for the next (dokumente#14)"""
+        with self.lock:
+            if any(st.zeit == stapel.zeit for st in self.reihe) or gleich(self.in_arbeit, stapel):
+                return
+            stapel.phase, stapel.eingereiht = "gescannt", self.now()
+            self.speichern(stapel)
+            self.reihe.append(stapel)
+            if gleich(self.lage_scan, stapel):
+                self.lage_scan = None
+            vor = len(self.reihe) - 1 + bool(self.in_arbeit)
+            self.protokoll(stapel, "gescannt, wartet aufs Trennen" + (" (%d Stapel davor)" % vor if vor else ""))
+            self.schreiben()
+        self.wach.set()
+
+    def leerlauf(self):
+        """nothing scanned, queued or split now"""
+        return not self.offen and not self.reihe and not self.in_arbeit
+
     def tick(self):
         if getattr(self, "neu_zeigen", False):   # dienst.py: the evaluation has news for the status
             self.neu_zeigen = False
             self.zeige()
-        if not self.offen:
+        if self.leerlauf():
             self.usb_neu()
         if self.cfg.scanner and self.pruefung.get("geraet") != self.cfg.scanner and not self.offen:
             self.pruefen()   # a new SCANNER: does it answer
@@ -1203,13 +1379,13 @@ class Dienst:
             datei = self.eingang_fertig()
             if datei:
                 self.ordner_stapel(datei)
-            elif self.nachholen:
-                self.nachholen_pruefen()
+        if self.faden is None:
+            self.arbeiten()
         if (self.uebergabe or self.markieren) and self.now() - self.uebergeben_at >= self.cfg.uebergabe_s:
             self.uebergeben()
         if self.now() - self.aufgeraeumt > 3600:
             self.aufraeumen()
-        if not self.offen and self.status.get("zustand") in ("bereit", "fertig") and self.now() - self.geblickt >= self.cfg.blick_s:
+        if self.leerlauf() and self.status.get("zustand") in ("bereit", "fertig") and self.now() - self.geblickt >= self.cfg.blick_s:
             self.blick()
 
     def usb_neu(self):
@@ -1285,10 +1461,10 @@ class Dienst:
             if akt == "weiter":
                 self.scanner_stapel(stapel)
             elif akt == "abschliessen":
-                self.verarbeiten(stapel)
+                self.einreihen(stapel)
             else:
                 self.ende(stapel, "abgebrochen", "Scan verworfen: %d Blatt gescannt, nichts abgelegt." % stapel.blatt)
-        elif akt == "redo" and ZEIT.match(a.get("stapel") or "") and not self.offen:
+        elif akt == "redo" and ZEIT.match(a.get("stapel") or ""):
             self.neu(a["stapel"], person)
         elif akt == "suchen":
             self.suchen()
@@ -1313,6 +1489,12 @@ class Dienst:
         self.zeige()
 
     def neu(self, zeit, person):
+        """a redo by hand: the stack joins the queue (dokumente#14)"""
+        with self.lock:
+            schon = any(st.zeit == zeit for st in self.reihe) or (self.in_arbeit and self.in_arbeit.zeit == zeit) or (self.offen and self.offen.zeit == zeit)
+        if schon:
+            log("redo %s: der Stapel ist schon in Arbeit oder in der Reihe" % zeit)
+            return
         try:
             with open(os.path.join(self.cfg.data, zeit, "stapel.json")) as f:
                 raw = json.load(f)
@@ -1331,9 +1513,11 @@ class Dienst:
             stapel.bilder = rohseiten(os.path.join(self.ordner(stapel), "roh"), self.cfg.duplex)
             if stapel.bilder:
                 self.protokoll(stapel, "redo mit %d Rohseiten aus dem Archiv" % len(stapel.bilder))
-        stapel.abgelegt, stapel.privat, stapel.ablage, stapel.spaet = [], [], [], False
-        self.markieren.pop(zeit, None)
-        self.verarbeiten(stapel)
+        stapel.abgelegt, stapel.privat, stapel.ablage, stapel.spaet, stapel.pruefen = [], [], [], False, {}
+        with self.lock:
+            self.markieren.pop(zeit, None)
+            self.nachholen.pop(zeit, None)
+        self.einreihen(stapel)
 
     # way in A: the inbox folder
 
@@ -1373,7 +1557,7 @@ class Dienst:
         if endung not in ENDUNGEN:
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: %s kann ich nicht lesen (nur PDF, TIFF, JPG, PNG). Die Datei liegt im Archiv %s." % (stapel.datei, stapel.zeit))
             return
-        self.verarbeiten(stapel)
+        self.einreihen(stapel)
 
     # way in B: the SANE scanner
 
@@ -1395,6 +1579,8 @@ class Dienst:
         for pfad in glob.glob(os.path.join(roh, "bild-*.pnm")):
             if pfad not in stapel.bilder:
                 os.unlink(pfad)   # half a sheet, or what followed a broken page: scanned again
+        stapel.phase = "scannt"
+        self.speichern(stapel)
         self.zustand("scannt", "scannt Seite %d" % start, stapel, seite=start)
         fehler_log = os.path.join(self.ordner(stapel), "scanimage-%d.log" % start)
         try:
@@ -1430,7 +1616,8 @@ class Dienst:
             if not stapel.bilder:
                 self.ende(stapel, "abgebrochen", "Scan abgebrochen: kein Blatt im Einzug, nichts abgelegt.")
                 return
-            self.verarbeiten(stapel)
+            # the page list saved, then queued: the scanner is free for the next stack (dokumente#14)
+            self.einreihen(stapel)
             return
         grund = scanner_grund(stderr)
         if self.cfg.duplex and len(stapel.bilder) % 2:
@@ -1444,6 +1631,7 @@ class Dienst:
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: %s In Paperless liegt nichts davon." % warum, einzelheiten=grund)
             return
         stapel.grund, stapel.seit, stapel.erinnert = grund, self.now(), False
+        stapel.phase = "wartet-auf-rest"
         self.offen = stapel
         self.speichern(stapel)
         text = wartet_text(stapel)
@@ -1464,10 +1652,7 @@ class Dienst:
 
     def zeige(self):
         """the status as it stands, with the setup's news"""
-        alt = dict(self.status) or {"zustand": "bereit", "detail": "bereit"}
-        mehr = {k: v for k, v in alt.items() if k in ("seite", "blatt", "grund")}
-        stapel = self.offen
-        self.zustand(alt.get("zustand", "bereit"), alt.get("detail", "bereit"), stapel, **mehr)
+        self.schreiben()
 
     def suchen(self):
         """SANE's own search, and the LAN's neighbours asked directly on the two scanner ports (#589)"""
@@ -1601,7 +1786,7 @@ class Dienst:
             texte, quellen = [None] * len(bilder), [0] * len(bilder)
         out = []
         for i, p in enumerate(bilder):
-            self.zustand("trennt", "liest Seite %d von %d" % (i + 1, len(bilder)), stapel)
+            self.zustand("trennt", "liest Seite %d von %d" % (i + 1, len(bilder)), stapel, seite=i + 1, seiten=len(bilder))
             out.append(pruefe_seite(p, i + 1, texte[i], quellen[i]))
         gewendet = not original and self.cfg.duplex and verkehrt(out)
         if gewendet:
@@ -1613,6 +1798,10 @@ class Dienst:
         return out, original, gewendet
 
     def verarbeiten(self, stapel, frage=None):
+        with self.lock:
+            self.in_arbeit = stapel
+            stapel.phase = "trennt"   # cut off now, and nothing filed: a restart queues it again (dokumente#14)
+            self.speichern(stapel)
         try:
             self._verarbeiten(stapel, frage or modell(self.cfg, lambda g: self.zustand("trennt", "wartet auf das Modell: " + g, stapel)))
         except Exception as e:
@@ -1620,6 +1809,12 @@ class Dienst:
             stapel.nachholen = {}   # broken otherwise: a redo would end the same way
             schon = ("Schon in Paperless: %s." % ", ".join(stapel.abgelegt)) if stapel.abgelegt else "In Paperless liegt nichts davon."
             self.ende(stapel, "fehler", "Scan fehlgeschlagen: %s. %s Neu versuchen: „laib scan redo --stapel %s“." % (str(e).rstrip("."), schon, stapel.zeit), stapel.abgelegt)
+        finally:
+            with self.lock:
+                self.in_arbeit = None
+                if gleich(self.lage_arbeit, stapel):
+                    self.lage_arbeit = None
+                    self.schreiben()
 
     def _verarbeiten(self, stapel, frage):
         seiten, original, gewendet = self.seiten(stapel)
@@ -1670,7 +1865,8 @@ class Dienst:
         with open(os.path.join(self.ordner(stapel), "plan.json"), "w") as f:
             json.dump({"seiten": [{k: v for k, v in s.__dict__.items() if k != "text"} for s in seiten],
                        "dokumente": [{"seiten": [s.nr for s in d.seiten], "art": d.art, "absender": d.absender, "datum": d.datum,
-                                      "titel": d.titel, "name": dateiname(d)} for d in docs], "hinweis": hinweis,
+                                      "titel": d.titel, "name": dateiname(d), **({"pruefen": d.pruefen} if d.pruefen else {})} for d in docs],
+                       "hinweis": hinweis,
                        "umgedreht": gewendet, "trennblaetter": [s.nr for s in trenner]}, f, ensure_ascii=False, indent=1)
         self.zustand("legt-ab", "legt %d Dokumente ab" % len(docs), stapel)
         vergeben = set()
@@ -1695,6 +1891,8 @@ class Dienst:
                 ablegen(self.cfg, pdf, name)
                 os.unlink(pdf)
             stapel.abgelegt.append(name)
+            if d.pruefen:
+                stapel.pruefen[name] = d.pruefen
             self.speichern(stapel)
             self.protokoll(stapel, "abgelegt: %s (Seiten %s)" % (name, ",".join(str(s.nr) for s in d.seiten)))
         if stapel.fuer:
@@ -1720,6 +1918,10 @@ class Dienst:
             text += "\n" + ("1 Trennblatt erkannt." if len(trenner) == 1 else "%d Trennblätter erkannt." % len(trenner))
         if gewendet:
             text += "\n" + lage(self.cfg.scanner)
+        if stapel.pruefen:
+            # dokumente#12: say which documents to look at, rather than the person finding out in Paperless
+            text += ("\nBitte in Paperless prüfen, ob richtig getrennt (dort lässt sich ein Dokument teilen oder mit einem anderen "
+                     "zusammenfügen):\n" + "\n".join("- %s: %s" % (n[:-4], g) for n, g in stapel.pruefen.items()))
         if hinweis:
             text += "\n" + hinweis
         elif stapel.nachholen:
@@ -1756,11 +1958,15 @@ class Dienst:
         return ""
 
     def uebergeben(self):
+        """under the lock: the worker's closing of a stack adds to these and writes its stapel.json"""
         self.uebergeben_at = self.now()
-        for zeit in sorted(self.uebergabe):
-            self.privat_weiter(self.uebergabe[zeit])
-        for zeit in sorted(self.markieren):
-            self.haushalt_weiter(self.markieren[zeit])
+        with self.lock:
+            for zeit in sorted(self.uebergabe):
+                if zeit in self.uebergabe:
+                    self.privat_weiter(self.uebergabe[zeit])
+            for zeit in sorted(self.markieren):
+                if zeit in self.markieren:
+                    self.haushalt_weiter(self.markieren[zeit])
 
     def feld(self, pl):
         """„Stapel“'s id, asked until Paperless has it (laib's template makes it); 0: not there"""
@@ -1866,7 +2072,10 @@ class Dienst:
 
     def nachholen_pruefen(self):
         """the next split to redo (#831): after its wait, once the model answers; after a day, unsorted"""
-        stapel = min(self.nachholen.values(), key=lambda s: s.nachholen.get("naechster", 0))
+        with self.lock:
+            if not self.nachholen:
+                return
+            stapel = min(self.nachholen.values(), key=lambda s: s.nachholen.get("naechster", 0))
         n, jetzt_ = stapel.nachholen, self.now()
         if jetzt_ - n.get("seit", 0) >= EIN_TAG:
             def tag_um(messages):
@@ -1889,7 +2098,8 @@ class Dienst:
         for pfad in glob.glob(os.path.join(self.cfg.data, "*")):
             zeit = os.path.basename(pfad)
             if (not ZEIT.match(zeit) or (self.offen and self.offen.zeit == zeit) or self.status.get("stapel") == zeit
-                    or zeit in self.nachholen or zeit in self.uebergabe or zeit in self.markieren):
+                    or zeit in self.nachholen or zeit in self.uebergabe or zeit in self.markieren
+                    or any(st.zeit == zeit for st in self.reihe) or (self.in_arbeit and self.in_arbeit.zeit == zeit)):
                 continue
             try:
                 alt = os.path.getmtime(os.path.join(pfad, "stapel.json")) < grenze
@@ -1897,6 +2107,12 @@ class Dienst:
                 alt = os.path.getmtime(pfad) < grenze
             if alt:
                 shutil.rmtree(pfad, ignore_errors=True)
+
+
+def gleich(lage_oder_stapel, stapel):
+    """the same stack: a Stapel, or a part's state holding one"""
+    st = lage_oder_stapel.get("stapel") if isinstance(lage_oder_stapel, dict) else lage_oder_stapel
+    return st is not None and stapel is not None and st.zeit == stapel.zeit
 
 
 def verkehrt(seiten):
