@@ -1,7 +1,7 @@
 """scan (laib #568) without a scanner, Tesseract or a GPU: pages are tiny
 synthetic PGMs whose bytes the fake OCR maps to text, the model is a
 function, scanimage a script that stops where it is told."""
-import glob, importlib.util, json, os, tempfile, textwrap, time, unittest
+import glob, importlib.util, json, os, tempfile, textwrap, threading, time, unittest
 
 # by its path: run from the repo root, "scan" is the folder, not the program
 _spec = importlib.util.spec_from_file_location("scan", os.path.join(os.path.dirname(__file__), "..", "scan.py"))
@@ -188,6 +188,38 @@ RECHNUNG = "Bezirksschornsteinfeger Rauch\nFamilie Beispiel\nMusterweg 1\n12345 
 BESCHEID = "Bezirksschornsteinfeger Rauch\nFamilie Beispiel\n12345 Musterstadt\nFeuerstättenbescheid Nr.: 4711-3-1\nDatum: 11.08.2020"
 ANGEBOT_1 = "Tischlerei Holzwurm\nFamilie Beispiel\nMusterweg 1\n12345 Musterstadt\nAngebot Nr.: 2024-17\nDatum: 08.09.2024\nTreppe"
 ANGEBOT_2 = "Tischlerei Holzwurm\nFamilie Beispiel\n12345 Musterstadt\nDatum: 08.09.2024\nSeite 2 von 3\nMaterial Eiche"
+
+
+# dokumente#12: the shape of the box's stack 2026-10-29T18-03-48, invented texts. One clinic's reports of
+# one day, each one sheet or two, then another hospital's page with its page number, a pension insurer's
+# form over five sheets and its discharge report on the stack's one sheet printed on both sides
+KLINIK = "Klinik Seeblick\nHerrn Max Beispiel\nMusterweg 1\n12345 Musterstadt\nDatum: 14.02.2024\n%s"
+REHA_18_03 = [
+    (2, KLINIK % "Kapillarblutgas Patientenbericht", True, "Klinik Seeblick"),
+    (4, KLINIK % "Ruhe-EKG Befund\nSeite 1 von 2", True, "Klinik Seeblick"),
+    (6, "Klinik Seeblick\nRuhe-EKG Befund\nSeite 2 von 2\nMessung vom 13.02.2024 Sinusrhythmus", False, "Klinik Seeblick"),
+    (8, KLINIK % "Untersuchungsprotokoll Ruhe-EKG", True, "Klinik Seeblick"),
+    (10, KLINIK % "Lungenfunktion Bodyplethysmographie\nSeite 1 von 2", True, "Klinik Seeblick"),
+    (12, "Klinik Seeblick\nLungenfunktion\nSeite 2 von 2\nDiffusionskapazität", False, "Klinik Seeblick"),
+    (14, "Klinik Seeblick\nHerrn Max Beispiel\nMusterweg 1\n12345 Musterstadt\nDatum: 19.11.2023\nRöntgen Thorax Befund", True, "Klinik Seeblick"),
+    (16, "Klinikum Nord Notaufnahme\nBehandlungsbericht vom 19.11.2023\nSeite 2 von 3\nVerlauf in der Notaufnahme", True, "Klinikum Nord"),
+    (18, "Deutsche Rentenversicherung\nReha-Nachsorge Formular G4802\nSeite 1 von 5\nAngaben zur Person", True, "Deutsche Rentenversicherung"),
+] + [(n, "Deutsche Rentenversicherung\nReha-Nachsorge G4802\nSeite %d von 5\nEmpfehlungen am 05.03.2024" % (n // 2 - 8), False, "Deutsche Rentenversicherung")
+     for n in (20, 22, 24, 26)] + [
+    (27, "Deutsche Rentenversicherung\nHerrn Max Beispiel\nMusterweg 1\n12345 Musterstadt\nDatum: 01.03.2024\nÄrztlicher Entlassungsbericht", True, "Deutsche Rentenversicherung"),
+    (28, "Ärztlicher Entlassungsbericht\nSeite 2\nDiagnosen und Verlauf", False, "Deutsche Rentenversicherung")]
+
+
+def wie_das_modell(wahr, nur_erste=lambda gesendet: False):
+    """a model that answers each page sent as wahr says (text → (neu, sender)); for the windows nur_erste
+    picks, only the first page (the box's second window of 2026-10-29T17-07-46, twice)"""
+    def frage(messages):
+        sent = __import__("re").findall(r"--- Seite (\d+) ---\n(.*?)(?=\n\n--- Seite |\Z)", messages[1]["content"], __import__("re").S)
+        seiten = [{"seite": int(n), "neu": int(n) == 1 or wahr[t.strip()][0], "absender": wahr[t.strip()][1]} for n, t in sent]
+        if nur_erste(sent) and len(messages) <= 4:
+            seiten = seiten[:1]
+        return json.dumps({"seiten": seiten})
+    return frage
 
 
 # separator sheets (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING, as Haus prints it; the
@@ -437,6 +469,67 @@ class Trennen(unittest.TestCase):
         self.assertFalse(scan.anders(scan.kennung(rechnung), scan.kennung(rechnung)))
         self.assertEqual(scan.briefkopf("Familie Beispiel\n12345 Musterstadt\nDatum: 01.02.2024\nsiehe Seite 2"), 1, "a reference is no page two")
 
+    def test_a_page_never_joins_a_document_whose_pages_it_does_not_follow(self):
+        # dokumente#12, the box 2026-10-29T18-03-48: the model's answer was right, the page-two rule made it
+        # wrong: the EKG's page two went to the next report (8,6), the other hospital's page two waited and
+        # landed in the X-ray report with the form's last page (14,16,26), the form went into the discharge
+        # report behind its first page (27,18,20,22,24,28), two documents were lost
+        seiten = [scan.Seite(nr=n, bild="", hell=0.8, text=t, woerter=40) for n, t, _, _ in REHA_18_03]
+        wahr = {t: (neu, wer) for _, t, neu, wer in REHA_18_03}
+        docs, _ = scan.trennen(seiten, wie_das_modell(wahr))
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs],
+                         [[2], [4, 6], [8], [10, 12], [14], [16], [18, 20, 22, 24, 26], [27, 28]])
+        for d in docs:   # reading order, one run each
+            self.assertEqual([s.nr for s in d.seiten], sorted(s.nr for s in d.seiten))
+        self.assertEqual([bool(d.pruefen) for d in docs], [False] * 5 + [True, False, False], "the page two alone is named to check")
+        self.assertIn("Folgeseite", docs[5].pruefen)
+
+    def test_a_page_two_of_another_sender_that_the_model_continues_starts_its_own(self):
+        # a page from another document inside a report: the model names its sender, the page says it is a page two
+        seiten = briefe(KLINIK % "Röntgen Thorax", "Klinikum Nord\nSeite 2 von 3\nVerlauf", "Klinik Seeblick\nAnlage Messwerte")
+        flags = {1: (True, False, "Klinik Seeblick"), 2: (False, False, "Klinikum Nord"), 3: (False, False, "Klinik Seeblick")}
+        docs, _ = scan.laeufe(seiten, flags, {})
+        self.assertEqual([[s.nr for s in d.seiten] for d in docs], [[1], [2, 3]])
+
+    def test_a_long_window_the_model_answers_for_one_page_only_is_asked_again_in_pieces(self):
+        # dokumente#12, the box 2026-10-29T17-07-46: 47 pages of a rehab file, the second window (25 pages)
+        # answered for its first page twice; the rest went by the letterhead and 28 sheets became one
+        # document. Here: one-page lab reports of one sender, a three-page report among them.
+        texte = ["Gemeinschaftslabor Befund %d\nMesswerte Tabelle" % i for i in range(1, 48)]
+        texte[30], texte[31] = "Gemeinschaftslabor Bericht\nSeite 2 von 3", "Gemeinschaftslabor Bericht\nSeite 3 von 3"
+        wahr = {t: (not t.endswith("von 3"), "Gemeinschaftslabor") for t in texte}
+        seiten = [scan.Seite(nr=n, bild="", hell=0.8, text=t, woerter=40) for n, t in enumerate(texte, 1)]
+        gefragt = []
+
+        def frage(messages):
+            gefragt.append(len(gesendet(messages)))
+            return wie_das_modell(wahr, lambda sent: len(sent) == 22)(messages)
+        roh = []
+        docs, _ = scan.trennen(seiten, frage, roh)
+        self.assertEqual(gefragt[:3], [30, 22, 22], "the window, then the second window and its second ask")
+        self.assertTrue(all(n <= scan.KLEIN + 1 for n in gefragt[3:]) and len(gefragt) > 3, gefragt)
+        self.assertEqual(len(docs), 45)
+        self.assertEqual([s.nr for s in docs[29].seiten], [30, 31, 32])
+        self.assertEqual([d.pruefen for d in docs], [""] * 45, "every page answered: nothing to check")
+        self.assertTrue(any(r["versuch"] >= 3 for r in roh), "the pieces' answers are kept too")
+
+    def test_pages_the_model_never_answers_for_are_named_for_the_person_to_check(self):
+        texte = ["Gemeinschaftslabor Befund %d\nMesswerte Tabelle" % i for i in range(1, 48)]
+        seiten = [scan.Seite(nr=n, bild="", hell=0.8, text=t, woerter=40) for n, t in enumerate(texte, 1)]
+        wahr = {t: (True, "Gemeinschaftslabor") for t in texte}
+        docs, _ = scan.trennen(seiten, wie_das_modell(wahr, lambda sent: len(sent) != 30))
+        # the first window decides pages 1-28, the second from its fourth page (29) on: unanswered, page 28's
+        self.assertEqual([s.nr for s in docs[-1].seiten], list(range(28, 48)))
+        self.assertEqual([d.pruefen for d in docs[:27]], [""] * 27)
+        self.assertEqual(docs[-1].pruefen, "das Modell hat für 19 Seiten nicht geantwortet")
+
+    def test_a_long_document_whose_pages_hardly_say_they_go_on_is_doubtful(self):
+        lang = scan.Dokument(seiten=briefe(*["Befund %d" % i for i in range(6)]))
+        self.assertIn("6 Seiten", scan.zweifel(lang))
+        folge = scan.Dokument(seiten=briefe("Befund", *["Seite %d von 6" % i for i in range(2, 7)]))
+        self.assertEqual(scan.zweifel(folge), "")
+        self.assertEqual(scan.zweifel(scan.Dokument(seiten=briefe(*["Befund"] * 5))), "", "five pages are not long")
+
     def test_names_are_paperless_titles_and_never_collide(self):
         self.assertEqual(scan.dateiname(scan.Dokument([], absender="Mosel", datum="2023-05-01", titel="Rechnung")), "2023-05-01 Mosel - Rechnung")
         self.assertEqual(scan.dateiname(scan.Dokument([], absender="A/B: C", datum="1.5.23", titel="")), "A B C - Dokument")
@@ -605,6 +698,48 @@ class Dienst(unittest.TestCase):
         with open(os.path.join(ordner, "modell-1.json")) as f:
             roh = json.load(f)
         self.assertEqual((roh["seiten"], roh["antwort"]), ([1, 3, 5], antwort([{"seite": 1, "neu": True}, {"seite": 2}, {"seite": 3, "neu": True}])))
+
+    def test_a_face_up_stack_of_one_page_reports_keeps_each_in_reading_order(self):
+        # dokumente#12: face up on the fi-6130, single-sided sheets and the last one printed on both sides;
+        # after the turn every document is a run of pages in reading order, the other hospital's page two
+        # its own, never inside the report before it
+        self.cfg.scanner, self.cfg.back_first = "fujitsu", False
+        a1, b1 = KLINIK % "Kapillarblutgas Patientenbericht", KLINIK % "Ruhe-EKG Befund\nSeite 1 von 2"
+        b2 = "Klinik Seeblick\nRuhe-EKG Befund\nSeite 2 von 2\nMessung vom 13.02.2024 Sinusrhythmus"
+        c = "Klinikum Nord Notaufnahme\nBehandlungsbericht vom 19.11.2023\nSeite 2 von 3\nVerlauf in der Notaufnahme"
+        d1 = "Deutsche Rentenversicherung\nReha-Nachsorge Formular G4802\nSeite 1 von 2\nAngaben zur Person"
+        d2 = "Deutsche Rentenversicherung\nReha-Nachsorge G4802\nSeite 2 von 2\nEmpfehlungen am 05.03.2024"
+        e1 = "Deutsche Rentenversicherung\nHerrn Max Beispiel\nMusterweg 1\n12345 Musterstadt\nDatum: 01.03.2024\nÄrztlicher Entlassungsbericht"
+        e2 = "Ärztlicher Entlassungsbericht\nSeite 2\nDiagnosen und Verlauf"
+        # the last sheet first, each sheet's down side first: the double-sided one's back, then its front
+        self.runs(([vorne(201, e2), vorne(202, e1), leer(203), vorne(204, d2), leer(205), vorne(206, d1), leer(207), vorne(208, c),
+                    leer(209), vorne(210, b2), leer(211), vorne(212, b1), leer(213), vorne(214, a1)],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        wahr = {a1: (True, "Klinik Seeblick"), b1: (True, "Klinik Seeblick"), b2: (False, "Klinik Seeblick"), c: (True, "Klinikum Nord"),
+                d1: (True, "Deutsche Rentenversicherung"), d2: (False, "Deutsche Rentenversicherung"),
+                e1: (True, "Deutsche Rentenversicherung"), e2: (False, "Deutsche Rentenversicherung")}
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, wie_das_modell(wahr))
+        self.auftrag(dienst, "start")
+        self.assertIn("die Reihenfolge ist umgedreht", self.meldungen[-1][1])
+        with open(os.path.join(self.cfg.data, self.status()["letzte"][0]["stapel"], "plan.json")) as f:
+            plan = json.load(f)
+        self.assertEqual([d["seiten"] for d in plan["dokumente"]], [[1], [3, 5], [7], [9, 11], [13, 14]])
+
+    def test_a_split_the_model_left_pages_out_of_says_which_documents_to_check(self):
+        # dokumente#12: the person is told which documents to look at rather than finding out in Paperless
+        self.runs(([leer(221), vorne(222, BRIEF_1), leer(223), vorne(224, "Anlage Messwerte Tabelle"), leer(225), vorne(226, "Anlage weitere Werte")],
+                   "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, lambda m: json.dumps(
+            {"seiten": [{"seite": 1, "neu": True}], "dokumente": [{"erste_seite": 1, "absender": "Stadtwerke", "titel": "Abschlag"}]}))
+        self.auftrag(dienst, "start")
+        text = self.meldungen[-1][1]
+        self.assertIn("Bitte in Paperless prüfen, ob richtig getrennt", text)
+        self.assertIn("- Stadtwerke - Abschlag: das Modell hat für 2 Seiten nicht geantwortet", text)
+        self.assertEqual(self.status()["letzte"][0]["dokumente"][0]["pruefen"], "das Modell hat für 2 Seiten nicht geantwortet")
+        with open(os.path.join(self.cfg.data, self.status()["letzte"][0]["stapel"], "plan.json")) as f:
+            self.assertEqual(json.load(f)["dokumente"][0]["pruefen"], "das Modell hat für 2 Seiten nicht geantwortet")
 
     def test_verwerfen_files_nothing_and_says_so_once(self):
         self.runs(([leer(21), vorne(22, BRIEF_A1), leer(23)], "scanimage: sane_start: Document feeder jammed"))
@@ -1489,6 +1624,126 @@ class NurFuerMich(unittest.TestCase):
         self.assertEqual(len(self.consume()), 4, "the two documents again, from the raw pages")
         with open(os.path.join(self.cfg.data, zeit, "log.txt")) as f:
             self.assertIn("redo mit 4 Rohseiten aus dem Archiv", f.read())
+
+    # dokumente#14: the scanner is free once the feeder is empty; the split works a queue
+
+    def mit_arbeiter(self, dienst):
+        dienst.faden = threading.Thread(target=dienst.arbeiter, daemon=True)
+        dienst.faden.start()
+
+        def halt():
+            dienst.halt = True
+            dienst.wach.set()
+            dienst.faden.join(5)
+        self.addCleanup(halt)
+
+    def bis(self, bedingung, s=10):
+        ende = time.monotonic() + s
+        while time.monotonic() < ende:
+            if bedingung():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_second_stack_is_scanned_while_the_first_is_split(self):
+        self.runs(([leer(231), vorne(232, BRIEF_A1), leer(233), vorne(234, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"),
+                  ([leer(235), vorne(236, BRIEF_1), leer(237), vorne(238, BRIEF_2)], "scanimage: sane_start: Document feeder out of documents"))
+        im_modell, los = threading.Event(), threading.Event()
+
+        def frage(messages):
+            if not los.is_set():
+                im_modell.set()
+                los.wait(10)
+            return antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2)
+        dienst = scan.Dienst(self.cfg)
+        dienst.verarbeiten = lambda stapel, frage_=None, v=dienst.verarbeiten: v(stapel, frage)
+        self.mit_arbeiter(dienst)
+        self.auftrag(dienst, "start", person="mama")
+        self.assertTrue(im_modell.wait(10), "the first stack goes to the model")
+        erster = self.status()["trennt"]["stapel"]
+        s = self.status()
+        self.assertEqual((s["zustand"], s["einzug"], s["trennt"]["person"]), ("trennt", "frei", "mama"), s)
+        gesehen = []
+        echt = dienst.scanimage
+        dienst.scanimage = lambda stapel, start: (gesehen.append(self.status()), echt(stapel, start))[1]
+        time.sleep(1)   # the next stack's second differs: its id is its start
+        self.auftrag(dienst, "start", person="papa", fuer="person")
+        # while it scans, both are there: the scanner's stack and the one being split
+        self.assertEqual((gesehen[0]["zustand"], gesehen[0]["einzug"], gesehen[0]["trennt"]["stapel"], gesehen[0]["auftrag"]["angenommen"]),
+                         ("scannt", "scannt", erster, True))
+        s = self.status()
+        self.assertEqual(s["einzug"], "frei", "the scanner is free again before the first stack is split")
+        self.assertEqual([(w["person"], w["fuer"], w["seiten"]) for w in s["warten"]], [("papa", "person", 4)])
+        self.assertEqual(self.meldungen, [], "no closing message before the split")
+        los.set()
+        self.assertTrue(self.bis(lambda: len(self.meldungen) == 2 and not dienst.in_arbeit and not dienst.reihe), self.meldungen)
+        (p1, t1), (p2, t2) = self.meldungen
+        self.assertEqual((p1, p2), ("mama", "papa"), "each stack its own closing message, in order")
+        self.assertTrue(t1.startswith("Scan fertig: 2 Blatt, 4 Seiten, 2 leer entfernt, 2 Dokumente in Paperless"), t1)
+        self.assertIn("2 Dokumente nur für dich", t2)
+        self.assertEqual(len(self.consume()), 2, "the household's stack through the consume folder")
+        self.assertEqual(len(self.pl.wartet), 2, "the private one as uploads")
+        s = self.status()
+        self.assertEqual(([l["person"] for l in s["letzte"]], s["warten"], s.get("trennt")), (["papa", "mama"], [], None))
+        self.pl.einlesen()
+        dienst.tick()
+        self.assertEqual({d["owner"] for d in self.pl.docs}, {4}, "the private stack's documents are papa's")
+
+    def test_a_restart_between_scan_and_split_splits_it_without_scanning_again(self):
+        os.environ["FAKE_ARGV"] = os.path.join(self.d, "argv")
+        self.runs(([leer(241), vorne(242, BRIEF_A1), leer(243), vorne(244, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        dienst.faden = "der Arbeiter, der nie dazu kommt"   # killed before the worker took it
+        self.auftrag(dienst, "start", person="mama", fuer="person")
+        s = self.status()
+        zeit = s["warten"][0]["stapel"]
+        self.assertEqual((s["zustand"], s["einzug"], s["stapel"], s["warten"][0]["person"]), ("trennt", "frei", zeit, "mama"), s)
+        wieder = scan.Dienst(self.cfg)
+        self.assertEqual([w["stapel"] for w in self.status()["warten"]], [zeit], "the queue is on disk")
+        wieder.verarbeiten = lambda stapel, frage=None, v=wieder.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2))
+        wieder.tick()
+        self.assertEqual(len(self.meldungen), 1)
+        self.assertIn("2 Dokumente nur für dich", self.meldungen[0][1])
+        self.assertEqual(self.meldungen[0][0], "mama", "its person kept through the queue and the restart")
+        self.assertEqual(len([a for a in self.argv() if "--batch-start=1" in a]), 1, "nothing scanned again")
+        self.assertEqual((self.status()["warten"], self.status()["letzte"][0]["stapel"]), ([], zeit))
+
+    def test_a_restart_mid_split_before_anything_is_filed_splits_it_again(self):
+        self.runs(([leer(245), vorne(246, BRIEF_A1), leer(247), vorne(248, BRIEF_B)], "scanimage: sane_start: Document feeder out of documents"))
+        dienst = scan.Dienst(self.cfg)
+        dienst.faden = "kein Arbeiter"
+        self.auftrag(dienst, "start", person="mama")
+        stapel = dienst.reihe.pop(0)
+        stapel.phase = "trennt"   # as verarbeiten leaves it, then killed
+        dienst.speichern(stapel)
+        dienst.zustand("trennt", "liest Seite 2 von 4", stapel, seite=2, seiten=4)
+        self.assertEqual(self.status()["trennt"], {"stapel": stapel.zeit, "person": "mama", "fuer": "haushalt", "schritt": "trennt",
+                                                   "detail": "liest Seite 2 von 4", "seite": 2, "seiten": 4})
+        wieder = scan.Dienst(self.cfg)
+        self.assertEqual(self.meldungen, [], "no FEHLER: nothing was filed, it is split again")
+        wieder.verarbeiten = lambda stapel, frage=None, v=wieder.verarbeiten: v(stapel, lambda m: antwort([{"seite": 1, "neu": True}, {"seite": 2, "neu": True}], zweite=2))
+        wieder.tick()
+        self.assertEqual((len(self.consume()), self.status()["letzte"][0]["ende"]), (2, "fertig"))
+        with open(os.path.join(self.cfg.data, stapel.zeit, "log.txt")) as f:
+            self.assertIn("nach einem Neustart wieder in der Reihe", f.read())
+
+    def test_a_restart_mid_filing_while_another_stack_scans_still_says_fehler(self):
+        dienst = scan.Dienst(self.cfg)
+        a = dienst.neuer_stapel("scanner", "mama")
+        a.phase, a.abgelegt = "trennt", ["2023-05-01 Mosel - Rechnung.pdf"]
+        dienst.speichern(a)
+        dienst.zustand("legt-ab", "legt 2 Dokumente ab", a)
+        time.sleep(1)
+        b = dienst.neuer_stapel("scanner", "papa")
+        b.phase = "scannt"
+        dienst.speichern(b)
+        dienst.zustand("scannt", "scannt Seite 3", b, seite=3)
+        self.assertEqual(self.status()["stapel"], b.zeit, "the status names the scanner's stack")
+        scan.Dienst(self.cfg)
+        self.assertEqual(sorted((p, "Schon in Paperless: 1" in t) for p, t in self.meldungen), [("mama", True), ("papa", False)])
+        self.assertEqual({l["stapel"]: l["ende"] for l in self.status()["letzte"]}, {a.zeit: "fehler", b.zeit: "fehler"})
+
+    argv = Dienst.argv
 
     def test_weiter_and_redo_keep_the_stack_its_starters(self):
         self.runs(([leer(71), vorne(72, BRIEF_A1)], "scanimage: sane_start: Error during device I/O"),
