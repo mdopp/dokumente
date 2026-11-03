@@ -8,7 +8,7 @@ folder) or a run of a SANE scanner, on the network or the box's USB
 and judged blank (bright and almost no words, or a back page where the
 front's print shows through: mirrored, the OCR reads clearly more). A page
 whose Code 128 or QR code reads PATCH T is a separator sheet (#814, Paperless'
-CONSUMER_BARCODE_STRING, Haus prints them): a stack with one cuts there, the
+CONSUMER_BARCODE_STRING, Homes prints them): a stack with one cuts there, the
 documents are the runs between, and the model only names each run. Without one, the
 household model marks where a new document starts (an answer that leaves
 pages out or starts far too few is asked again once, then the pages'
@@ -28,7 +28,7 @@ Exactly one closing message per stack through
 bote-notify: FERTIG, WARTET (the scanner stopped mid-stack: clear the jam,
 put the rest in, then weiter, abschliessen or verwerfen), ABGEBROCHEN
 (nothing filed) or FEHLER (also after a crash, with what is filed
-already). The state is the status file laib, Haus and the Operator read.
+already). The state is the status file laib, Homes and the Operator read.
 
 Orders come as files in /data/auftrag/ (laib scan writes them): start,
 weiter, abschliessen, verwerfen, redo; and for setting the scanner up
@@ -1066,7 +1066,7 @@ class Dienst:
         self.gepingt = 0           # when the model was last asked whether it answers
         self.uebergabe = {}        # zeit → a stack „nur für mich“ whose documents are not all the person's yet
         self.markieren = {}        # zeit → a household stack whose documents Paperless has not shown with their id yet (dokumente#15)
-        self.letzter_auftrag = {}  # the last order and whether it was taken (dokumente#16): Haus shows a refusal in place
+        self.letzter_auftrag = {}  # the last order and whether it was taken (dokumente#16): Homes shows a refusal in place
         self.stapel_feld, self.feld_gefragt = 0, -3600   # Paperless' „Stapel“ field id, asked once; while missing, hourly
         self.uebergeben_at = 0
         # dokumente#14: the scanner and the split run side by side. The status shows both: the scanner's
@@ -1201,7 +1201,7 @@ class Dienst:
         if e.get("wie") in ("nicht angenommen", "schon da"):
             d["paperless"] = e["wie"]
         if (stapel.pruefen or {}).get(datei):
-            d["pruefen"] = stapel.pruefen[datei]   # dokumente#12: Haus can mark it
+            d["pruefen"] = stapel.pruefen[datei]   # dokumente#12: Homes can mark it
         return d
 
     def ids_zeigen(self, stapel):
@@ -1476,7 +1476,7 @@ class Dienst:
             log("auftrag %s: nichts zu tun (offen: %s)" % (akt, bool(self.offen)))
 
     def angenommen(self, a):
-        """the order as the status carries it (dokumente#16): Haus tells a taken one from one not read yet"""
+        """the order as the status carries it (dokumente#16): Homes tells a taken one from one not read yet"""
         self.letzter_auftrag = {"aktion": a.get("aktion") or "", "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                                 "angenommen": True, "fuer": a.get("fuer") or "haushalt", "person": a.get("person") or ""}
 

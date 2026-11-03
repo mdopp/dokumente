@@ -3,7 +3,7 @@
 paperless-vertraege.service feeds this file on stdin into the running Paperless
 container (`podman exec -i --user paperless … python3 -`), hourly from its
 timer. It talks to Paperless' API as Paperless' own admin and to the household
-model as Paperless' AI does, both from the container's environment; Haus's
+model as Paperless' AI does, both from the container's environment; Homes'
 Haushalt URL and token come from the unit. The standard library only.
 
 1. Reading. A contract is a document whose document type or one of whose tags
@@ -43,10 +43,10 @@ Haushalt URL and token come from the unit. The standard library only.
    "Kündigungsfrist" it can read ("3 Monate", "vier Wochen", "6 Wochen zum
    Quartalsende": the number and the unit), the notice must be in by the
    notice date minus the period; VERTRAG_VORLAUF_TAGE before that, a reminder
-   in Haus's Haushalt (erinnerung_anlegen: a task with an alarm in the family
+   in Homes' Haushalt (erinnerung_anlegen: a task with an alarm in the family
    calendar, on every phone). Made as soon as both fields are there, once per
    document and notice date; already due: today; the notice date minus the
-   period past: none. Without Haus nothing is made and nothing recorded.
+   period past: none. Without Homes nothing is made and nothing recorded.
    "zum Monats-/Quartals-/Jahresende" (#721): with a notice date at such an
    end, the notice must be in by the end of the month the period reaches
    back to; a notice date that is no such end is marked `prüfen` and counted
@@ -79,24 +79,24 @@ Haushalt URL and token come from the unit. The standard library only.
    first run records them). The correspondent itself stays (Paperless marks
    none as the AI's); one left without documents is listed in the record,
    and paperless-mail.py check says so in laib's status.
-7. The family address book (#820). With Haus, the same question asks for the
+7. The family address book (#820). With Homes, the same question asks for the
    sender too (KONTAKT): firm, contact person, phone, e-mail, IBAN, postal
    address, and the recipient block only to keep the household out. A value
    is kept when belegt() and its shape; never the household's own: in the
    recipient block, a household person (6.), a login's e-mail, a number,
    mail or IBAN the text calls the recipient's (EIGEN), or a street with a
    household person's name just before it. An address goes only whole.
-   Haus's kontakt_ergaenzen gets it with the document's link as quelle,
+   Homes' kontakt_ergaenzen gets it with the document's link as quelle,
    once per document (the record's kontakte); one read before is asked once
-   more, for its sender only. An IBAN Haus answers abweichend: `prüfen` and
-   a note with Haus's reason. Haus away or without the tool: the contact
-   waits in the record, the model is not asked again. Without Haus nothing
+   more, for its sender only. An IBAN Homes answers abweichend: `prüfen` and
+   a note with Homes' reason. Homes away or without the tool: the contact
+   waits in the record, the model is not asked again. Without Homes nothing
    is asked, sent or recorded.
 
 What it filled and reminded is kept in laib-vertraege.json in Paperless' data
 folder (backed up), so a run never asks or reminds twice. The record's lauf
 says what the last run did (#829): its start, the contracts and invoices read,
-the contacts Haus took, the reminders made, the documents marked `prüfen`, and
+the contacts Homes took, the reminders made, the documents marked `prüfen`, and
 whether the model did not answer; paperless-mail.py's check makes the status
 line of it ("Vertragshelfer: zuletzt 13:05, 3 Rechnungen gelesen …")."""
 import base64, calendar, hashlib, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
@@ -135,7 +135,7 @@ REFERENZ = re.compile(r"verwendungszweck|kassenzeichen|referenz", re.I)
 IHR_ZEICHEN = re.compile(r"\bihr(?:e|em|en|er)?\s+(?:zeichen|referenz|nachricht|aktenzeichen)\b", re.I)
 # what a document is read as: its words for the note, its fields, what else is asked
 ARTEN = {"vertrag": ("Vertragsdaten", FELDER, {}), "rechnung": ("Rechnungsdaten", RECHNUNG_FELDER, RECHNUNG_HILFEN)}
-# #820: the sender, asked in the same question when Haus is there, for kontakt_ergaenzen; Empfänger only to keep the household out
+# #820: the sender, asked in the same question when Homes is there, for kontakt_ergaenzen; Empfänger only to keep the household out
 KONTAKT = {"Firma": "die Firma, Behörde oder Person, die das Dokument schickt (Briefkopf, Absender, Fußzeile); nie der Empfänger",
            "Ansprechpartner": "die Person beim Absender, an die man sich wenden soll, nur wenn der Text sie nennt",
            "Telefon": "die Telefonnummer des Absenders, wie sie dasteht",
@@ -673,7 +673,7 @@ def absender(api, rec, tags, personen):
 
 
 def werkzeug(name, arguments):
-    """one tool of Haus's Haushalt, its JSON-RPC answer"""
+    """one tool of Homes' Haushalt, its JSON-RPC answer"""
     r = urllib.request.Request(E["HAUSHALT_URL"], method="POST", data=json.dumps(
         {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}).encode(),
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + E.get("HAUSHALT_TOKEN", "")})
@@ -682,35 +682,35 @@ def werkzeug(name, arguments):
 
 
 def erinnern(text, wann):
-    """erinnerung_anlegen in Haus's Haushalt; True when Haus took it"""
+    """erinnerung_anlegen in Homes' Haushalt; True when Homes took it"""
     res = werkzeug("erinnerung_anlegen", {"text": text, "wann": wann})
     out = res.get("result") or {}
     if res.get("error") or out.get("isError"):
-        print("vertraege: Haus nimmt die Erinnerung nicht:", (res.get("error") or {}).get("message") or out.get("content"))
+        print("vertraege: Homes nimmt die Erinnerung nicht:", (res.get("error") or {}).get("message") or out.get("content"))
         return False
     return True
 
 
 def kontakte(api, rec, prüfen_tag):
-    """the senders waiting in the record, into Haus's address book through kontakt_ergaenzen (#820), each
-    once; a Haus that does not take them (away, or without the tool) keeps them for the next run"""
+    """the senders waiting in the record, into Homes' address book through kontakt_ergaenzen (#820), each
+    once; a Homes that does not take them (away, or without the tool) keeps them for the next run"""
     for k, e in sorted(rec.get("kontakte", {}).items(), key=lambda kv: int(kv[0])):
         if "offen" not in e:
             continue
         try:
             res = werkzeug("kontakt_ergaenzen", e["offen"])
         except (OSError, ValueError) as x:
-            print("vertraege: Haus antwortet nicht (%s), Kontakte im nächsten Lauf" % x)
+            print("vertraege: Homes antwortet nicht (%s), Kontakte im nächsten Lauf" % x)
             return
-        if res.get("error"):   # a Haus before kontakt_ergaenzen, or without the address book
-            print("vertraege: Haus nimmt keine Kontakte (%s), der nächste Lauf versucht es wieder" % res["error"].get("message"))
+        if res.get("error"):   # a Homes before kontakt_ergaenzen, or without the address book
+            print("vertraege: Homes nimmt keine Kontakte (%s), der nächste Lauf versucht es wieder" % res["error"].get("message"))
             return
         out, am = res.get("result") or {}, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         text = str(((out.get("content") or [{}])[0]).get("text") or "")
         firma = e["offen"]["firma"]
         if out.get("isError"):
             rec["kontakte"][k] = {"fehler": text[:300], "am": am}
-            print("vertraege: Dokument %s: Haus nimmt den Kontakt „%s“ nicht: %s" % (k, firma, text))
+            print("vertraege: Dokument %s: Homes nimmt den Kontakt „%s“ nicht: %s" % (k, firma, text))
             continue
         try:
             a = json.loads(text.rsplit("\n", 1)[1])
@@ -724,7 +724,7 @@ def kontakte(api, rec, prüfen_tag):
             try:
                 markieren(api, int(k), "Die IBAN %s in diesem Dokument ist nicht die, die im Adressbuch für „%s“ steht (laib): %s. "
                           "Bitte vor einer Überweisung prüfen, ob die neue Bankverbindung stimmt; eine geänderte IBAN kann ein "
-                          "Betrugsversuch sein." % (e["offen"].get("iban"), firma, (a.get("gruende") or {}).get("iban") or "Haus nennt keinen Grund"),
+                          "Betrugsversuch sein." % (e["offen"].get("iban"), firma, (a.get("gruende") or {}).get("iban") or "Homes nennt keinen Grund"),
                           prüfen_tag)
             except urllib.error.HTTPError as x:
                 print("vertraege: Dokument %s: IBAN abweichend, aber nicht markiert (%d)" % (k, x.code))
@@ -826,7 +826,7 @@ def main():
     mails = {str(u["email"]).casefold() for u in users or [] if u.get("email")}
     if users is not None:
         absender(api, rec, tags, personen)
-    haus = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
+    homes = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
     link = E.get("PAPERLESS_URL", "").rstrip("/")
     ki = E.get("PAPERLESS_AI_ENABLED", "").strip().lower() == "true" and E.get("PAPERLESS_AI_LLM_ENDPOINT")
     gelesen = 0
@@ -840,7 +840,7 @@ def main():
         if not (d.get("content") or "").strip() or d["id"] in salat:
             continue
         fertig = all(not leer(vals.get(fid)) for fid, _ in f.values()) or (e.get("text") == sha and set(f) <= set(e.get("felder") or FELDER))
-        kontakt = haus and str(d["id"]) not in rec.get("kontakte", {})   # #820: its sender, once; one read before is asked for it
+        kontakt = homes and str(d["id"]) not in rec.get("kontakte", {})   # #820: its sender, once; one read before is asked for it
         if fertig and not kontakt:
             continue
         if gelesen >= PRO_LAUF:
@@ -874,7 +874,7 @@ def main():
                                           "am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         print("vertraege: %s (%d): gefüllt %s%s" % (d.get("title"), d["id"], ", ".join(gefuellt) or "nichts",
                                                     "; prüfen: " + ", ".join(verworfen) if verworfen else ""))
-    if haus:
+    if homes:
         kontakte(api, rec, prüfen_tag)
 
     vorlauf = int(E.get("VERTRAG_VORLAUF_TAGE") or 28)
@@ -917,16 +917,16 @@ def main():
             gemeldet[key] = heute.isoformat()
         if key in rec["erinnerungen"]:
             continue
-        if not haus:
-            print("vertraege: %s (%d): kündigen bis %s, aber ohne Haus keine Erinnerung im Kalender" % (d.get("title"), d["id"], bis.strftime("%d.%m.%Y")))
+        if not homes:
+            print("vertraege: %s (%d): kündigen bis %s, aber ohne Homes keine Erinnerung im Kalender" % (d.get("title"), d["id"], bis.strftime("%d.%m.%Y")))
             continue
         text = "Kündigung prüfen: " + was
         wann = max(erinnerungstag, heute).isoformat()
         try:
             ok = erinnern(text, wann)
         except (OSError, ValueError) as e:
-            print("vertraege: Haus antwortet nicht (%s), der nächste Lauf versucht es wieder" % e)
-            haus = None
+            print("vertraege: Homes antwortet nicht (%s), der nächste Lauf versucht es wieder" % e)
+            homes = None
             continue
         if ok:
             rec["erinnerungen"][key] = {"wann": wann, "bis": bis.isoformat()}

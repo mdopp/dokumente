@@ -222,7 +222,7 @@ def wie_das_modell(wahr, nur_erste=lambda gesendet: False):
     return frage
 
 
-# separator sheets (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING, as Haus prints it; the
+# separator sheets (#814): Paperless-ngx' default CONSUMER_BARCODE_STRING, as Homes prints it; the
 # modules as python-barcode and qrcode lay them out, drawn here into a page
 CODE128_PATCH_T = "1101001000011101110110101000110001101110001010001000110110001010001101100110011011100010111011101101100011101011"
 CODE128_ASN = "110100100001010001100011011101000101110001101011101111011011001100110011011001011110111011001110010110000101001100011101011"
