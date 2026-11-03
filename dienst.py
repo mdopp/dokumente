@@ -14,7 +14,7 @@ eingang, which tells the owner; its other lines go to the log. What the
 last run did goes into the scan's status as „auswertung“.
 
 The listener is for Paperless only: laib binds it where Paperless' pod
-reaches the host (as Haus's 8650) and keeps it from the LAN; the token is
+reaches the host (as Homes' 8650) and keeps it from the LAN; the token is
 the box's, generated, never typed.
 """
 import hmac, importlib.util, json, os, subprocess, sys, threading, time, traceback

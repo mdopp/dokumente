@@ -1,9 +1,9 @@
 """#709: contract data into Paperless' contract fields, and the reminder before a
 notice date. paperless-vertraege.py asks the household model for the fields of
 a contract's text, keeps only values the text backs up word for word, fills
-only empty fields, notes what it filled, and makes one reminder in Haus's
+only empty fields, notes what it filled, and makes one reminder in Homes'
 Haushalt per document and notice date. Against a fake Paperless, a fake model
-and a fake Haus, never real ones; no real names or addresses."""
+and a fake Homes, never real ones; no real names or addresses."""
 import base64, hashlib, json, os, subprocess, sys, tempfile, threading, time, unittest, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -155,13 +155,13 @@ class Model:
 
 
 def kontakt_angelegt(args):
-    """Haus's kontakt_ergaenzen on an empty address book (haus#164): a German line, then one JSON line"""
+    """Homes' kontakt_ergaenzen on an empty address book (homes#164): a German line, then one JSON line"""
     return False, "Kontakt „%s“ angelegt.\n%s" % (args.get("firma"), json.dumps(
         {"status": "angelegt", "kontakt": "uid-1", "felder": {k: "angelegt" for k in args if k != "quelle"}, "gruende": {}}))
 
 
-class Haus:
-    """Haus's /mcp/haushalt: tools/call erinnerung_anlegen, kontakt_ergaenzen (#820)"""
+class Homes:
+    """Homes' /mcp/haushalt: tools/call erinnerung_anlegen, kontakt_ergaenzen (#820)"""
 
     def __init__(self, kontakt=kontakt_angelegt):
         self.calls, self.kontakt, self.ohne_kontakte = [], kontakt, False
@@ -172,14 +172,14 @@ class Haus:
                 pass
 
             def do_POST(self):
-                if self.headers.get("Authorization") != "Bearer haustoken":
+                if self.headers.get("Authorization") != "Bearer homestoken":
                     self.send_response(401)
                     self.end_headers()
                     return
                 b = body_of(self)
                 fake.calls.append(b)
                 if b["params"]["name"] == "kontakt_ergaenzen":
-                    if fake.ohne_kontakte:   # a Haus before haus#164, or without Radicale: the tool is not listed
+                    if fake.ohne_kontakte:   # a Homes before homes#164, or without Radicale: the tool is not listed
                         return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "error": {"code": -32602, "message": "unknown tool: kontakt_ergaenzen"}})
                     fehler, text = fake.kontakt(b["params"]["arguments"])
                     return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": text}], "isError": fehler}})
@@ -216,13 +216,13 @@ class Lauf(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.record = os.path.join(self.tmp, "laib-vertraege.json")
 
-    def run_job(self, paperless, model=None, haus=None, heute="2026-10-26", ai="true", **extra):
+    def run_job(self, paperless, model=None, homes=None, heute="2026-10-26", ai="true", **extra):
         env = {"PATH": os.environ["PATH"], "PAPERLESS_API": paperless.url, "PAPERLESS_ADMIN_USER": "admin",
                "PAPERLESS_ADMIN_PASSWORD": "adminpw", "PAPERLESS_URL": "https://paperless.example.org",
                "PAPERLESS_AI_ENABLED": ai, "PAPERLESS_AI_LLM_ENDPOINT": (model.url + "/v1") if model else "",
                "PAPERLESS_AI_LLM_API_KEY": "modelkey", "PAPERLESS_AI_LLM_MODEL": "household",
                "VERTRAG_ARTEN": "Vertrag, Versicherung", "VERTRAG_VORLAUF_TAGE": "28",
-               "HAUSHALT_URL": (haus.url + "/mcp/haushalt") if haus else "", "HAUSHALT_TOKEN": "haustoken" if haus else "",
+               "HAUSHALT_URL": (homes.url + "/mcp/haushalt") if homes else "", "HAUSHALT_TOKEN": "homestoken" if homes else "",
                "VERTRAEGE_FILE": self.record, "HEUTE": heute, **extra}
         # as the unit feeds it: the script on stdin
         return subprocess.run([sys.executable, "-"], input=SCRIPT.read_text(), env=env, capture_output=True, text=True, timeout=60)
@@ -315,46 +315,46 @@ class Vertraege(Lauf):
     def test_a_reminder_four_weeks_before_the_notice_must_be_in_once(self):
         fields = {F["Anbieter"]: "Stadtwerke Beispielstadt GmbH", F["Kündigungsfrist"]: "drei Monate zum Ende der Laufzeit",
                   F["Nächster Kündigungstermin"]: "2027-03-31"}
-        p, h = Paperless([vertrag(fields=fields)]), Haus()
-        r = self.run_job(p, haus=h, ai="false")
+        p, h = Paperless([vertrag(fields=fields)]), Homes()
+        r = self.run_job(p, homes=h, ai="false")
         self.assertEqual(r.returncode, 0, r.stderr)
         [rem] = h.reminders()
         self.assertEqual(rem["wann"], "2026-12-03", "31.03.2027 − 3 Monate = 31.12.2026, − 28 Tage")
         self.assertIn("31.12.2026", rem["text"])
         self.assertIn("Stadtwerke Beispielstadt GmbH", rem["text"])
         self.assertIn("https://paperless.example.org/documents/1/details", rem["text"])
-        self.assertLessEqual(len(rem["text"]), 500, "Haus's cap on a reminder's text")
-        self.run_job(p, haus=h, ai="false")
+        self.assertLessEqual(len(rem["text"]), 500, "Homes' cap on a reminder's text")
+        self.run_job(p, homes=h, ai="false")
         self.assertEqual(len(h.reminders()), 1, "one reminder per document and notice date")
         p.doc(1)["custom_fields"] = [{"field": F["Kündigungsfrist"], "value": "1 Monat"},
                                      {"field": F["Nächster Kündigungstermin"], "value": "2028-03-31"}]
-        self.run_job(p, haus=h, ai="false")
+        self.run_job(p, homes=h, ai="false")
         self.assertEqual(h.reminders()[-1]["wann"], "2028-02-01", "a new notice date: a new reminder")
 
     def test_a_reminder_already_due_is_today_one_too_late_is_none(self):
         due = vertrag(1, fields={F["Kündigungsfrist"]: "4 Wochen", F["Nächster Kündigungstermin"]: "2026-12-15"})
         late = vertrag(2, fields={F["Kündigungsfrist"]: "3 Monate", F["Nächster Kündigungstermin"]: "2026-12-31"})
         vague = vertrag(3, fields={F["Kündigungsfrist"]: "rechtzeitig", F["Nächster Kündigungstermin"]: "2027-12-31"})
-        p, h = Paperless([due, late, vague]), Haus()
-        r = self.run_job(p, haus=h, ai="false")
+        p, h = Paperless([due, late, vague]), Homes()
+        r = self.run_job(p, homes=h, ai="false")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual([x["wann"] for x in h.reminders()], ["2026-10-26"], "17.11. − 28 Tage is past: today")
         self.assertIn("rechtzeitig", r.stdout, "a notice period it cannot read is said, not guessed")
 
-    def test_without_haus_no_reminder_and_it_says_so(self):
+    def test_without_homes_no_reminder_and_it_says_so(self):
         p = Paperless([vertrag(fields={F["Kündigungsfrist"]: "3 Monate", F["Nächster Kündigungstermin"]: "2027-03-31"})])
         r = self.run_job(p, ai="false")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("Haus", r.stdout)
-        self.run_job(p, haus=(h := Haus()), ai="false")
-        self.assertEqual(len(h.reminders()), 1, "not recorded while there was no Haus")
+        self.assertIn("Homes", r.stdout)
+        self.run_job(p, homes=(h := Homes()), ai="false")
+        self.assertEqual(len(h.reminders()), 1, "not recorded while there was no Homes")
 
     # #721 (a): a notice date that passed moves on by the renewal the text names
     def test_a_past_notice_date_moves_on_by_the_renewal_the_text_names(self):
         text = TEXT + "\nDer Vertrag verlängert sich jeweils um 12 Monate, wenn er nicht fristgerecht gekündigt wird."
         p, h = Paperless([vertrag(text=text, fields={F["Vertragsende"]: "2026-03-31", F["Kündigungsfrist"]: "3 Monate",
-                                                     F["Nächster Kündigungstermin"]: "2026-03-31"})]), Haus()
-        r = self.run_job(p, haus=h, ai="false")
+                                                     F["Nächster Kündigungstermin"]: "2026-03-31"})]), Homes()
+        r = self.run_job(p, homes=h, ai="false")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(p.value(1, F["Nächster Kündigungstermin"]), "2027-03-31")
         self.assertEqual(p.value(1, F["Vertragsende"]), "2026-03-31", "only the notice date moves, not a field with the same day")
@@ -365,7 +365,7 @@ class Vertraege(Lauf):
         self.assertNotIn(PRUEFEN_ID, p.doc(1)["tags"])
         [rem] = h.reminders()
         self.assertEqual(rem["wann"], "2026-12-03", "the new notice date gets its reminder at once")
-        self.run_job(p, haus=h, ai="false")
+        self.run_job(p, homes=h, ai="false")
         self.assertEqual(len(p.notes[1]), 1, "moved once")
         self.assertEqual(len(h.reminders()), 1)
 
@@ -397,8 +397,8 @@ class Vertraege(Lauf):
             vertrag(2, fields={F["Kündigungsfrist"]: "3 Monate zum Ende eines Kalendervierteljahres", F["Nächster Kündigungstermin"]: "2027-06-30"}),
             vertrag(3, fields={F["Kündigungsfrist"]: "6 Wochen zum Quartalsende", F["Nächster Kündigungstermin"]: "2027-06-30"}),
             vertrag(4, fields={F["Kündigungsfrist"]: "3 Monate zum Jahresende", F["Nächster Kündigungstermin"]: "2027-12-31"}),
-            vertrag(5, fields={F["Kündigungsfrist"]: "3 Monate zum Quartalsende", F["Nächster Kündigungstermin"]: "2027-02-15"})]), Haus()
-        r = self.run_job(p, haus=h, ai="false")
+            vertrag(5, fields={F["Kündigungsfrist"]: "3 Monate zum Quartalsende", F["Nächster Kündigungstermin"]: "2027-02-15"})]), Homes()
+        r = self.run_job(p, homes=h, ai="false")
         self.assertEqual(r.returncode, 0, r.stderr)
         bis = {int(x["text"].split("/documents/")[1].split("/")[0]): x["text"].split("Kündigen bis ")[1][:10] for x in h.reminders()}
         self.assertEqual(bis[1], "31.01.2027", "28.02. − 1 Monat zum Monatsende: the end of January, not the 28th")
@@ -721,7 +721,7 @@ def kontakt_iban_abweichend(args):
 
 class Kontakte(Lauf):
     """#820: the sender's firm, contact person, phone, e-mail and IBAN, asked in the same question,
-    into Haus's family address book through kontakt_ergaenzen, once per document"""
+    into Homes' family address book through kontakt_ergaenzen, once per document"""
 
     def rec(self):
         with open(self.record) as f:
@@ -731,8 +731,8 @@ class Kontakte(Lauf):
         return Rechnungen.prüfen(self, p, i)
 
     def test_an_invoice_gives_the_senders_contact_in_the_same_question_once(self):
-        p, m, h = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Haus()
-        r = self.run_job(p, m, haus=h)
+        p, m, h = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Homes()
+        r = self.run_job(p, m, homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(m.asks), 1, "one question per document: the invoice's fields and the sender together")
         ask = m.asks[0][2]["messages"][-1]["content"]
@@ -749,37 +749,37 @@ class Kontakte(Lauf):
         self.assertIn("Anschrift", ask)
         self.assertEqual(self.rec()["kontakte"]["1"]["status"], "angelegt")
         self.assertFalse(self.prüfen(p, 1))
-        r = self.run_job(p, m, haus=h)
+        r = self.run_job(p, m, homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((len(m.asks), len(h.kontakte())), (1, 1), "once per document: neither asked nor sent again")
         p.doc(1)["content"] += "\nSeite 2"
         p.doc(1)["custom_fields"] = []
-        self.run_job(p, m, haus=h)
+        self.run_job(p, m, homes=h)
         self.assertEqual(len(h.kontakte()), 1, "a new text is read again, its sender is not sent again")
 
     def test_the_record_says_what_the_last_run_did(self):
         # #829: the status line reads it ("Vertragshelfer: zuletzt …"), so it counts this run only
-        p, m, h = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Haus()
-        r = self.run_job(p, m, haus=h)
+        p, m, h = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Homes()
+        r = self.run_job(p, m, homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         lauf = self.rec()["lauf"]
         self.assertRegex(lauf.pop("am"), r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(lauf, {"vertraege": 0, "rechnungen": 1, "kontakte": 1, "erinnerungen": 0, "pruefen": 0})
-        self.run_job(p, m, haus=h)
+        self.run_job(p, m, homes=h)
         lauf = self.rec()["lauf"]
         self.assertEqual((lauf["rechnungen"], lauf["kontakte"]), (0, 0), "a run that read nothing new counts nothing")
 
     def test_a_value_left_out_is_not_sent_and_without_a_firm_nothing_is(self):
         antwort = {**KONTAKT_ANTWORT, "Ansprechpartner": None, "Anschrift": None, "E-Mail": {"wert": "", "beleg": ""},
                    "Telefon": {"wert": "030 7654321", "beleg": "Tel. 030 7654321"}}
-        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus()
-        r = self.run_job(p, Model(antwort), haus=h)
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes()
+        r = self.run_job(p, Model(antwort), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         [args] = h.kontakte()
         self.assertEqual(sorted(args), ["firma", "iban", "quelle"], "only what was found and the text backs")
         os.remove(self.record)
-        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus()
-        r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": "Malerei Beispiel AG", "beleg": "Malerei Beispiel AG"}}), haus=h)
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes()
+        r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": "Malerei Beispiel AG", "beleg": "Malerei Beispiel AG"}}), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(h.kontakte(), [], "a firm the text does not name: nothing to send")
         self.assertEqual(self.rec()["kontakte"]["1"]["status"], "keiner", "asked: not asked again")
@@ -795,8 +795,8 @@ class Kontakte(Lauf):
                    "Telefon": {"wert": "0171 2345678", "beleg": "Ihre Rufnummer: 0171 2345678"},
                    "E-Mail": {"wert": "erika@familie.example", "beleg": "erika@familie.example"},
                    "IBAN": {"wert": IBAN_GB, "beleg": IBAN_GB}}
-        p, h = Paperless([rechnung(text=text, title="Rechnung Mobilfunk")], users=users), Haus()
-        r = self.run_job(p, Model(antwort), haus=h)
+        p, h = Paperless([rechnung(text=text, title="Rechnung Mobilfunk")], users=users), Homes()
+        r = self.run_job(p, Model(antwort), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         [args] = h.kontakte()
         self.assertEqual(sorted(args), ["firma", "quelle"],
@@ -804,14 +804,14 @@ class Kontakte(Lauf):
         # the household's own name as the firm: nothing is sent
         for firma in ("Familie Erika Mustermann", "Erika Mustermann", "Musterstraße 1"):
             os.remove(self.record)
-            p, h = Paperless([rechnung(text=MALER_KONTAKT)], users=USERS), Haus()
-            r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": firma, "beleg": firma}}), haus=h)
+            p, h = Paperless([rechnung(text=MALER_KONTAKT)], users=USERS), Homes()
+            r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": firma, "beleg": firma}}), homes=h)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(h.kontakte(), [], "the recipient is never the firm: %s" % firma)
 
     def anschrift(self, text, antwort, users=None):
-        p, h = Paperless([rechnung(text=text)], users=users), Haus()
-        r = self.run_job(p, Model({**KONTAKT_ANTWORT, **antwort}), haus=h)
+        p, h = Paperless([rechnung(text=text)], users=users), Homes()
+        r = self.run_job(p, Model({**KONTAKT_ANTWORT, **antwort}), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         os.remove(self.record)
         [args] = h.kontakte()
@@ -849,15 +849,15 @@ class Kontakte(Lauf):
                           "the model named no recipient: the household's person just before the street gives it away")
 
     def test_a_different_iban_marks_the_document_with_the_reason(self):
-        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus(kontakt=kontakt_iban_abweichend)
-        r = self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes(kontakt=kontakt_iban_abweichend)
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(self.prüfen(p, 1), "a changed IBAN on an invoice is the fake-invoice trick: the family looks")
         note = p.notes[1][-1]
         self.assertIn("IBAN", note)
-        self.assertIn("im Adressbuch steht eine andere IBAN", note, "the note says Haus' reason")
+        self.assertIn("im Adressbuch steht eine andere IBAN", note, "the note says Homes' reason")
         self.assertIn("Malerbetrieb Beispiel GmbH", note)
-        self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        self.run_job(p, Model(KONTAKT_ANTWORT), homes=h)
         self.assertEqual((len(h.kontakte()), len(p.notes[1])), (1, 2), "sent and said once")
 
     def test_a_contract_feeds_contacts_too_and_one_read_before_is_asked_once_for_its_sender(self):
@@ -869,57 +869,57 @@ class Kontakte(Lauf):
         antwort = {**ANSWER, "Firma": {"wert": "Stadtwerke Beispielstadt GmbH", "beleg": "Stadtwerke Beispielstadt GmbH"}}
         p, m = Paperless([d]), Model(antwort)
         r = self.run_job(p, m)
-        self.assertEqual((r.returncode, m.asks), (0, []), "without Haus a contract read before is not asked again")
-        h = Haus()
-        r = self.run_job(p, m, haus=h)
+        self.assertEqual((r.returncode, m.asks), (0, []), "without Homes a contract read before is not asked again")
+        h = Homes()
+        r = self.run_job(p, m, homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(m.asks), 1, "with Haus: once, for its sender")
+        self.assertEqual(len(m.asks), 1, "with Homes: once, for its sender")
         self.assertEqual(h.kontakte()[0]["firma"], "Stadtwerke Beispielstadt GmbH")
         self.assertFalse([c for c in p.calls if c[0] == "PATCH"], "its fields were read: nothing written")
         self.assertEqual(p.notes, {})
-        self.run_job(p, m, haus=h)
+        self.run_job(p, m, homes=h)
         self.assertEqual((len(m.asks), len(h.kontakte())), (1, 1))
 
-    def test_without_haus_nothing_is_asked_sent_or_recorded(self):
+    def test_without_homes_nothing_is_asked_sent_or_recorded(self):
         p, m = Paperless([rechnung(text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT)
         r = self.run_job(p, m)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn("IBAN", m.asks[0][2]["messages"][-1]["content"].split("Text:")[0], "no Haus: no contact asked")
+        self.assertNotIn("IBAN", m.asks[0][2]["messages"][-1]["content"].split("Text:")[0], "no Homes: no contact asked")
         self.assertNotIn("kontakte", self.rec())
-        h = Haus()
-        self.run_job(p, m, haus=h)
-        self.assertEqual((len(m.asks), len(h.kontakte())), (2, 1), "Haus came later: its sender asked and sent once")
+        h = Homes()
+        self.run_job(p, m, homes=h)
+        self.assertEqual((len(m.asks), len(h.kontakte())), (2, 1), "Homes came later: its sender asked and sent once")
 
-    def test_a_haus_without_the_tool_keeps_the_contact_and_sends_it_once_it_has_it(self):
-        p, m, h = Paperless([rechnung(1, text=MALER_KONTAKT), rechnung(2, text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Haus()
+    def test_a_homes_without_the_tool_keeps_the_contact_and_sends_it_once_it_has_it(self):
+        p, m, h = Paperless([rechnung(1, text=MALER_KONTAKT), rechnung(2, text=MALER_KONTAKT)]), Model(KONTAKT_ANTWORT), Homes()
         h.ohne_kontakte = True
-        r = self.run_job(p, m, haus=h)
+        r = self.run_job(p, m, homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("kontakt_ergaenzen", r.stdout, "it says why")
         self.assertEqual(len(h.kontakte()), 1, "the first refusal stops the run's sending")
         self.assertIn("offen", self.rec()["kontakte"]["1"], "kept, never re-asked")
-        self.run_job(p, m, haus=h)
-        self.assertEqual(len(m.asks), 2, "the model is not asked again for a contact waiting for Haus")
+        self.run_job(p, m, homes=h)
+        self.assertEqual(len(m.asks), 2, "the model is not asked again for a contact waiting for Homes")
         h.ohne_kontakte = False
-        self.run_job(p, m, haus=h)
-        self.run_job(p, m, haus=h)
-        self.assertEqual([a["quelle"].split("/")[-2] for a in h.kontakte()[2:]], ["1", "2"], "each sent once Haus has the tool")
+        self.run_job(p, m, homes=h)
+        self.run_job(p, m, homes=h)
+        self.assertEqual([a["quelle"].split("/")[-2] for a in h.kontakte()[2:]], ["1", "2"], "each sent once Homes has the tool")
         self.assertEqual({k: v["status"] for k, v in self.rec()["kontakte"].items()}, {"1": "angelegt", "2": "angelegt"})
 
     def test_a_tool_error_is_recorded_and_not_sent_again(self):
-        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus(kontakt=lambda a: (True, "firma fehlt"))
-        r = self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes(kontakt=lambda a: (True, "firma fehlt"))
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("firma fehlt", r.stdout)
-        self.run_job(p, Model(KONTAKT_ANTWORT), haus=h)
+        self.run_job(p, Model(KONTAKT_ANTWORT), homes=h)
         self.assertEqual(len(h.kontakte()), 1, "at most once per document")
         self.assertIn("firma fehlt", self.rec()["kontakte"]["1"]["fehler"])
 
     def test_without_a_paperless_url_no_source_is_sent(self):
-        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Haus()
-        r = self.run_job(p, Model(KONTAKT_ANTWORT), haus=h, PAPERLESS_URL="")
+        p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes()
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), homes=h, PAPERLESS_URL="")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn("quelle", h.kontakte()[0], "Haus takes only an http(s) link as the source")
+        self.assertNotIn("quelle", h.kontakte()[0], "Homes takes only an http(s) link as the source")
 
 
 class Korrespondenten(unittest.TestCase):
