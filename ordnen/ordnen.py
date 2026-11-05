@@ -246,6 +246,12 @@ def eigener(name, haushalt):
     return False
 
 
+def ein_name(name):
+    """whether a sender's name looks like one: two letters that differ and a vowel, not OCR's "KKKKK" """
+    buchstaben = [c for c in falten(name) if c.isalpha()]
+    return len(set(buchstaben)) >= 3 and any(c in "aeiouy" for c in buchstaben)
+
+
 def passt(name, korrespondenten):
     """the existing correspondent a sender's name is: the same words, or one whose words start with the other's"""
     w = falten(name).split()
@@ -253,6 +259,8 @@ def passt(name, korrespondenten):
         return None
     for cname in korrespondenten:
         c = falten(cname).split()
+        if "".join(c) == "".join(w):   # "Reha-Zentrum Borkum" is "Rehazentrum Borkum"
+            return cname
         kurz, lang = (w, c) if len(w) <= len(c) else (c, w)
         if c == w or (kurz and lang[:len(kurz)] == kurz and (len(kurz) > 1 or len(kurz[0]) >= 3)):
             return cname
@@ -284,7 +292,9 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
     if isinstance(s, dict) and isinstance(s.get("wert"), str) and s["wert"].strip():
         name, beleg = re.sub(r"\s+", " ", s["wert"]).strip()[:128], belegt(s, text)
         bekannt = passt(name, korrespondenten)
-        if eigener(name, haushalt):
+        if not ein_name(name):
+            out["weg"].append("Absender „%s“ (kein Name)" % name)
+        elif eigener(name, haushalt):
             out["weg"].append("Absender „%s“ (gehört zum Haushalt)" % name)
         elif bekannt and (beleg or falten(bekannt) in falten(text)):
             out["absender"] = bekannt
@@ -771,8 +781,8 @@ def name_von(liste, i):
 def vorher_nachher(d, body, o, alt):
     """one document's line for the plan: before → after, by name"""
     def bild(x):
-        return {"typ": name_von(alt["typen"], x.get("document_type")) or name_von(o.typen, x.get("document_type")),
-                "absender": name_von(alt["korr"], x.get("correspondent")) or name_von(o.korr, x.get("correspondent")),
+        return {"typ": name_von(o.typen, x.get("document_type")) or name_von(alt["typen"], x.get("document_type")),
+                "absender": name_von(o.korr, x.get("correspondent")) or name_von(alt["korr"], x.get("correspondent")),
                 "tags": sorted(filter(None, (name_von(o.tags, t) or name_von(alt["tags"], t) for t in x.get("tags") or [])))}
     nach = {**d, **{k: v for k, v in body.items() if k != "custom_fields"}}
     return {"id": d["id"], "titel": d.get("title"), "vorher": bild(d), "nachher": bild(nach)}
