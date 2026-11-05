@@ -229,6 +229,13 @@ class Auswerten(unittest.TestCase):
                       ["Stadtwerke Beispielstadt GmbH"])
         self.assertEqual(p["absender"], "Stadtwerke Beispielstadt GmbH")
 
+    def test_ocr_noise_is_no_sender_and_a_hyphen_is_the_same_sender(self):
+        self.doc["content"] += "KKKKK\nReha-Zentrum Beispiel\n"
+        p = self.plan({**answer_invoice(), "absender": {"wert": "KKKKK", "beleg": "KKKKK"}})
+        self.assertIsNone(p["absender"])
+        p = self.plan({**answer_invoice(), "absender": {"wert": "Reha-Zentrum Beispiel", "beleg": "Reha-Zentrum Beispiel"}}, ["Rehazentrum Beispiel"])
+        self.assertEqual(p["absender"], "Rehazentrum Beispiel")
+
     def test_the_household_is_never_the_sender_and_a_person_must_be_named(self):
         p = self.plan({**answer_invoice(), "absender": {"wert": "Anna Muster", "beleg": "Frau Anna Muster"},
                        "person": {"wert": "Ben", "beleg": "Frau Anna Muster"}})
@@ -275,6 +282,12 @@ class Lauf(unittest.TestCase):
         plan = json.loads(Path(self.dir, "plan.json").read_text())
         self.assertEqual(plan["dokumente"]["1"]["setzt"]["typ"], "Rechnung")
         self.assertFalse(list(Path(self.dir).glob("sicherung-*.json")), "a dry run needs no backup")
+
+    def test_a_sample_names_a_renamed_type_by_its_new_name(self):
+        text = ordnen.alles(self.f, self.dir, args(dry_run=True), log=lambda *_: None,
+                            ask=lambda m: {"typ": "Brief", "bereiche": ["Haus"], "sicher": True})
+        self.assertIn('"typ": "Brief"', text)
+        self.assertNotIn('"typ": "Auskunft"', text)
 
     def test_apply_reuses_the_answers_backs_up_first_and_fills_only_what_is_empty(self):
         ordnen.alles(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
