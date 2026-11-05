@@ -9,6 +9,11 @@ and invoices get their fields read and their notice and due dates reminded.
   separator sheets, blank pages, the split, filing into Paperless' consume
   folder, the status file. Carried from laib's `scan/` with its history
   (frozen at laib 8236b19).
+- `ordnen/` — the household's order in Paperless (decided 2026-11-05): document
+  types, Bereich tags, the fields Person, Produkte, Kundennummer,
+  Versicherungsnummer, Garantie bis, Steuerjahr, a saved view per Bereich and
+  per person; each document's type, Bereich, sender, person and fields read
+  by the household model. See below.
 - `vertraege/` — contracts and invoices: their fields from the text, notice
   and due reminders. Carried from laib's `templates/paperless/` with its
   history.
@@ -19,7 +24,7 @@ is `ghcr.io/mdopp/dokumente`, built on every push to main.
 
 Tests run in the image: `docker build -t dokumente:test -f Containerfile .`
 then `docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3
-dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py`.
+dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py`.
 
 ## The contract with laib's template
 
@@ -139,3 +144,39 @@ with the stack's first `scannt`, before the scanner runs), plus
 "pruefen", "fehlt"?}, "einzelheiten"? (the last log lines of a failed run),
 "findings"? }`; its findings (a household correspondent left without
 documents, yellow) are also in the status's top-level `findings`.
+
+## The order (`ordnen/`)
+
+`ordnen.py`'s docstring is the contract: the types (Rechnung, Vertrag,
+Versicherungsschein, Beitrag/Bescheid, Kontoauszug, Steuer, Bestellung,
+Beleg/Garantie, Urkunde, Brief, and Gesundheit's medical types untouched),
+the Bereich tags (Haus, Auto, Gesundheit, Versicherung, Finanzen, Steuer,
+Arbeit & Rente, Freizeit; Gesundheit is Gesundheit's own tag `gesundheit`,
+found folded, its name kept), the tags that grew before and where each goes
+(`TAG_REGELN`: a company to its correspondent, a type-like tag to its type, a
+product or topic to „Produkte“ and a Bereich; a tag without a rule is never
+touched, an emptied one is deleted), the new fields and the views.
+
+- **Once, by an administrator** (it makes types, fields, correspondents and
+  views, which Dokumente's own Paperless user may not): inside Paperless'
+  container, where `PAPERLESS_ADMIN_USER` / `PAPERLESS_ADMIN_PASSWORD` and the
+  model's `PAPERLESS_AI_LLM_*` are, as the user `paperless`:
+  `python3 ordnen.py --dry-run --personen "<Vorname>,<Vorname>" --eigentuemer <login> --hintergrund`,
+  then the same without `--dry-run`. A dry run changes nothing in Paperless;
+  it keeps the model's answers (`ordnen.json`), so the real run asks again
+  only for a text that changed, and writes `plan.json` and
+  `zusammenfassung.txt`. The real run writes `sicherung-<zeit>.json` first;
+  `ordnen.py wiederherstellen <sicherung>` puts every document's type, tags,
+  correspondent and fields back. The views go on the owner's dashboard and
+  sidebar through Paperless' own `manage.py shell` (a user's display settings
+  are only that user's through the API).
+- **On every run after Paperless' hook** (`dienst.py`): `ordnen.py --neue`
+  before the contract helper, with Dokumente's token: the newest documents
+  without a Bereich it has not seen, at most 10; it uses the order as it is
+  and does nothing until it is set up. A new sender becomes a correspondent
+  only if Paperless lets Dokumente's user add one; else the document's note
+  names it. Its record is `/dokumente/ordnen/ordnen.json`; the status's
+  `auswertung.lauf.eingeordnet` counts what it filed in order.
+- Only what is empty is filled; a value is taken only on words that are in
+  the text; a document whose type or Bereich the model cannot say, or is
+  unsure of, gets `prüfen` and a note why.

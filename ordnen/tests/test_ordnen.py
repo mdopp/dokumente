@@ -1,0 +1,377 @@
+"""ordnen.py: the household's Paperless in one order. Types, Bereich tags and
+fields are made, near-duplicate types renamed (never Gesundheit's), the tags
+that grew move into correspondents, types, Bereiche and Produkte and go once
+empty, each document is read by the model and only what the text backs is
+filled into what is empty; a backup comes first and puts everything back.
+Against a fake Paperless and a fake model; no real names or documents."""
+import copy, importlib.util, json, os, re, tempfile, unittest, urllib.error
+from pathlib import Path
+from types import SimpleNamespace
+
+# by its path: from the repo's root a bare `import ordnen` finds the ordnen/ folder
+_spec = importlib.util.spec_from_file_location("ordnen_skript", Path(__file__).resolve().parent.parent / "ordnen.py")
+ordnen = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ordnen)
+
+
+class Fake:
+    """Paperless' API in memory: what ordnen.API answers, and every write"""
+
+    def __init__(self, docs, tags=(), typen=(), korr=(), felder=(), users=None, korr_403=False):
+        self.docs = {d["id"]: {"document_type": None, "correspondent": None, "tags": [], "custom_fields": [], "content": "", **d} for d in docs}
+        self.tags = [dict(t) for t in tags]
+        self.typen = [dict(t) for t in typen]
+        self.korr = [dict(c) for c in korr]
+        self.felder = [dict(f) for f in felder]
+        self.views, self.notes, self.writes, self.trash = [], {}, [], []
+        self.users = users if users is not None else [{"id": 1, "username": "admin"}, {"id": 4, "username": "anna", "first_name": "Anna", "last_name": "Muster"}]
+        self.korr_403 = korr_403
+        self.next = 500
+
+    def _id(self):
+        self.next += 1
+        return self.next
+
+    def all(self, path):
+        p, _, q = path.partition("?")
+        if p == "/api/documents/":
+            ds = [dict(d) for d in self.docs.values()]
+            if "ordering=-added" in q:
+                ds.sort(key=lambda d: -d["id"])
+            return ds
+        return [dict(x) for x in {"/api/tags/": self.tags, "/api/document_types/": self.typen, "/api/correspondents/": self.korr,
+                                  "/api/custom_fields/": self.felder, "/api/saved_views/": self.views, "/api/users/": self.users,
+                                  "/api/trash/": self.trash}[p]]
+
+    def __call__(self, method, path, body=None):
+        p, _, q = path.partition("?")
+        if method != "GET":
+            self.writes.append((method, p, body))
+        m = re.fullmatch(r"/api/documents/(\d+)/", p)
+        if m and method == "GET":
+            return dict(self.docs[int(m.group(1))])
+        if m and method == "PATCH":
+            self.docs[int(m.group(1))].update(json.loads(json.dumps(body)))
+            return dict(self.docs[int(m.group(1))])
+        m = re.fullmatch(r"/api/documents/(\d+)/notes/", p)
+        if m:
+            self.notes.setdefault(int(m.group(1)), []).append(body["note"])
+            return {}
+        if p == "/api/documents/" and method == "GET":
+            t = int(re.search(r"tags__id__all=(\d+)", q).group(1))
+            return {"count": sum(1 for d in self.docs.values() if t in d["tags"]), "results": []}
+        liste = {"/api/tags/": self.tags, "/api/document_types/": self.typen, "/api/correspondents/": self.korr,
+                 "/api/custom_fields/": self.felder, "/api/saved_views/": self.views}
+        if method == "POST" and p in liste:
+            if p == "/api/correspondents/" and self.korr_403:
+                raise urllib.error.HTTPError(p, 403, "Forbidden", {}, None)
+            obj = {**json.loads(json.dumps(body)), "id": self._id()}
+            if p == "/api/custom_fields/" and obj.get("data_type") == "select":
+                for i, o in enumerate(obj["extra_data"]["select_options"]):
+                    o.setdefault("id", "opt%d" % i)
+            liste[p].append(obj)
+            return dict(obj)
+        m = re.fullmatch(r"(/api/\w+/)(\d+)/", p)
+        if m and m.group(1) in liste:
+            lst, i = liste[m.group(1)], int(m.group(2))
+            obj = next(x for x in lst if x["id"] == i)
+            if method == "PATCH":
+                obj.update(json.loads(json.dumps(body)))
+                if m.group(1) == "/api/custom_fields/":
+                    for k, o in enumerate(obj["extra_data"]["select_options"]):
+                        o.setdefault("id", "optn%d" % k)
+                return dict(obj)
+            if method == "DELETE":
+                lst.remove(obj)
+                for d in self.docs.values():
+                    d["tags"] = [t for t in d["tags"] if t != i]
+                return None
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+
+INVOICE = ("Stadtwerke Beispielstadt GmbH\nKundennummer: 4711-0815\nRechnung für Strom und Gas\n"
+           "Frau Anna Muster, Beispielweg 1\nTarif: Ökostrom Plus\n")
+LAB = "Praxis Dr. Beispiel\nPatient: Anna Muster\nLaborbefund Blutbild\n"
+
+
+def answer_invoice():
+    return {"typ": "Rechnung", "bereiche": ["Haus"], "absender": {"wert": "Stadtwerke Beispielstadt GmbH", "beleg": "Stadtwerke Beispielstadt GmbH"},
+            "person": {"wert": "Anna", "beleg": "Frau Anna Muster"}, "kundennummer": {"wert": "4711-0815", "beleg": "Kundennummer: 4711-0815"},
+            "versicherungsnummer": {"wert": "VS-999", "beleg": "Versicherung VS-999"},   # not in the text: never taken
+            "produkte": {"wert": "Ökostrom Plus", "beleg": "Tarif: Ökostrom Plus"}, "garantie_bis": None, "steuerjahr": None, "sicher": True}
+
+
+def base(docs=(), **kw):
+    return Fake(docs,
+                tags=kw.pop("tags", [{"id": 1, "name": "Stapel"}, {"id": 2, "name": "prüfen"}, {"id": 3, "name": "gesundheit", "owner": 6},
+                                     {"id": 10, "name": "ERGO"}, {"id": 11, "name": "Glasfaser"}, {"id": 12, "name": "Eigenes Thema"},
+                                     {"id": 13, "name": "Rechnung"}, {"id": 14, "name": "Konzert"}]),
+                typen=kw.pop("typen", [{"id": 1, "name": "Rechnung"}, {"id": 2, "name": "Befund"}, {"id": 3, "name": "Beitragsrechnung"},
+                                       {"id": 4, "name": "Auskunft"}, {"id": 5, "name": "Labor"}]),
+                korr=kw.pop("korr", [{"id": 1, "name": "ERGO Versicherung AG"}]), **kw)
+
+
+def args(**kw):
+    a = {"dry_run": False, "personen": "Anna,Ben", "eigentuemer": "anna", "max": None, "zeit": 600.0}
+    a.update(kw)
+    return SimpleNamespace(**a)
+
+
+class Struktur(unittest.TestCase):
+    def test_types_bereiche_and_fields_are_made_and_duplicates_renamed(self):
+        f = base()
+        o = ordnen.Ordnung(f, log=lambda *_: None)
+        ordnen.struktur(o, ["Anna", "Ben"], log=lambda *_: None)
+        namen = {t["name"] for t in f.typen}
+        self.assertTrue(set(ordnen.TYPEN) <= namen)
+        self.assertNotIn("Beitragsrechnung", namen)
+        self.assertEqual(next(t for t in f.typen if t["id"] == 3)["name"], "Beitrag/Bescheid", "renamed in place: its id and documents stay")
+        self.assertEqual(next(t for t in f.typen if t["id"] == 4)["name"], "Brief")
+        self.assertIn("Befund", namen)
+        self.assertIn("Labor", namen)
+        self.assertFalse(any(m == "DELETE" for m, _, _ in f.writes), "a type is never deleted")
+        tags = {t["name"] for t in f.tags}
+        self.assertTrue({"Haus", "Auto", "Versicherung", "Finanzen", "Steuer", "Arbeit & Rente", "Freizeit"} <= tags)
+        self.assertNotIn("Gesundheit", tags, "Gesundheit's own tag gesundheit is the Bereich, its name kept")
+        felder = {x["name"]: x for x in f.felder}
+        self.assertEqual(felder["Produkte"]["data_type"], "longtext")
+        self.assertEqual(felder["Steuerjahr"]["data_type"], "integer")
+        self.assertEqual([o["label"] for o in felder["Person"]["extra_data"]["select_options"]], ["Anna", "Ben"])
+
+    def test_a_second_run_writes_nothing_and_a_new_person_is_added(self):
+        f = base()
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna"], log=lambda *_: None)
+        n = len(f.writes)
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna"], log=lambda *_: None)
+        self.assertEqual(len(f.writes), n)
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna", "Ben"], log=lambda *_: None)
+        person = next(x for x in f.felder if x["name"] == "Person")
+        self.assertEqual([o["label"] for o in person["extra_data"]["select_options"]], ["Anna", "Ben"])
+        self.assertEqual(person["extra_data"]["select_options"][0]["id"], "opt0", "Anna's option keeps its id")
+
+    def test_a_medical_type_is_never_merged(self):
+        f = base(typen=[{"id": 1, "name": "Auskunft"}])
+        old = dict(ordnen.ZUSAMMENLEGEN)
+        ordnen.ZUSAMMENLEGEN["Labor"] = "Brief"
+        try:
+            f.typen.append({"id": 9, "name": "Labor"})
+            ordnen.struktur(ordnen.Ordnung(f), [], log=lambda *_: None)
+        finally:
+            ordnen.ZUSAMMENLEGEN.clear()
+            ordnen.ZUSAMMENLEGEN.update(old)
+        self.assertEqual(next(t for t in f.typen if t["id"] == 9)["name"], "Labor")
+
+    def test_dry_run_writes_nothing(self):
+        f = base()
+        ordnen.struktur(ordnen.Ordnung(f, dry=True), ["Anna"], log=lambda *_: None)
+        self.assertEqual(f.writes, [])
+
+
+class Tags(unittest.TestCase):
+    def test_company_product_and_type_tags_move_and_go_unknown_and_workflow_tags_stay(self):
+        f = base([{"id": 1, "tags": [10, 1]}, {"id": 2, "tags": [11, 12]}, {"id": 3, "tags": [13]},
+                  {"id": 4, "tags": [11], "custom_fields": []}])
+        o = ordnen.Ordnung(f)
+        ordnen.struktur(o, ["Anna"], log=lambda *_: None)
+        ordnen.tags_umziehen(o, list(f.all("/api/documents/")), log=lambda *_: None)
+        names = {t["name"] for t in f.tags}
+        self.assertFalse({"ERGO", "Glasfaser", "Rechnung", "Konzert"} & names)
+        self.assertTrue({"Stapel", "prüfen", "gesundheit", "Eigenes Thema"} <= names)
+        self.assertEqual(f.docs[1]["correspondent"], 1, "ERGO → the correspondent ERGO Versicherung AG")
+        self.assertIn(1, f.docs[1]["tags"])
+        haus = o.tag("Haus")["id"]
+        produkte = o.feld("Produkte")["id"]
+        self.assertIn(haus, f.docs[2]["tags"])
+        self.assertIn(12, f.docs[2]["tags"], "a tag without a rule is never touched")
+        self.assertEqual({c["field"]: c["value"] for c in f.docs[2]["custom_fields"]}[produkte], "Glasfaser")
+        self.assertEqual(f.docs[3]["document_type"], 1)
+
+    def test_a_product_is_added_to_what_is_there(self):
+        f = base([{"id": 1, "tags": [11, 14]}])
+        o = ordnen.Ordnung(f)
+        ordnen.struktur(o, [], log=lambda *_: None)
+        ordnen.tags_umziehen(o, list(f.all("/api/documents/")), log=lambda *_: None)
+        produkte = o.feld("Produkte")["id"]
+        self.assertEqual({c["field"]: c["value"] for c in f.docs[1]["custom_fields"]}[produkte], "Glasfaser, Konzert")
+        self.assertTrue({o.tag("Haus")["id"], o.tag("Freizeit")["id"]} <= set(f.docs[1]["tags"]))
+
+    def test_a_tag_named_in_the_contract_kinds_stays(self):
+        f = base([{"id": 1, "tags": [13]}])
+        os.environ["RECHNUNG_ARTEN"] = "Rechnung"
+        try:
+            o = ordnen.Ordnung(f)
+            ordnen.struktur(o, [], log=lambda *_: None)
+            ordnen.tags_umziehen(o, list(f.all("/api/documents/")), log=lambda *_: None)
+        finally:
+            del os.environ["RECHNUNG_ARTEN"]
+        self.assertIn(13, f.docs[1]["tags"])
+
+
+class Auswerten(unittest.TestCase):
+    def setUp(self):
+        self.doc = {"id": 7, "title": "Stadtwerke - Rechnung", "content": INVOICE}
+
+    def plan(self, a, korr=()):
+        return ordnen.auswerten(a, self.doc, list(ordnen.TYPEN) + ["Befund"], ["Anna", "Ben"], ["Anna Muster", "Ben Muster"], list(korr))
+
+    def test_only_what_the_text_backs(self):
+        p = self.plan(answer_invoice())
+        self.assertEqual(p["typ"], "Rechnung")
+        self.assertEqual(p["bereiche"], ["Haus"])
+        self.assertEqual(p["absender"], "Stadtwerke Beispielstadt GmbH")
+        self.assertEqual(p["person"], "Anna")
+        self.assertEqual(p["felder"], {"Kundennummer": "4711-0815", "Produkte": "Ökostrom Plus"})
+        self.assertTrue(any("Versicherungsnummer" in w for w in p["weg"]))
+        self.assertEqual(p["pruefen"], [])
+
+    def test_a_known_sender_is_matched(self):
+        p = self.plan({**answer_invoice(), "absender": {"wert": "Stadtwerke Beispielstadt", "beleg": "Stadtwerke Beispielstadt"}},
+                      ["Stadtwerke Beispielstadt GmbH"])
+        self.assertEqual(p["absender"], "Stadtwerke Beispielstadt GmbH")
+
+    def test_the_household_is_never_the_sender_and_a_person_must_be_named(self):
+        p = self.plan({**answer_invoice(), "absender": {"wert": "Anna Muster", "beleg": "Frau Anna Muster"},
+                       "person": {"wert": "Ben", "beleg": "Frau Anna Muster"}})
+        self.assertIsNone(p["absender"])
+        self.assertIsNone(p["person"])
+
+    def test_unsure_or_unknown_kind_is_pruefen(self):
+        p = self.plan({**answer_invoice(), "typ": "Postkarte", "bereiche": ["Mond"], "sicher": False})
+        self.assertIsNone(p["typ"])
+        self.assertEqual(p["pruefen"], ["Art nicht erkannt", "Bereich nicht erkannt", "das Modell ist unsicher"])
+
+    def test_tax_year_and_warranty_need_their_words(self):
+        self.doc["content"] = "Einkommensteuerbescheid für 2023\nGarantie bis 31.12.2027\n"
+        p = self.plan({"typ": "Steuer", "bereiche": ["Steuer"], "sicher": True, "steuerjahr": {"wert": 2023, "beleg": "für 2023"},
+                       "garantie_bis": {"wert": "2027-12-31", "beleg": "Garantie bis 31.12.2027"}})
+        self.assertEqual(p["felder"], {"Steuerjahr": 2023, "Garantie bis": "2027-12-31"})
+        p = self.plan({"typ": "Steuer", "bereiche": ["Steuer"], "sicher": True, "steuerjahr": {"wert": 2022, "beleg": "für 2023"}})
+        self.assertEqual(p["felder"], {})
+
+
+class Lauf(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.f = base([{"id": 1, "title": "Stadtwerke - Rechnung", "content": INVOICE, "tags": [1]},
+                       {"id": 2, "title": "Labor", "content": LAB, "tags": [1, 3], "document_type": 5},
+                       {"id": 3, "title": "Unklar", "content": "Lorem ipsum", "tags": [1, 10]}])
+        self.asked = []
+
+    def ask(self, messages):
+        text = messages[1]["content"]
+        self.asked.append(text)
+        if "Stadtwerke" in text:
+            return answer_invoice()
+        if "Laborbefund" in text:
+            return {"typ": "Brief", "bereiche": ["Finanzen"], "person": {"wert": "Anna", "beleg": "Patient: Anna Muster"}, "sicher": True}
+        return {"typ": None, "bereiche": [], "sicher": False}
+
+    def test_dry_run_changes_nothing_and_says_what_would(self):
+        text = ordnen.alles(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(self.f.writes, [])
+        self.assertIn("PROBELAUF", Path(self.dir, "zusammenfassung.txt").read_text())
+        self.assertIn("Rechnung", text)
+        self.assertIn("ERGO (1 Dok.) → Korrespondent „ERGO Versicherung AG“", text)
+        plan = json.loads(Path(self.dir, "plan.json").read_text())
+        self.assertEqual(plan["dokumente"]["1"]["setzt"]["typ"], "Rechnung")
+        self.assertFalse(list(Path(self.dir).glob("sicherung-*.json")), "a dry run needs no backup")
+
+    def test_apply_reuses_the_answers_backs_up_first_and_fills_only_what_is_empty(self):
+        ordnen.alles(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
+        n = len(self.asked)
+        ordnen.alles(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(len(self.asked), n, "the dry run's answers are used, the model is not asked again")
+        self.assertEqual(len(list(Path(self.dir).glob("sicherung-*.json"))), 1)
+        o = ordnen.Ordnung(self.f)
+        d1, d2, d3 = self.f.docs[1], self.f.docs[2], self.f.docs[3]
+        self.assertEqual(d1["document_type"], o.typ("Rechnung")["id"])
+        self.assertEqual(o.korrespondent("Stadtwerke Beispielstadt GmbH")["id"], d1["correspondent"])
+        self.assertIn(o.tag("Haus")["id"], d1["tags"])
+        felder = {c["field"]: c["value"] for c in d1["custom_fields"]}
+        self.assertEqual(felder[o.feld("Person")["id"]], "opt0")
+        self.assertEqual(felder[o.feld("Kundennummer")["id"]], "4711-0815")
+        self.assertEqual(d2["document_type"], 5, "the type someone set stays")
+        self.assertNotIn(o.tag("Finanzen")["id"], d2["tags"], "it has a Bereich (gesundheit): none added")
+        self.assertNotIn(2, d2["tags"])
+        self.assertIn(2, d3["tags"], "unsure: prüfen")
+        self.assertIn("Bitte prüfen", self.f.notes[3][0])
+        self.assertEqual(d3["correspondent"], 1)
+        self.assertEqual(sorted(v["name"] for v in self.f.views),
+                         sorted(list(ordnen.BEREICHE) + ["Anna", "Ben"]))
+        self.assertTrue(all(v["owner"] == 4 for v in self.f.views))
+        gesundheit = next(v for v in self.f.views if v["name"] == "Gesundheit")
+        self.assertEqual(gesundheit["filter_rules"], [{"rule_type": 6, "value": "3"}])
+        before = len(self.f.writes)
+        ordnen.alles(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertEqual([w for w in self.f.writes[before:] if w[1] != "/api/documents/" ], [], "a second run changes nothing")
+
+    def test_the_backup_puts_everything_back(self):
+        before = copy.deepcopy(self.f.docs)
+        ordnen.alles(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertNotEqual(before, self.f.docs)
+        backup = str(next(Path(self.dir).glob("sicherung-*.json")))
+        self.assertEqual(ordnen.wiederherstellen(self.f, backup, log=lambda *_: None), 0)
+        ergo = next(t for t in self.f.tags if t["name"] == "ERGO")
+        for i, d in before.items():
+            now = self.f.docs[i]
+            self.assertEqual(now["document_type"], d["document_type"])
+            self.assertEqual(now["correspondent"], d["correspondent"])
+            self.assertEqual(sorted(now["tags"]), sorted(ergo["id"] if t == 10 else t for t in d["tags"]))
+            self.assertEqual(now["custom_fields"], d["custom_fields"])
+        self.assertEqual(next(t for t in self.f.typen if t["id"] == 3)["name"], "Beitragsrechnung")
+
+    def test_the_model_away_keeps_what_it_answered(self):
+        calls = []
+
+        def flaky(m):
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError("proxy: the card is lent")
+            return self.ask(m)
+        ordnen.alles(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=flaky)
+        rec = json.loads(Path(self.dir, "ordnen.json").read_text())
+        self.assertEqual(len(rec["antworten"]), 1)
+        self.assertTrue(rec["modell_weg"])
+        self.assertEqual(rec["lauf"]["offen"], 2)
+
+
+class Neue(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_without_the_order_nothing_happens(self):
+        f = base([{"id": 1, "title": "x", "content": INVOICE}])
+        ordnen.neue(f, self.dir, args(max=None), log=lambda *_: None, ask=lambda m: self.fail("asked"))
+        self.assertEqual(f.writes, [])
+
+    def test_new_documents_without_a_bereich_once_each_and_a_sender_paperless_refuses_is_noted(self):
+        f = base([{"id": 1, "title": "Stadtwerke", "content": INVOICE}, {"id": 2, "title": "alt", "content": "x", "tags": []}], korr_403=True)
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna"], log=lambda *_: None)
+        haus = next(t["id"] for t in f.tags if t["name"] == "Haus")
+        f.docs[2]["tags"] = [haus]
+        f.writes.clear()
+        asked = []
+        ordnen.neue(f, self.dir, args(max=5), log=lambda *_: None, ask=lambda m: asked.append(1) or answer_invoice())
+        self.assertEqual(len(asked), 1, "the document with a Bereich is not asked about")
+        self.assertIn(haus, f.docs[1]["tags"])
+        self.assertIsNone(f.docs[1]["correspondent"])
+        self.assertIn("Absender „Stadtwerke Beispielstadt GmbH“ ist noch kein Korrespondent", f.notes[1][0])
+        f.docs[1]["tags"] = []
+        ordnen.neue(f, self.dir, args(max=5), log=lambda *_: None, ask=lambda m: asked.append(1) or answer_invoice())
+        self.assertEqual(len(asked), 1, "seen once: never asked again")
+
+
+class Kommando(unittest.TestCase):
+    def test_paperless_away_in_intake_is_no_failure(self):
+        d = tempfile.mkdtemp()
+        os.environ.update({"ORDNEN_DIR": d, "PAPERLESS_API": "http://127.0.0.1:9", "PAPERLESS_TOKEN": "t"})
+        try:
+            self.assertEqual(ordnen.main(["--neue"]), 0)
+            self.assertEqual(ordnen.main([]), 2)
+        finally:
+            for k in ("ORDNEN_DIR", "PAPERLESS_API", "PAPERLESS_TOKEN"):
+                del os.environ[k]
+
+
+if __name__ == "__main__":
+    unittest.main()

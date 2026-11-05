@@ -56,6 +56,11 @@ class Auswertung:
         self.skript = env.get("VERTRAEGE_SKRIPT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "vertraege.py")
         if not os.path.exists(self.skript):
             self.skript = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vertraege", "vertraege.py")
+        # ordnen.py --neue (2026-11-05): each new document's type, Bereich, sender, person and fields, before the helper
+        self.ordnen = env.get("ORDNEN_SKRIPT")
+        if self.ordnen is None:
+            hier = os.path.dirname(os.path.abspath(__file__))
+            self.ordnen = next((p for p in (os.path.join(hier, "ordnen.py"), os.path.join(hier, "ordnen", "ordnen.py")) if os.path.exists(p)), "")
         data = env.get("DOKUMENTE_DATA", "/data")
         # the record is backed up (laib mounts /dokumente); /data is the scan's transient folder
         self.datei = env.get("VERTRAEGE_FILE") or (
@@ -123,6 +128,7 @@ class Auswertung:
         for k in ("VERTRAG_ARTEN", "VERTRAG_VORLAUF_TAGE", "RECHNUNG_ARTEN", "HAUSHALT_URL", "HAUSHALT_TOKEN", "HAUSHALT_NAMEN", "HEUTE"):
             if e.get(k):
                 env[k] = e[k]
+        eingeordnet = self.einordnen(env) if self.ordnen and os.path.exists(self.ordnen) else None
         start = time.monotonic()
         try:
             p = subprocess.Popen([sys.executable, self.skript], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -148,6 +154,8 @@ class Auswertung:
             lauf = rec.get("lauf") or {}
         except (OSError, ValueError, AttributeError):
             pass
+        if eingeordnet:
+            lauf = {**lauf, "eingeordnet": eingeordnet}
         befunde = leere_absender(rec)
         dauer = int(time.monotonic() - start)
         if rc != 0:
@@ -157,6 +165,24 @@ class Auswertung:
                                 "einzelheiten": " | ".join(letzte), "findings": befunde})
         self.zeigen({"zustand": "fertig", "at": jetzt(), "anlass": anlass, "lauf": lauf, "detail": satz_lauf(lauf, anlass),
                      "findings": befunde})
+
+    def einordnen(self, env):
+        """ordnen.py --neue before the helper, so a document it typed a contract or invoice is read in the same
+        run; its lines to the log, how many it filed in order back. It failing never stops the helper"""
+        ordner = os.path.join(os.path.dirname(self.datei), "ordnen")
+        try:
+            r = subprocess.run([sys.executable, self.ordnen, "--neue", "--zeit", str(int(self.zeit / 2))], env={**env, "ORDNEN_DIR": ordner},
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=self.zeit / 2 + 60)
+            for z in r.stdout.splitlines():
+                if z:
+                    log(z)
+            if r.returncode != 0:
+                return 0
+            with open(os.path.join(ordner, "ordnen.json"), encoding="utf-8") as f:
+                return int((json.load(f).get("lauf") or {}).get("eingeordnet") or 0)
+        except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired) as x:
+            log("ordnen: %s" % x)
+            return 0
 
     def melden(self, roh):
         """one message for the owner: a file in laib-notify's eingang, whole or not at all"""
@@ -209,6 +235,9 @@ def satz_lauf(lauf, anlass):
     was = ("Gelesen: " + ", ".join(teile) + ".") if teile else "Nichts Neues zu lesen."
     if lauf.get("fehlt"):
         was = "Nicht ausgewertet: " + lauf["fehlt"] + "."
+    n = int(lauf.get("eingeordnet") or 0)
+    if n:   # ordnen.py --neue: type, Bereich, sender, person
+        was = "%d Dokument%s eingeordnet. " % (n, "" if n == 1 else "e") + was
     if int(lauf.get("pruefen") or 0):
         n = int(lauf["pruefen"])
         was += " %d Dokument%s zum Prüfen markiert." % (n, "" if n == 1 else "e")
