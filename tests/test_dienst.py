@@ -30,6 +30,16 @@ json.dump({"lauf": {"am": "2026-10-27T20:00:00Z", "vertraege": 2, "rechnungen": 
 sys.exit(1 if os.path.exists(Z + ".exit") else 0)
 '''
 
+# a stand-in for ordnen.py --neue: says it ran (before vertraege's counter moves) and what it filed in order
+ORDNEN = r'''
+import json, os, sys
+Z = %r
+assert not os.path.exists(Z), "ordnen runs before the helper"
+open(Z + ".reihe", "a").write("ordnen %%s %%s\n" %% (sys.argv[1], os.environ["ORDNEN_DIR"]))
+os.makedirs(os.environ["ORDNEN_DIR"], exist_ok=True)
+json.dump({"lauf": {"eingeordnet": 3}}, open(os.path.join(os.environ["ORDNEN_DIR"], "ordnen.json"), "w"))
+'''
+
 
 class Basis(unittest.TestCase):
     def setUp(self):
@@ -42,6 +52,7 @@ class Basis(unittest.TestCase):
                     "VERTRAG_ARTEN": "Vertrag, Versicherung, Bescheid", "VERTRAEGE_SKRIPT": skript,
                     "DOKUMENTE_DATA": self.tmp, "MELDUNGEN": os.path.join(self.tmp, "eingang"),
                     "AUSWERTUNG_RUHE_S": "0.3", "AUSWERTUNG_SPAETESTENS_S": "5", "AUSWERTUNG_STUENDLICH_S": "3600",
+                    "ORDNEN_SKRIPT": "", "VERTRAEGE_FILE": os.path.join(self.tmp, "laib-vertraege.json"),
                     }
         scan.AUSWERTUNG.clear()
 
@@ -136,6 +147,26 @@ class Lauf(Basis):
         a.schleife()   # returns at once
         self.assertEqual(scan.AUSWERTUNG["zustand"], "aus")
         self.assertEqual(self.laeufe(), 0)
+
+    def test_new_documents_are_put_in_order_before_the_helper_reads_them(self):
+        ordnen = os.path.join(self.tmp, "ordnen.py")
+        Path(ordnen).write_text(ORDNEN % self.zaehler)
+        a = dienst.Auswertung({**self.env, "ORDNEN_SKRIPT": ordnen})
+        a.lauf("neue Dokumente")
+        self.assertEqual(Path(self.zaehler + ".reihe").read_text(), "ordnen --neue %s\n" % os.path.join(self.tmp, "ordnen"))
+        self.assertEqual(self.laeufe(), 1, "the helper ran after it")
+        self.assertEqual(scan.AUSWERTUNG["lauf"]["eingeordnet"], 3)
+        self.assertTrue(scan.AUSWERTUNG["detail"].startswith("Nach neuen Dokumenten ausgewertet. 3 Dokumente eingeordnet. Gelesen: 2 Verträge"),
+                        scan.AUSWERTUNG["detail"])
+
+    def test_ordnen_failing_never_stops_the_helper(self):
+        ordnen = os.path.join(self.tmp, "ordnen.py")
+        Path(ordnen).write_text("import sys; print('kaputt'); sys.exit(3)")
+        a = dienst.Auswertung({**self.env, "ORDNEN_SKRIPT": ordnen})
+        a.lauf("stündlich")
+        self.assertEqual(self.laeufe(), 1)
+        self.assertEqual(scan.AUSWERTUNG["zustand"], "fertig")
+        self.assertNotIn("eingeordnet", scan.AUSWERTUNG["lauf"])
 
     def test_the_scan_status_carries_the_evaluation(self):
         cfg = scan.Config.from_env({"DATA": self.tmp})
