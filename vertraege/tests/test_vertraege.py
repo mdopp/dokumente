@@ -157,7 +157,7 @@ class Model:
 def kontakt_angelegt(args):
     """Homes' kontakt_ergaenzen on an empty address book (homes#164): a German line, then one JSON line"""
     return False, "Kontakt „%s“ angelegt.\n%s" % (args.get("firma"), json.dumps(
-        {"status": "angelegt", "kontakt": "uid-1", "felder": {k: "angelegt" for k in args if k != "quelle"}, "gruende": {}}))
+        {"status": "angelegt", "kontakt": "uid-1", "felder": {k: "angelegt" for k in args}, "gruende": {}}))
 
 
 class Homes:
@@ -736,7 +736,7 @@ class Kontakte(Lauf):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(len(m.asks), 1, "one question per document: the invoice's fields and the sender together")
         ask = m.asks[0][2]["messages"][-1]["content"]
-        for name in ("Rechnungsnummer", "Firma", "Ansprechpartner", "Telefon", "E-Mail", "IBAN", "Empfänger"):
+        for name in ("Rechnungsnummer", "Firma", "Ansprechpartner", "Telefon", "E-Mail", "IBAN", "Bank", "Kontoinhaber", "Empfänger"):
             self.assertIn(name, ask)
         self.assertEqual(p.value(1, F["Rechnungsnummer"]), "2026/0042", "the invoice is read as before")
         [call] = [c for c in h.calls if c["params"]["name"] == "kontakt_ergaenzen"]
@@ -744,8 +744,8 @@ class Kontakte(Lauf):
         self.assertEqual(call["params"]["arguments"], {
             "firma": "Malerbetrieb Beispiel GmbH", "ansprechpartner": "Max Pinsel", "telefon": "030 1234567",
             "email": "info@maler-beispiel.example", "iban": "DE89370400440532013000",
-            "anschrift": {"strasse": "Musterweg 3", "plz": "12345", "ort": "Beispielstadt"},
-            "quelle": "https://paperless.example.org/documents/1/details"})
+            "anschrift": {"strasse": "Musterweg 3", "plz": "12345", "ort": "Beispielstadt"}},
+            "no bank or holder the model did not find, and no quelle: Homes writes no document link (homes#282)")
         self.assertIn("Anschrift", ask)
         self.assertEqual(self.rec()["kontakte"]["1"]["status"], "angelegt")
         self.assertFalse(self.prüfen(p, 1))
@@ -776,7 +776,7 @@ class Kontakte(Lauf):
         r = self.run_job(p, Model(antwort), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         [args] = h.kontakte()
-        self.assertEqual(sorted(args), ["firma", "iban", "quelle"], "only what was found and the text backs")
+        self.assertEqual(sorted(args), ["firma", "iban"], "only what was found and the text backs")
         os.remove(self.record)
         p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes()
         r = self.run_job(p, Model({**KONTAKT_ANTWORT, "Firma": {"wert": "Malerei Beispiel AG", "beleg": "Malerei Beispiel AG"}}), homes=h)
@@ -799,7 +799,7 @@ class Kontakte(Lauf):
         r = self.run_job(p, Model(antwort), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
         [args] = h.kontakte()
-        self.assertEqual(sorted(args), ["firma", "quelle"],
+        self.assertEqual(sorted(args), ["firma"],
                          "the household's person, its own number, its login's mail and the account it pays from stay out: %s" % args)
         # the household's own name as the firm: nothing is sent
         for firma in ("Familie Erika Mustermann", "Erika Mustermann", "Musterstraße 1"):
@@ -903,7 +903,7 @@ class Kontakte(Lauf):
         h.ohne_kontakte = False
         self.run_job(p, m, homes=h)
         self.run_job(p, m, homes=h)
-        self.assertEqual([a["quelle"].split("/")[-2] for a in h.kontakte()[2:]], ["1", "2"], "each sent once Homes has the tool")
+        self.assertEqual(len(h.kontakte()[2:]), 2, "each sent once Homes has the tool")
         self.assertEqual({k: v["status"] for k, v in self.rec()["kontakte"].items()}, {"1": "angelegt", "2": "angelegt"})
 
     def test_a_tool_error_is_recorded_and_not_sent_again(self):
@@ -915,11 +915,49 @@ class Kontakte(Lauf):
         self.assertEqual(len(h.kontakte()), 1, "at most once per document")
         self.assertIn("firma fehlt", self.rec()["kontakte"]["1"]["fehler"])
 
-    def test_without_a_paperless_url_no_source_is_sent(self):
+    def test_a_contact_waiting_from_before_homes_282_is_sent_without_its_quelle(self):
+        with open(self.record, "w") as f:
+            json.dump({"kontakte": {"1": {"offen": {"firma": "Malerbetrieb Beispiel GmbH", "iban": "DE89370400440532013000",
+                                                    "quelle": "https://paperless.example.org/documents/1/details"}}}}, f)
         p, h = Paperless([rechnung(text=MALER_KONTAKT)]), Homes()
-        r = self.run_job(p, Model(KONTAKT_ANTWORT), homes=h, PAPERLESS_URL="")
+        r = self.run_job(p, Model(KONTAKT_ANTWORT), homes=h)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn("quelle", h.kontakte()[0], "Homes takes only an http(s) link as the source")
+        self.assertEqual(h.kontakte(), [{"firma": "Malerbetrieb Beispiel GmbH", "iban": "DE89370400440532013000"}])
+
+    def konto(self, text, antwort, users=None):
+        p, h = Paperless([rechnung(text=text)], users=users), Homes()
+        r = self.run_job(p, Model({**KONTAKT_ANTWORT, **antwort}), homes=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        os.remove(self.record)
+        [args] = h.kontakte()
+        return {k: args[k] for k in ("iban", "bank", "kontoinhaber") if k in args}
+
+    def test_the_accounts_bank_and_holder_go_with_its_iban_when_the_text_names_them(self):
+        # a remittance slip: the holder line right before the IBAN is the sender's, not the household's
+        text = ANSCHRIFT + MALER + "\nKontoinhaber: Malerbetrieb Beispiel GmbH\nIBAN " + IBAN_DE + "\nBank: Sparkasse Beispielstadt"
+        bank = {"Bank": {"wert": "Sparkasse Beispielstadt", "beleg": "Bank: Sparkasse Beispielstadt"},
+                "Kontoinhaber": {"wert": "Malerbetrieb Beispiel GmbH", "beleg": "Kontoinhaber: Malerbetrieb Beispiel GmbH"}}
+        self.assertEqual(self.konto(text, bank), {"iban": "DE89370400440532013000", "bank": "Sparkasse Beispielstadt",
+                                                  "kontoinhaber": "Malerbetrieb Beispiel GmbH"})
+        self.assertEqual(self.konto(MALER_KONTAKT, {"Bank": {"wert": "Beispielbank", "beleg": "Bankverbindung: Beispielbank"},
+                                                    "Kontoinhaber": None}),
+                         {"iban": "DE89370400440532013000", "bank": "Beispielbank"}, "a holder the text does not name stays empty")
+        self.assertEqual(self.konto(MALER_KONTAKT, {"Bank": {"wert": "Deutsche Bank", "beleg": "Deutsche Bank"},
+                                                    "Kontoinhaber": {"wert": "Max Pinsel", "beleg": "Kontoinhaber Max Pinsel"}}),
+                         {"iban": "DE89370400440532013000"}, "never invented: what the text does not say is not sent")
+        self.assertEqual(self.konto(text, {**bank, "IBAN": None}), {}, "without an IBAN neither bank nor holder")
+
+    def test_the_households_own_account_holder_and_bank_stay_out(self):
+        text = (ANSCHRIFT + MALER + "\nSEPA-Lastschriftmandat\nKontoinhaber: Erika Mustermann\nIBAN " + IBAN_GB +
+                "\nIhre Bank: Postbank\nZahlbar an IBAN " + IBAN_DE)
+        antwort = {"IBAN": {"wert": IBAN_GB, "beleg": "IBAN " + IBAN_GB},
+                   "Bank": {"wert": "Postbank", "beleg": "Ihre Bank: Postbank"},
+                   "Kontoinhaber": {"wert": "Erika Mustermann", "beleg": "Kontoinhaber: Erika Mustermann"}}
+        self.assertEqual(self.konto(text, antwort, users=USERS), {}, "the mandate's holder, account and bank are the household's")
+        self.assertEqual(self.konto(text.replace("Erika Mustermann\n", "Malerbetrieb Beispiel GmbH\n"),
+                                    {**antwort, "Kontoinhaber": {"wert": "Malerbetrieb Beispiel GmbH",
+                                                                 "beleg": "Kontoinhaber: Malerbetrieb Beispiel GmbH"}}),
+                         {}, "an account to be debited stays out whoever the holder: Lastschrift and Ihre Bank still count")
 
 
 class Korrespondenten(unittest.TestCase):
