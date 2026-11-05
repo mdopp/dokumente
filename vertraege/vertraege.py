@@ -80,14 +80,17 @@ Haushalt URL and token come from the unit. The standard library only.
    none as the AI's); one left without documents is listed in the record,
    and paperless-mail.py check says so in laib's status.
 7. The family address book (#820). With Homes, the same question asks for the
-   sender too (KONTAKT): firm, contact person, phone, e-mail, IBAN, postal
-   address, and the recipient block only to keep the household out. A value
+   sender too (KONTAKT): firm, contact person, phone, e-mail, IBAN with its
+   bank and account holder (only when the text names them; they go only with
+   the IBAN), postal address, and the recipient block only to keep the
+   household out. A value
    is kept when belegt() and its shape; never the household's own: in the
    recipient block, a household person (6.), a login's e-mail, a number,
-   mail or IBAN the text calls the recipient's (EIGEN), or a street with a
+   mail or IBAN the text calls the recipient's (EIGEN; „Kontoinhaber“ only
+   when the holder after it is not the sender's), or a street with a
    household person's name just before it. An address goes only whole.
-   Homes' kontakt_ergaenzen gets it with the document's link as quelle,
-   once per document (the record's kontakte); one read before is asked once
+   Homes' kontakt_ergaenzen gets it once per document (no link to the
+   document: Homes' contact page finds them, homes#282) (the record's kontakte); one read before is asked once
    more, for its sender only. An IBAN Homes answers abweichend: `prüfen` and
    a note with Homes' reason. Homes away or without the tool: the contact
    waits in the record, the model is not asked again. Without Homes nothing
@@ -141,18 +144,27 @@ KONTAKT = {"Firma": "die Firma, Behörde oder Person, die das Dokument schickt (
            "Telefon": "die Telefonnummer des Absenders, wie sie dasteht",
            "E-Mail": "die E-Mail-Adresse des Absenders",
            "IBAN": "die IBAN des Absenders, auf die gezahlt werden soll; nie die des Empfängers (\"von Ihrem Konto\")",
+           "Bank": "der Name der Bank zu dieser IBAN, wie er dasteht (z. B. \"Bank: Sparkasse …\", \"Bankverbindung: …\"), "
+                   "nur wenn der Text ihn nennt; nie aus der IBAN erschlossen, nie die Bank des Empfängers",
+           "Kontoinhaber": "der Inhaber des Kontos zu dieser IBAN, wie er dasteht (\"Kontoinhaber: …\", auf einem "
+                           "Überweisungsträger der \"Empfänger\"), nur wenn der Text ihn nennt; nie der Empfänger des Briefs",
            "Anschrift": "die Postanschrift des Absenders aus Briefkopf, Absenderzeile oder Fußzeile, als "
                         "{\"strasse\": …, \"plz\": …, \"ort\": …, \"land\": \"DE\"}; nie die Anschrift im Anschriftenfeld",
            **EMPFAENGER}
 LAENDER = {"DE": "deutschland", "AT": "österreich", "CH": "schweiz", "NL": "niederlande", "FR": "frankreich", "LU": "luxemburg"}
-KONTAKT_ARGS = {"Firma": "firma", "Ansprechpartner": "ansprechpartner", "Telefon": "telefon", "E-Mail": "email", "IBAN": "iban"}
+# the holder first: an IBAN or bank just after "Kontoinhaber: <the sender's holder>" is the sender's (eigen)
+KONTAKT_ARGS = {"Kontoinhaber": "kontoinhaber", "Firma": "firma", "Ansprechpartner": "ansprechpartner", "Telefon": "telefon",
+                "E-Mail": "email", "IBAN": "iban", "Bank": "bank"}
+KONTO = ("bank", "kontoinhaber")   # Homes takes them only with a valid IBAN
 FORM = {"Firma": lambda v: len(v) <= 128 and re.search(r"[^\W\d_]{2}", v),
         "Ansprechpartner": lambda v: len(v) <= 80 and re.fullmatch(r"[^\W\d_][^\d@]*", v),
         "Telefon": lambda v: re.fullmatch(r"\+?[\d\s()/.-]{6,30}", v) and 6 <= len(re.sub(r"\D", "", v)) <= 15,
         "E-Mail": lambda v: re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", v),
-        "IBAN": lambda v: re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", v)}
+        "IBAN": lambda v: re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", v),
+        "Bank": lambda v: len(v) <= 128 and re.search(r"[^\W\d_]{2}", v) and "@" not in v,
+        "Kontoinhaber": lambda v: len(v) <= 128 and re.search(r"[^\W\d_]{2}", v) and "@" not in v}
 # words just before a number, mail or IBAN that make it the household's own (#820)
-EIGEN = re.compile(r"\bihr(?:e|em|en|er)?\s+(?:konto|iban|bankverbindung|telefon\w*|rufnummer\w*|mobil\w*|handy\w*|anschluss\w*|e-?mail\w*)"
+EIGEN = re.compile(r"\bihr(?:e|em|en|er)?\s+(?:konto|iban|bank\w*|telefon\w*|rufnummer\w*|mobil\w*|handy\w*|anschluss\w*|e-?mail\w*)"
                    r"|lastschrift|abgebucht|abbuch|eingezogen|einzug|mandat|kontoinhaber", re.I)
 RECHNUNGSTITEL = re.compile(r"^(?:\d{4}-\d{2}-\d{2}\s+)?(?:.{1,60}?\s-\s)?rechnung\b", re.I)   # scan.py's dateiname
 GUTSCHRIFT = re.compile(r"gutschrift|guthaben|erstatt|gutgeschrieben|zu ihren gunsten|rückzahlung", re.I)
@@ -374,18 +386,21 @@ def faellig(antwort, text):
         "Rechnungsdatum %s und „%s“" % (d.strftime("%d.%m.%Y"), re.sub(r"\s+", " ", str(z["beleg"])).strip())
 
 
-def eigen(name, v, text, empf, personen, mails):
+def eigen(name, v, text, empf, personen, mails, inhaber=""):
     """whether a contact value is the household's own: in the recipient block, a household
-    person, a login's mail, or a number, mail or IBAN the text calls the recipient's"""
+    person, a login's mail, or a number, mail, IBAN or bank the text calls the recipient's;
+    "Kontoinhaber" only when the sender's holder (inhaber, taken) does not follow it"""
     if empf and (eng(v) in empf or dicht(v) in dicht(empf)):
         return True
-    if name in ("Firma", "Ansprechpartner"):
+    if name in ("Firma", "Ansprechpartner", "Kontoinhaber"):
         return eigener(v, personen)
     if name == "E-Mail" and v.casefold() in mails:
         return True
     t = eng(text)
     for m in re.finditer(r"\s?".join(map(re.escape, dicht(v))), t):
-        if EIGEN.search(t[max(0, m.start() - 60):m.start()]):
+        w = t[max(0, m.start() - 60):m.start()]
+        hits = {x.group(0) for x in EIGEN.finditer(w)}
+        if hits - {"kontoinhaber"} or (hits and not (inhaber and dicht(inhaber) in dicht(w))):
             return True
     return False
 
@@ -430,10 +445,12 @@ def kontaktdaten(antwort, text, personen, mails):
             weg.append("%s (steht so nicht im Text)" % name)
         elif not FORM[name](v):
             weg.append("%s (%r ist kein gültiger Wert)" % (name, a["wert"]))
-        elif eigen(name, v, text, empf, personen, mails):
+        elif eigen(name, v, text, empf, personen, mails, out.get("kontoinhaber", "")):
             weg.append("%s (gehört zum Haushalt)" % name)
         else:
             out[arg] = v
+    if "iban" not in out:
+        weg += ["%s (ohne IBAN)" % n for n, arg in KONTAKT_ARGS.items() if arg in KONTO and out.pop(arg, None)]
     if "firma" in out:
         a, warum = anschrift(antwort.get("Anschrift"), text, empf, personen)
         if a:
@@ -698,7 +715,8 @@ def kontakte(api, rec, prüfen_tag):
         if "offen" not in e:
             continue
         try:
-            res = werkzeug("kontakt_ergaenzen", e["offen"])
+            # a quelle recorded before homes#282 is not sent: Homes no longer reads it
+            res = werkzeug("kontakt_ergaenzen", {a: v for a, v in e["offen"].items() if a != "quelle"})
         except (OSError, ValueError) as x:
             print("vertraege: Homes antwortet nicht (%s), Kontakte im nächsten Lauf" % x)
             return
@@ -827,7 +845,6 @@ def main():
     if users is not None:
         absender(api, rec, tags, personen)
     homes = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
-    link = E.get("PAPERLESS_URL", "").rstrip("/")
     ki = E.get("PAPERLESS_AI_ENABLED", "").strip().lower() == "true" and E.get("PAPERLESS_AI_LLM_ENDPOINT")
     gelesen = 0
     for d in sorted({**rechnungen, **docs}.values(), key=lambda d: d["id"]) if ki else []:
@@ -861,8 +878,6 @@ def main():
         if kontakt:
             args, weg = kontaktdaten(antwort, d.get("content") or "", personen, mails)
             am = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            if args and link.startswith(("https://", "http://")):
-                args["quelle"] = "%s/documents/%d/details" % (link, d["id"])
             rec.setdefault("kontakte", {})[str(d["id"])] = {"offen": args, "am": am} if args else {"status": "keiner", "verworfen": weg, "am": am}
             if weg:
                 print("vertraege: %s (%d): vom Absender nicht übernommen: %s" % (d.get("title"), d["id"], ", ".join(weg)))
