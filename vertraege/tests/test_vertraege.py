@@ -48,7 +48,8 @@ class Paperless:
         self.docs, self.calls, self.notes, self.bulk, self.v3 = docs, [], {}, [], True
         self.users = users if users is not None else [{"id": 1, "username": "admin", "first_name": "", "last_name": ""}]
         self.correspondents = correspondents if correspondents is not None else []
-        self.types = types if types is not None else [{"id": 1, "name": "Vertrag"}, {"id": 2, "name": "Rechnung"}]
+        self.types = types if types is not None else [{"id": 1, "name": "Vertrag"}, {"id": 2, "name": "Rechnung"},
+                                                      {"id": 3, "name": "Versicherungsschein"}]
         self.tags = tags if tags is not None else [{"id": 1, "name": "Versicherung"}]
         self.fields = [{"id": F[n], "name": n, "data_type": k} for n, k in zip(NAMES, KINDS) if n in names] + [
             {"id": OTHER, "name": "Ablageort", "data_type": "string"}]
@@ -278,17 +279,27 @@ class Vertraege(Lauf):
         self.assertEqual(set(p.doc(1)["tags"]), {5, tag["id"]}, "the document's tags kept, prüfen added")
         self.assertIn("Vertragsnummer", p.notes[1][0].split("prüfen", 1)[1])
 
-    def test_only_contracts_by_type_or_tag_and_only_with_an_empty_field(self):
+    def test_only_contracts_by_type_and_only_with_an_empty_field(self):
         full = {F[n]: "x" for n in NAMES}
         rechnung = {F["Betrag"]: "EUR10.00", F["Rechnungsnummer"]: "R-1", F["Fällig am"]: "2026-01-31",
                     F["Verwendungszweck"]: "R-1"}   # #818: an invoice, its fields full
-        p = Paperless([vertrag(1, typ=2, title="Rechnung", fields=rechnung), vertrag(2, typ=None, tags=[1]), vertrag(3, fields=full)])
+        p = Paperless([vertrag(1, typ=2, title="Rechnung", fields=rechnung), vertrag(2, typ=None, tags=[1]), vertrag(3, fields=full),
+                       vertrag(4, typ=3, title="Police")])
         m = Model(ANSWER)
-        r = self.run_job(p, m)
+        r = self.run_job(p, m)   # the box's VERTRAG_ARTEN still names Versicherung: no longer read
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(len(m.asks), 1, "the invoice is no contract, the full one has nothing to fill")
-        self.assertEqual(p.value(2, F["Vertragsnummer"]), "SW-12345", "tagged Versicherung: a contract")
+        self.assertEqual(len(m.asks), 1, "the invoice is no contract, the full one has nothing to fill, a tag makes none")
+        self.assertIsNone(p.value(2, F["Vertragsnummer"]), "tagged Versicherung (a Bereich): no contract")
+        self.assertEqual(p.value(4, F["Vertragsnummer"]), "SW-12345", "a Versicherungsschein is a contract")
         self.assertIsNone(p.value(1, F["Vertragsnummer"]))
+
+    def test_vertrag_typen_names_the_contract_types(self):
+        p = Paperless([vertrag(1, typ=3, title="Police"), vertrag(2, typ=1)])
+        m = Model(ANSWER)
+        r = self.run_job(p, m, VERTRAG_TYPEN="Versicherungsschein")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(p.value(1, F["Vertragsnummer"]), "SW-12345")
+        self.assertIsNone(p.value(2, F["Vertragsnummer"]))
 
     def test_model_away_changes_nothing_and_the_next_run_asks_again(self):
         p = Paperless([vertrag()])

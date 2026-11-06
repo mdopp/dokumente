@@ -6,9 +6,11 @@ timer. It talks to Paperless' API as Paperless' own admin and to the household
 model as Paperless' AI does, both from the container's environment; Homes'
 Haushalt URL and token come from the unit. The standard library only.
 
-1. Reading. A contract is a document whose document type or one of whose tags
-   is named in VERTRAG_ARTEN (the household's own names: Vertrag, Versicherung
-   …). For each one with an empty contract field (paperless-mail.py's CONTRACT,
+1. Reading. A contract is a document whose document type is named in
+   VERTRAG_TYPEN (default Vertrag, Versicherungsschein; decided 2026-11-06):
+   by its type only, never by a tag. A Bereich tag such as „Versicherung“
+   orders documents and makes none a contract; VERTRAG_ARTEN, which also
+   counted tags, is no longer read. For each one with an empty contract field (paperless-mail.py's CONTRACT,
    made by post-deploy) the household model is asked once per text, in German,
    for a JSON object: per field a value and the words of the text it stands on.
    A value is taken only when those words are in the text and it has its
@@ -110,6 +112,7 @@ PRO_LAUF = 10                  # documents read a run: the household model is sh
 ZEICHEN = 16000                # of a document's text: a contract's data is on its first pages
 OCR_PRO_LAUF = 3               # documents recognised again a run: OCR is the box's CPU
 PRUEFEN = "prüfen"
+VERTRAG_TYPEN = "Vertrag, Versicherungsschein"   # the document types that make a contract (2026-11-06)
 BEHALTEN = "korrespondent-ok"   # the family's tag: this document's correspondent stays (#737)
 # words before a name that are no part of it; the first three name a family by its surname
 FAMILIE = {"familie", "fam", "eheleute"}
@@ -805,15 +808,13 @@ def main():
     ohne = [n for n in RECHNUNG_FELDER if n not in felder]
     if ohne:
         print("vertraege: Paperless fehlen Rechnungsfelder (%s): Rechnungen werden nicht gelesen, laib apply paperless legt sie an" % ", ".join(ohne))
-    arten = {a.strip().casefold() for a in E.get("VERTRAG_ARTEN", "").split(",") if a.strip()}
+    arten = {a.strip().casefold() for a in (E.get("VERTRAG_TYPEN") or VERTRAG_TYPEN).split(",") if a.strip()}
     typen = [t["id"] for t in api.all("/api/document_types/") if t["name"].casefold() in arten]
     tags = api.all("/api/tags/")
-    marken = [t["id"] for t in tags if t["name"].casefold() in arten]
     docs = {}
-    for key, ids in (("document_type__id__in", typen), ("tags__id__in", marken)):
-        if ids:
-            for d in api.all("/api/documents/?%s=%s" % (key, ",".join(map(str, ids)))):
-                docs[d["id"]] = d
+    if typen:   # by type only: a tag makes no contract (2026-11-06)
+        for d in api.all("/api/documents/?document_type__id__in=%s" % ",".join(map(str, typen))):
+            docs[d["id"]] = d
     rechnungen = {}   # #818: by type or tag, or the scan service's art at the title's start
     if not ohne:
         rarten = {a.strip().casefold() for a in E.get("RECHNUNG_ARTEN", "Rechnung").split(",") if a.strip()}

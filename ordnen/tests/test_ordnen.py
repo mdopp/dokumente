@@ -236,6 +236,25 @@ class Auswerten(unittest.TestCase):
         p = self.plan({**answer_invoice(), "absender": {"wert": "Reha-Zentrum Beispiel", "beleg": "Reha-Zentrum Beispiel"}}, ["Rehazentrum Beispiel"])
         self.assertEqual(p["absender"], "Rehazentrum Beispiel")
 
+    def test_an_alias_is_one_sender_with_the_fuller_name(self):
+        self.doc["content"] += "DRV Bund\nGemeinschaftslabor\n"
+        p = self.plan({**answer_invoice(), "absender": {"wert": "DRV Bund", "beleg": "DRV Bund"}})
+        self.assertEqual(p["absender"], "Deutsche Rentenversicherung Bund", "made under the full name")
+        p = self.plan({**answer_invoice(), "absender": {"wert": "DRV Bund", "beleg": "DRV Bund"}}, ["Deutsche Rentenversicherung Bund"])
+        self.assertEqual(p["absender"], "Deutsche Rentenversicherung Bund")
+        p = self.plan({**answer_invoice(), "absender": {"wert": "Gemeinschaftslabor", "beleg": "Gemeinschaftslabor"}})
+        self.assertEqual(p["absender"], "LCM Gemeinschaftslabor")
+
+    def test_a_device_or_software_maker_is_never_the_sender(self):
+        self.doc["content"] += "Zimmer MedizinSysteme GmbH\nCompuGroup Medical Deutschland AG\nSchiller Apotheke\n"
+        for name in ("Zimmer MedizinSysteme", "Zimmer MedizinSysteme GmbH", "CompuGroup Medical Deutschland AG"):
+            p = self.plan({**answer_invoice(), "absender": {"wert": name, "beleg": name}})
+            self.assertIsNone(p["absender"], name)
+            self.assertTrue(any("Hersteller" in w for w in p["weg"]))
+            self.assertEqual(p["pruefen"], [], "no sender is no doubt")
+        p = self.plan({**answer_invoice(), "absender": {"wert": "Schiller Apotheke", "beleg": "Schiller Apotheke"}})
+        self.assertEqual(p["absender"], "Schiller Apotheke")
+
     def test_the_household_is_never_the_sender_and_a_person_must_be_named(self):
         p = self.plan({**answer_invoice(), "absender": {"wert": "Anna Muster", "beleg": "Frau Anna Muster"},
                        "person": {"wert": "Ben", "beleg": "Frau Anna Muster"}})
