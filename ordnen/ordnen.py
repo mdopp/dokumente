@@ -160,7 +160,7 @@ ANLASS_NAH = 400
 MEDIKAMENT_KOPF = r"(?:\w*medikation|medikamente?|arzneimittel|therapie(?:empfehlung)?|verordnung|\brp\.?)\s*:"
 MEDIKAMENT_DOKUMENT = r"medikationsplan|kassenrezept|privatrezept|e-rezept|\brezept\b|arzneiverordnungsblatt|verordnungsblatt"
 MEDIKAMENT_NAH = 1500
-FRAGE_STAND = 2     # an answer from before the medical fields is asked again by `felder`
+FRAGE_STAND = 3     # an answer from before the medical fields (or before their shape was spelled out) is asked again by `felder`
 ZEICHEN = 8000      # of a document's text for the model: who, what and which year stand on the first pages
 PRO_LAUF = 10       # documents an intake run reads: the household model is shared
 
@@ -264,8 +264,10 @@ def frage(doc, typen, personen, haushalt, korrespondenten):
               "{\"typ\": eine der Arten oder null, \"bereiche\": [ein oder zwei der Bereiche], "
               "\"absender\": {\"wert\": …, \"beleg\": …} oder null, \"person\": {\"wert\": einer der Namen, \"beleg\": …} oder null, "
               "\"versicherungsnummer\": {…} oder null, \"kundennummer\": {…} oder null, \"produkte\": {…} oder null, "
-              "\"garantie_bis\": {…} oder null, \"steuerjahr\": {…} oder null, \"fachrichtung\": {…} oder null, "
-              "\"anlass\": {…} oder null, \"medikamente\": {…} oder null, \"sicher\": true oder false}.\n"
+              "\"garantie_bis\": {…} oder null, \"steuerjahr\": {…} oder null, "
+              "\"fachrichtung\": {\"wert\": eine der Fachrichtungen, \"beleg\": …} oder null, \"anlass\": {\"wert\": …, \"beleg\": …} oder null, "
+              "\"medikamente\": {\"wert\": …, \"beleg\": …} oder null, \"sicher\": true oder false}.\n"
+              "Jeder Wert außer typ, bereiche und sicher ist ein Objekt {\"wert\": …, \"beleg\": …}, nie eine bloße Zeichenkette. "
               "beleg ist immer wörtlich der Ausschnitt des Textes, auf dem der Wert steht. Steht etwas nicht im Text, dann null. "
               "Rate nie, rechne nichts aus. absender ist die Firma, Behörde, Praxis oder Person, die das Dokument schickt oder ausstellt "
               "(Briefkopf, Fußzeile), nie der Hersteller eines Messgeräts oder einer Praxis- oder Laborsoftware aus dem Kopf eines Ausdrucks, nie der Empfänger und nie jemand aus dem Haushalt (%s); nimm, wenn es passt, den Namen eines bekannten "
@@ -453,7 +455,11 @@ def kuerzen(wert, n):
 
 
 def medizin_auswerten(a, text, out):
-    """fachrichtung, anlass and medikamente as may be set: each only on the words the text has where the rule wants them"""
+    """fachrichtung, anlass and medikamente as may be set: each only on the words the text has where the rule wants them;
+    an answer without its quoted words (a bare string) is not taken, and said"""
+    for key, name in (("fachrichtung", "Fachrichtung"), ("anlass", "Anlass/Diagnose"), ("medikamente", "Medikamente")):
+        if a.get(key) not in (None, "", []) and not isinstance(a.get(key), dict):
+            out["weg"].append("%s (ohne Beleg)" % name)
     v = a.get("fachrichtung")
     if isinstance(v, dict) and isinstance(v.get("wert"), str) and v["wert"].strip():
         wahl = next((k for k in FACHRICHTUNGEN if falten(k) == falten(v["wert"])), None)

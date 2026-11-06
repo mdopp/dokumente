@@ -433,6 +433,18 @@ class Medizin(unittest.TestCase):
         self.assertEqual(p["felder"], {"Fachrichtung": "Kardiologie", "Anlass/Diagnose": "Arterielle Hypertonie",
                                        "Medikamente": "Ramipril 5mg 1-0-0, ASS 100 0-1-0"})
 
+    def test_a_bare_string_is_no_evidence_and_is_counted(self):
+        p = self.plan(answer_medizin(fachrichtung="Kardiologie", anlass="Arterielle Hypertonie", medikamente=["Ramipril 5 mg"]))
+        self.assertEqual(p["felder"], {})
+        self.assertEqual(sorted(w for w in p["weg"] if "ohne Beleg" in w),
+                         ["Anlass/Diagnose (ohne Beleg)", "Fachrichtung (ohne Beleg)", "Medikamente (ohne Beleg)"])
+
+    def test_the_question_spells_out_the_shape_of_every_value(self):
+        system = ordnen.frage({"title": "x", "content": "y"}, ordnen.TYPEN, [], [], [])[0]["content"]
+        for key in ("fachrichtung", "anlass", "medikamente"):
+            self.assertIn('"%s": {"wert": ' % key, system)
+        self.assertIn("nie eine bloße Zeichenkette", system)
+
     def test_a_specialty_needs_its_words_and_must_be_one_of_the_list(self):
         p = self.plan(answer_medizin(fachrichtung={"wert": "Kardiologie", "beleg": "Echo unauffällig"}))
         self.assertNotIn("Fachrichtung", p["felder"], "an echo is no cardiology practice")
@@ -493,8 +505,9 @@ class Felder(unittest.TestCase):
         self.f.felder = [x for x in self.f.felder if x["name"] not in ordnen.MEDIZIN_FELDER]   # the box before this change
         self.f.writes.clear()
         sha = {i: ordnen.sha(d) for i, d in self.f.docs.items()}
-        Path(self.dir, "ordnen.json").write_text(json.dumps({"antworten": {
-            str(i): {"sha": sha[i], "antwort": {"typ": "Brief", "bereiche": ["Haus"], "sicher": True}} for i in (1, 2, 3)}}))
+        Path(self.dir, "ordnen.json").write_text(json.dumps({"antworten": {   # 3: an answer from the first cut (stand 2), bare strings
+            **{str(i): {"sha": sha[i], "antwort": {"typ": "Brief", "bereiche": ["Haus"], "sicher": True}} for i in (1, 2)},
+            "3": {"sha": sha[3], "stand": 2, "antwort": {"typ": "Befund", "fachrichtung": "Kardiologie", "sicher": True}}}}))
         self.asked = []
 
     def ask(self, m):
