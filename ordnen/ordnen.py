@@ -327,7 +327,8 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
             out["weg"].append("Absender „%s“ (steht so nicht im Text)" % name)
     p = a.get("person")
     if isinstance(p, dict) and isinstance(p.get("wert"), str):
-        wer = next((x for x in personen if falten(x) == falten(p["wert"])), None)
+        # "Anna Muster" is the option Anna (first name and surname); "Anna und Ben Muster" is the household: none
+        wer = next((x for x in personen if falten(x) == falten(p["wert"]) or (len(falten(p["wert"]).split()) == 2 and falten(x).split() == falten(p["wert"]).split()[:1])), None)
         beleg = belegt(p, text)
         if wer and beleg and falten(wer) in falten(beleg):
             out["person"] = wer

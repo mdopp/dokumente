@@ -236,6 +236,14 @@ class Auswerten(unittest.TestCase):
         p = self.plan({**answer_invoice(), "absender": {"wert": "Reha-Zentrum Beispiel", "beleg": "Reha-Zentrum Beispiel"}}, ["Rehazentrum Beispiel"])
         self.assertEqual(p["absender"], "Rehazentrum Beispiel")
 
+    def test_a_person_by_full_name_is_the_persons_option(self):
+        p = self.plan({**answer_invoice(), "person": {"wert": "Anna Muster", "beleg": "Frau Anna Muster"}})
+        self.assertEqual(p["person"], "Anna")
+        p = self.plan({**answer_invoice(), "person": {"wert": "Muster Anna", "beleg": "Frau Anna Muster"}})
+        self.assertIsNone(p["person"], "only the first name picks the option")
+        p = self.plan({**answer_invoice(), "person": {"wert": "Anna und Ben Muster", "beleg": "Frau Anna Muster"}})
+        self.assertIsNone(p["person"], "two people: the household, no one")
+
     def test_an_alias_is_one_sender_with_the_fuller_name(self):
         self.doc["content"] += "DRV Bund\nGemeinschaftslabor\n"
         p = self.plan({**answer_invoice(), "absender": {"wert": "DRV Bund", "beleg": "DRV Bund"}})
