@@ -111,6 +111,15 @@ TAG_REGELN = {
     "Konzert": (P, "Freizeit", "Konzert"), "Tickets": (P, "Freizeit", "Tickets"),
     "Privatkunden": (P, None, None), "Zahlung": (P, None, None),
 }
+# one sender under two names (decided 2026-11-06): the short or other name → the one correspondent, the fuller name
+ALIASE = {"DRV Bund": "Deutsche Rentenversicherung Bund", "DRV-Bund": "Deutsche Rentenversicherung Bund",
+          "Deutsche Rentenversicherung (Bund)": "Deutsche Rentenversicherung Bund",
+          "Gemeinschaftslabor": "LCM Gemeinschaftslabor"}
+# makers of devices and practice or lab software (decided 2026-11-06): their name heads a printout, they never send one;
+# matched as the name's first words ("Zimmer MedizinSysteme GmbH" too); never a bare word a pharmacy or a person may carry
+GERAETE = ["Zimmer MedizinSysteme", "Zimmer Diagnostik", "CompuGroup Medical", "CGM", "Schiller AG", "Schiller Medizintechnik",
+           "Vyaire", "Ganshorn", "MGC Diagnostics", "nSpire Health", "CareFusion", "custo med", "medatixx", "Turbomed",
+           "Albis", "x.isynet", "Medistar", "GE Healthcare", "Siemens Healthineers", "Mortara", "Welch Allyn", "Nihon Kohden"]
 FELDER = [("Versicherungsnummer", "string"), ("Kundennummer", "string"), ("Produkte", "longtext"),
           ("Garantie bis", "date"), ("Person", "select"), ("Steuerjahr", "integer")]
 ZEICHEN = 8000      # of a document's text for the model: who, what and which year stand on the first pages
@@ -219,7 +228,7 @@ def frage(doc, typen, personen, haushalt, korrespondenten):
               "\"garantie_bis\": {…} oder null, \"steuerjahr\": {…} oder null, \"sicher\": true oder false}.\n"
               "beleg ist immer wörtlich der Ausschnitt des Textes, auf dem der Wert steht. Steht etwas nicht im Text, dann null. "
               "Rate nie, rechne nichts aus. absender ist die Firma, Behörde, Praxis oder Person, die das Dokument schickt oder ausstellt "
-              "(Briefkopf, Fußzeile), nie der Empfänger und nie jemand aus dem Haushalt (%s); nimm, wenn es passt, den Namen eines bekannten "
+              "(Briefkopf, Fußzeile), nie der Hersteller eines Messgeräts oder einer Praxis- oder Laborsoftware aus dem Kopf eines Ausdrucks, nie der Empfänger und nie jemand aus dem Haushalt (%s); nimm, wenn es passt, den Namen eines bekannten "
               "Absenders. person ist, wen aus dem Haushalt das Dokument betrifft (Patient, Versicherter, Vertragspartner), nur wenn der "
               "Name im Text steht; betrifft es den ganzen Haushalt, null. versicherungsnummer: Versicherungsschein- oder Policennummer. "
               "kundennummer: Kunden-, Mitglieds- oder Vertragskontonummer. produkte: die Produkte, Tarife oder Leistungen, um die es geht, "
@@ -244,6 +253,18 @@ def eigener(name, haushalt):
         if h and (w == h or w == h[::-1] or (len(h) > 1 and w[-1:] == h[-1:] and len(w) <= 2 and w[0] in ("familie", "fam", h[0]))):
             return True
     return False
+
+
+def kanonisch(name):
+    """a sender's one name: an alias to its correspondent's name, else the name"""
+    f = falten(name)
+    return next((ziel for alias, ziel in ALIASE.items() if falten(alias) == f), name)
+
+
+def geraet(name):
+    """whether a name is a device or software maker's (GERAETE): its words start with one's"""
+    w = falten(name).split()
+    return any(w[:len(g)] == g for g in (falten(x).split() for x in GERAETE) if g)
 
 
 def ein_name(name):
@@ -291,15 +312,17 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
     s = a.get("absender")
     if isinstance(s, dict) and isinstance(s.get("wert"), str) and s["wert"].strip():
         name, beleg = re.sub(r"\s+", " ", s["wert"]).strip()[:128], belegt(s, text)
-        bekannt = passt(name, korrespondenten)
+        bekannt = passt(kanonisch(name), korrespondenten)
         if not ein_name(name):
             out["weg"].append("Absender „%s“ (kein Name)" % name)
+        elif geraet(name):
+            out["weg"].append("Absender „%s“ (Hersteller des Geräts oder der Software, nicht der Absender)" % name)
         elif eigener(name, haushalt):
             out["weg"].append("Absender „%s“ (gehört zum Haushalt)" % name)
-        elif bekannt and (beleg or falten(bekannt) in falten(text)):
+        elif bekannt and (beleg or falten(bekannt) in falten(text) or falten(kanonisch(name)) == falten(bekannt)):
             out["absender"] = bekannt
         elif beleg and (im(name, beleg) or falten(name) in falten(beleg)):
-            out["absender"] = name
+            out["absender"] = kanonisch(name)
         else:
             out["weg"].append("Absender „%s“ (steht so nicht im Text)" % name)
     p = a.get("person")

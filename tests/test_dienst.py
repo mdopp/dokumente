@@ -20,7 +20,7 @@ Z = %r
 n = int(open(Z).read() or 0) + 1 if os.path.exists(Z) else 1
 open(Z, "w").write(str(n))
 open(Z + ".env", "w").write(json.dumps({k: os.environ.get(k, "") for k in
-    ("PAPERLESS_API", "PAPERLESS_TOKEN", "PAPERLESS_AI_LLM_ENDPOINT", "PAPERLESS_AI_LLM_API_KEY", "PAPERLESS_AI_LLM_MODEL", "VERTRAG_ARTEN", "PAPERLESS_AI_ENABLED")}))
+    ("PAPERLESS_API", "PAPERLESS_TOKEN", "PAPERLESS_AI_LLM_ENDPOINT", "PAPERLESS_AI_LLM_API_KEY", "PAPERLESS_AI_LLM_MODEL", "VERTRAG_TYPEN", "VERTRAG_ARTEN", "PAPERLESS_AI_ENABLED")}))
 print("vertraege: lief")
 if os.path.exists(Z + ".melden"):
     print("meldung " + json.dumps({"an": "", "betreff": "Kündigung prüfen: Kfz", "text": "bis 30.11.", "at": 1}))
@@ -49,7 +49,8 @@ class Basis(unittest.TestCase):
         Path(skript).write_text(FAKE % self.zaehler)
         self.env = {"PATH": os.environ["PATH"], "PAPERLESS_TOKEN": "pt", "PAPERLESS_URL": "http://127.0.0.1:8000",
                     "MODEL_URL": "http://127.0.0.1:11435/v1", "MODEL_KEY": "mk", "MODEL_NAME": "household",
-                    "VERTRAG_ARTEN": "Vertrag, Versicherung, Bescheid", "VERTRAEGE_SKRIPT": skript,
+                    "VERTRAG_ARTEN": "Vertrag, Versicherung, Bescheid", "VERTRAG_TYPEN": "Vertrag, Versicherungsschein",
+                    "VERTRAEGE_SKRIPT": skript,
                     "DOKUMENTE_DATA": self.tmp, "MELDUNGEN": os.path.join(self.tmp, "eingang"),
                     "AUSWERTUNG_RUHE_S": "0.3", "AUSWERTUNG_SPAETESTENS_S": "5", "AUSWERTUNG_STUENDLICH_S": "3600",
                     "ORDNEN_SKRIPT": "", "VERTRAEGE_FILE": os.path.join(self.tmp, "laib-vertraege.json"),
@@ -98,7 +99,8 @@ class Hook(Basis):
         given = json.loads(Path(self.zaehler + ".env").read_text())
         self.assertEqual(given, {"PAPERLESS_API": "http://127.0.0.1:8000", "PAPERLESS_TOKEN": "pt", "PAPERLESS_AI_LLM_ENDPOINT": "http://127.0.0.1:11435/v1",
                                  "PAPERLESS_AI_LLM_API_KEY": "mk", "PAPERLESS_AI_LLM_MODEL": "household",
-                                 "VERTRAG_ARTEN": "Vertrag, Versicherung, Bescheid", "PAPERLESS_AI_ENABLED": "true"})
+                                 "VERTRAG_TYPEN": "Vertrag, Versicherungsschein", "VERTRAG_ARTEN": "",
+                                 "PAPERLESS_AI_ENABLED": "true"}, "contracts by type: the old VERTRAG_ARTEN (tags too) is not handed on")
 
     def test_only_paperless_with_the_token_starts_a_run(self):
         a = dienst.Auswertung(self.env)

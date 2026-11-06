@@ -125,7 +125,7 @@ class Auswertung:
                "PAPERLESS_AI_ENABLED": "true" if e.get("MODEL_URL") else "false",
                "PAPERLESS_AI_LLM_ENDPOINT": e.get("MODEL_URL", ""), "PAPERLESS_AI_LLM_API_KEY": e.get("MODEL_KEY", ""),
                "PAPERLESS_AI_LLM_MODEL": e.get("MODEL_NAME", ""), "VERTRAEGE_FILE": self.datei}
-        for k in ("VERTRAG_ARTEN", "VERTRAG_VORLAUF_TAGE", "RECHNUNG_ARTEN", "HAUSHALT_URL", "HAUSHALT_TOKEN", "HAUSHALT_NAMEN", "HEUTE"):
+        for k in ("VERTRAG_TYPEN", "VERTRAG_VORLAUF_TAGE", "RECHNUNG_ARTEN", "HAUSHALT_URL", "HAUSHALT_TOKEN", "HAUSHALT_NAMEN", "HEUTE"):
             if e.get(k):
                 env[k] = e[k]
         eingeordnet = self.einordnen(env) if self.ordnen and os.path.exists(self.ordnen) else None
