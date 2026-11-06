@@ -452,6 +452,14 @@ class Medizin(unittest.TestCase):
         self.assertNotIn("Fachrichtung", p["felder"])
         self.assertTrue(any("keine der Fachrichtungen" in w for w in p["weg"]))
 
+    def test_the_quote_may_begin_with_its_heading(self):
+        p = self.plan(answer_medizin(anlass={"wert": "Arterielle Hypertonie", "beleg": "Diagnosen: - Arterielle Hypertonie"},
+                                     medikamente={"wert": "Ramipril 5 mg 1-0-0", "beleg": "Medikation: Ramipril 5 mg 1-0-0"}))
+        self.assertEqual(p["felder"]["Anlass/Diagnose"], "Arterielle Hypertonie")
+        self.assertEqual(p["felder"]["Medikamente"], "Ramipril 5 mg 1-0-0")
+        p = self.plan(answer_medizin(anlass={"wert": "Echo unauffällig", "beleg": "Befund: Echo unauffällig"}))
+        self.assertNotIn("Anlass/Diagnose", p["felder"], "another heading is no diagnosis")
+
     def test_a_diagnosis_only_under_its_heading(self):
         p = self.plan(answer_medizin(anlass={"wert": "Belastungsdyspnoe", "beleg": "Verdacht auf Belastungsdyspnoe"}))
         self.assertNotIn("Anlass/Diagnose", p["felder"], "a finding's words are no diagnosis section")

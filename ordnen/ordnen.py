@@ -423,8 +423,9 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
 
 
 def nach_kopf(text, beleg, kopf, nah):
-    """whether the quoted words stand in a section under a heading `kopf`: after it, within `nah` characters,
-    before the next line that starts with a heading of its own ("Befund:")"""
+    """whether the quoted words stand in a section under a heading `kopf`: from the heading on (the quote may
+    begin with it, "Diagnose: …"), within `nah` characters, before the next line that starts with a heading
+    of its own ("Befund:")"""
     t = re.sub(r"[ \t]+", " ", text).casefold()
     worte = beleg.split()
     if not worte:
@@ -433,7 +434,7 @@ def nach_kopf(text, beleg, kopf, nah):
     for m in re.finditer(kopf, t):
         weiter = re.search(r"\n ?[a-zäöüß][\w äöüß/.-]{1,40}:", t[m.end():])
         ende = m.end() + min(nah, weiter.start() if weiter else nah)
-        if any(m.end() <= s < ende for s in stellen):
+        if any(m.start() <= s < ende for s in stellen):
             return True
     return False
 
