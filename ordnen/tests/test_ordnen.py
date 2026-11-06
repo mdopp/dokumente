@@ -401,6 +401,141 @@ class Neue(unittest.TestCase):
         self.assertEqual(len(asked), 1, "seen once: never asked again")
 
 
+ARZTBRIEF = ("Dr. med. Beispiel, Facharzt für Kardiologie\nPatient: Anna Muster\nDiagnosen:\n- Arterielle Hypertonie\n"
+             "Befund: Echo unauffällig, Verdacht auf Belastungsdyspnoe\nMedikation: Ramipril 5 mg 1-0-0, ASS 100 0-1-0\n")
+PLAN = "Bundeseinheitlicher Medikationsplan\nfür Anna Muster\nWirkstoff Stärke\nMetoprolol 47,5 mg morgens\n"
+
+
+def answer_medizin(**kw):
+    a = {"typ": "Befund", "bereiche": ["Gesundheit"], "sicher": True,
+         "fachrichtung": {"wert": "Kardiologie", "beleg": "Facharzt für Kardiologie"},
+         "anlass": {"wert": "Arterielle Hypertonie", "beleg": "Arterielle Hypertonie"},
+         "medikamente": {"wert": "Ramipril 5mg 1-0-0, ASS 100 0-1-0", "beleg": "Ramipril 5 mg 1-0-0, ASS 100 0-1-0"}}
+    a.update(kw)
+    return a
+
+
+class Medizin(unittest.TestCase):
+    def plan(self, a, content=ARZTBRIEF):
+        doc = {"id": 9, "title": "Arztbrief", "content": content}
+        return ordnen.auswerten(a, doc, list(ordnen.TYPEN) + ["Befund"], ["Anna"], ["Anna Muster"], [])
+
+    def test_the_three_fields_are_made_with_the_specialties(self):
+        f = base()
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna"], log=lambda *_: None)
+        felder = {x["name"]: x for x in f.felder}
+        self.assertEqual([o["label"] for o in felder["Fachrichtung"]["extra_data"]["select_options"]], list(ordnen.FACHRICHTUNGEN))
+        self.assertEqual(felder["Anlass/Diagnose"]["data_type"], "string")
+        self.assertEqual(felder["Medikamente"]["data_type"], "longtext")
+
+    def test_each_value_only_where_the_text_has_it(self):
+        p = self.plan(answer_medizin())
+        self.assertEqual(p["felder"], {"Fachrichtung": "Kardiologie", "Anlass/Diagnose": "Arterielle Hypertonie",
+                                       "Medikamente": "Ramipril 5mg 1-0-0, ASS 100 0-1-0"})
+
+    def test_a_specialty_needs_its_words_and_must_be_one_of_the_list(self):
+        p = self.plan(answer_medizin(fachrichtung={"wert": "Kardiologie", "beleg": "Echo unauffällig"}))
+        self.assertNotIn("Fachrichtung", p["felder"], "an echo is no cardiology practice")
+        p = self.plan(answer_medizin(fachrichtung={"wert": "Herzchirurgie", "beleg": "Facharzt für Kardiologie"}))
+        self.assertNotIn("Fachrichtung", p["felder"])
+        self.assertTrue(any("keine der Fachrichtungen" in w for w in p["weg"]))
+
+    def test_a_diagnosis_only_under_its_heading(self):
+        p = self.plan(answer_medizin(anlass={"wert": "Belastungsdyspnoe", "beleg": "Verdacht auf Belastungsdyspnoe"}))
+        self.assertNotIn("Anlass/Diagnose", p["felder"], "a finding's words are no diagnosis section")
+        p = self.plan(answer_medizin(), content=ARZTBRIEF.replace("Diagnosen:", "Notizen"))
+        self.assertNotIn("Anlass/Diagnose", p["felder"])
+        p = self.plan(answer_medizin(anlass={"wert": "Herzinsuffizienz", "beleg": "Arterielle Hypertonie"}))
+        self.assertNotIn("Anlass/Diagnose", p["felder"], "the value must be the quoted words")
+
+    def test_medicines_from_a_plan_or_a_medication_section_only(self):
+        p = self.plan(answer_medizin(medikamente={"wert": "Metoprolol 47,5 mg", "beleg": "Metoprolol 47,5 mg"}), content=PLAN)
+        self.assertEqual(p["felder"]["Medikamente"], "Metoprolol 47,5 mg")
+        p = self.plan(answer_medizin(), content=ARZTBRIEF.replace("Medikation:", "Früher einmal"))
+        self.assertNotIn("Medikamente", p["felder"])
+        p = self.plan(answer_medizin(medikamente={"wert": "Bisoprolol", "beleg": "Ramipril 5 mg 1-0-0"}))
+        self.assertNotIn("Medikamente", p["felder"])
+
+    def test_no_medical_field_on_a_document_that_is_not_medical(self):
+        f = base([{"id": 1, "title": "x", "content": ARZTBRIEF, "tags": []}])
+        o = ordnen.Ordnung(f)
+        ordnen.struktur(o, ["Anna"], log=lambda *_: None)
+        body, was = ordnen.neue_werte(f.docs[1], {"bereiche": ["Haus"], "felder": {"Medikamente": "ASS 100"}}, o, {})
+        self.assertNotIn("Medikamente", was)
+        body, was = ordnen.neue_werte(f.docs[1], {"bereiche": ["Gesundheit"], "felder": {"Medikamente": "ASS 100"}}, o, {})
+        self.assertEqual(was["Medikamente"], "ASS 100")
+
+    def test_a_practice_has_one_specialty_decided_once(self):
+        f = base([{"id": 1, "correspondent": 7, "tags": [3]}, {"id": 2, "correspondent": 7, "tags": [3]},
+                  {"id": 3, "correspondent": 8, "tags": [3]}], korr=[{"id": 7, "name": "Praxis A"}, {"id": 8, "name": "Praxis B"}])
+        o = ordnen.Ordnung(f)
+        ordnen.struktur(o, ["Anna"], log=lambda *_: None)
+        fid, opts = o.feld("Fachrichtung")["id"], ordnen.optionen_von(o, "Fachrichtung")
+        fach = {}
+        _, was = ordnen.neue_werte(f.docs[1], {"felder": {"Fachrichtung": "Kardiologie"}}, o, fach)
+        self.assertEqual(was["Fachrichtung"], "Kardiologie")
+        _, was = ordnen.neue_werte(f.docs[2], {"felder": {"Fachrichtung": "Labor"}}, o, fach)
+        self.assertEqual(was["Fachrichtung"], "Kardiologie", "the same practice, the same specialty")
+        _, was = ordnen.neue_werte(f.docs[2], {"felder": {}}, o, fach)
+        self.assertEqual(was["Fachrichtung"], "Kardiologie", "decided: no new evidence needed")
+        f.docs[3]["custom_fields"] = [{"field": fid, "value": opts["HNO"]}]
+        self.assertEqual(ordnen.fach_lesen(o, list(f.docs.values())), {8: "HNO"}, "one set in Paperless is the practice's")
+
+
+class Felder(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.f = base([{"id": 1, "title": "Stadtwerke - Rechnung", "content": INVOICE, "tags": [1]},
+                       {"id": 2, "title": "Arztbrief", "content": ARZTBRIEF, "tags": [3], "correspondent": 1},
+                       {"id": 3, "title": "Plan", "content": PLAN, "document_type": 2}])
+        ordnen.struktur(ordnen.Ordnung(self.f), ["Anna"], log=lambda *_: None)
+        ordnen.felder_anlegen(ordnen.Ordnung(self.f), [], [])
+        self.f.felder = [x for x in self.f.felder if x["name"] not in ordnen.MEDIZIN_FELDER]   # the box before this change
+        self.f.writes.clear()
+        sha = {i: ordnen.sha(d) for i, d in self.f.docs.items()}
+        Path(self.dir, "ordnen.json").write_text(json.dumps({"antworten": {
+            str(i): {"sha": sha[i], "antwort": {"typ": "Brief", "bereiche": ["Haus"], "sicher": True}} for i in (1, 2, 3)}}))
+        self.asked = []
+
+    def ask(self, m):
+        self.asked.append(m[1]["content"])
+        if "Medikationsplan" in m[1]["content"]:
+            return answer_medizin(fachrichtung=None, anlass=None,
+                                  medikamente={"wert": "Metoprolol 47,5 mg", "beleg": "Metoprolol 47,5 mg"})
+        return answer_medizin()
+
+    def test_dry_run_asks_again_for_medical_documents_only_and_changes_nothing(self):
+        text = ordnen.felder(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(self.f.writes, [])
+        self.assertEqual(len(self.asked), 2, "the invoice is not asked again")
+        self.assertIn("Medizinische Dokumente: 2", text)
+        self.assertIn("  1  Fachrichtung", text)
+        self.assertIn("  2  Medikamente", text)
+        self.assertNotIn("Ramipril", Path(self.dir, "zusammenfassung-felder.txt").read_text(), "counts only")
+
+    def test_apply_backs_up_first_and_sets_only_the_medical_fields(self):
+        ordnen.felder(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
+        n = len(self.asked)
+        before = copy.deepcopy(self.f.docs)
+        ordnen.felder(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(len(self.asked), n, "the dry run's answers are used")
+        self.assertEqual(len(list(Path(self.dir).glob("sicherung-*.json"))), 1)
+        o = ordnen.Ordnung(self.f)
+        for i, d in self.f.docs.items():
+            for k in ("document_type", "correspondent", "tags", "title"):
+                self.assertEqual(d.get(k), before[i].get(k))
+        self.assertEqual(self.f.docs[1]["custom_fields"], [])
+        werte = {c["field"]: c["value"] for c in self.f.docs[2]["custom_fields"]}
+        self.assertEqual(werte[o.feld("Fachrichtung")["id"]], ordnen.optionen_von(o, "Fachrichtung")["Kardiologie"])
+        self.assertEqual(werte[o.feld("Anlass/Diagnose")["id"]], "Arterielle Hypertonie")
+        self.assertEqual({c["field"]: c["value"] for c in self.f.docs[3]["custom_fields"]}[o.feld("Medikamente")["id"]], "Metoprolol 47,5 mg")
+        self.assertFalse(self.f.notes)
+        before = len(self.f.writes)
+        ordnen.felder(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(len(self.asked), n)
+        self.assertEqual([w for w in self.f.writes[before:] if w[1] != "/api/documents/"], [], "a second run sets nothing")
+
+
 class Kommando(unittest.TestCase):
     def test_paperless_away_in_intake_is_no_failure(self):
         d = tempfile.mkdtemp()

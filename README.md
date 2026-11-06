@@ -11,7 +11,8 @@ and invoices get their fields read and their notice and due dates reminded.
   (frozen at laib 8236b19).
 - `ordnen/` — the household's order in Paperless (decided 2026-11-05): document
   types, Bereich tags, the fields Person, Produkte, Kundennummer,
-  Versicherungsnummer, Garantie bis, Steuerjahr, a saved view per Bereich and
+  Versicherungsnummer, Garantie bis, Steuerjahr, and for medical documents
+  Fachrichtung, Anlass/Diagnose, Medikamente; a saved view per Bereich and
   per person; each document's type, Bereich, sender, person and fields read
   by the household model. See below.
 - `vertraege/` — contracts and invoices: their fields from the text, notice
@@ -170,6 +171,18 @@ touched, an emptied one is deleted), the new fields and the views.
   correspondent and fields back. The views go on the owner's dashboard and
   sidebar through Paperless' own `manage.py shell` (a user's display settings
   are only that user's through the API).
+- **The medical fields** (Fachrichtung, Anlass/Diagnose, Medikamente; since
+  Paperless took over from Gesundheit) go only on a medical document (the
+  Bereich Gesundheit or a medical type), each only from the place the text
+  has it: the practice's specialty from its letterhead or stamp, a diagnosis
+  from a „Diagnose:“ section and its kin, medicines from a prescription, a
+  Medikationsplan or a „Medikation:“ section. One practice, one specialty:
+  the first its documents back, or one set in Paperless, is the practice's.
+  For the documents there already are: `python3 ordnen.py felder --dry-run
+  --hintergrund`, then without `--dry-run`, in Paperless' container as above;
+  it asks the model again for medical documents only, sets nothing but these
+  three fields where empty, backs up first and writes counts to
+  `zusammenfassung-felder.txt`.
 - **On every run after Paperless' hook** (`dienst.py`): `ordnen.py --neue`
   before the contract helper, with Dokumente's token: the newest documents
   without a Bereich it has not seen, at most 10; it uses the order as it is
