@@ -1,7 +1,7 @@
 """dienst.py: Paperless' hook starts the contract helper once a stack has
 arrived, the hourly run catches what a hook missed, the helper's messages
 become files for laib-notify, and the status says what the last run did."""
-import json, os, sys, tempfile, threading, time, unittest, urllib.error, urllib.request
+import json, os, re, sys, tempfile, threading, time, unittest, urllib.error, urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,7 +53,7 @@ class Basis(unittest.TestCase):
                     "VERTRAEGE_SKRIPT": skript,
                     "DOKUMENTE_DATA": self.tmp, "MELDUNGEN": os.path.join(self.tmp, "eingang"),
                     "AUSWERTUNG_RUHE_S": "0.3", "AUSWERTUNG_SPAETESTENS_S": "5", "AUSWERTUNG_STUENDLICH_S": "3600",
-                    "ORDNEN_SKRIPT": "", "VERTRAEGE_FILE": os.path.join(self.tmp, "laib-vertraege.json"),
+                    "ORDNEN_SKRIPT": "", "DOPPELT_SKRIPT": "", "VERTRAEGE_FILE": os.path.join(self.tmp, "laib-vertraege.json"),
                     }
         scan.AUSWERTUNG.clear()
 
@@ -213,3 +213,129 @@ class Absender(Basis):
         self.assertIn("„Erika Mustermann“, „Familie Mustermann“", f["detail"])
         self.assertIn("Korrespondenten", f["fix"])
         self.assertTrue(os.path.exists(rec))
+
+
+# a stand-in for ordnen.py --neue that cannot do its work, as the real one says it (dokumente, 2026-11-08)
+HAENGT = r'''
+import json
+print("ordnen: die Ordnung ist in Paperless noch nicht eingerichtet")
+print("hängt " + json.dumps({"was": "einrichtung", "detail": "Neue Dokumente werden nicht eingeordnet: Bereich-Tag „Gesundheit“ ist für Dokumente in Paperless nicht sichtbar", "fix": "In Paperless nachsehen", "einzelheiten": ""}, ensure_ascii=False))
+'''
+
+# a stand-in for doppelt.py --neue: says how it was called, one partial scan to the trash, one pair marked
+DOPPELT = r'''
+import json, sys
+open(%r, "w").write(json.dumps(sys.argv[1:]))
+print("doppelt: #438 steckt ganz in #405")
+print("doppelt " + json.dumps({"zusammengefuehrt": 1, "pruefen": 1}))
+'''
+
+# laib's proposal.Technical (internal/proposal/plain.go): a status finding's detail that matches is not what the family reads
+TECHNISCH = re.compile(r"\blaib [a-z]|\b[\w@-]+\.(service|timer|socket|container)\b|\bexit (status )?\d|dial tcp|connection refused|"
+                       r"no such|deadline exceeded|\b(Get|Post) \"|\b(failed|not found|unknown|cannot|refused|invalid|error)\b|"
+                       r"\b\w+\.ya?ml\b|(^|\s)--[a-z]|\{\"")
+
+
+class Haengt(Basis):
+    """„Es muss auf jeden Fall auffallen“: a step that cannot do its work is a finding, yellow, red if it lasts"""
+
+    def finding(self, st, was):
+        return next((f for f in st.get("findings") or [] if f.get("topic") == "dokumente-" + was), None)
+
+    def test_ordnen_not_set_up_is_a_finding_that_names_the_piece_and_turns_red(self):
+        ordnen = os.path.join(self.tmp, "ordnen.py")
+        Path(ordnen).write_text(HAENGT)
+        a = dienst.Auswertung({**self.env, "ORDNEN_SKRIPT": ordnen, "HAENGT_ROT_H": "6"})
+        a.lauf("neue Dokumente")
+        f = self.finding(scan.AUSWERTUNG, "einrichtung")
+        self.assertEqual(f["severity"], "gelb", "what never mends itself is yellow at once")
+        self.assertIn("Bereich-Tag „Gesundheit“ ist für Dokumente in Paperless nicht sichtbar", f["detail"])
+        self.assertEqual(f["fix"], "In Paperless nachsehen")
+        # seven hours later it still hangs: red, for the Operator
+        st = json.loads(Path(self.tmp, "dokumente-haengt.json").read_text())
+        st["einrichtung"]["seit"] -= 7 * 3600
+        Path(self.tmp, "dokumente-haengt.json").write_text(json.dumps(st))
+        a.lauf("stündlich")
+        f = self.finding(scan.AUSWERTUNG, "einrichtung")
+        self.assertEqual(f["severity"], "rot")
+        self.assertIn("(seit ", f["detail"])
+        self.assertTrue(f["fix"].startswith("Das löst sich nicht von selbst; der Operator sollte nachsehen."))
+        # set up by hand: the next run says nothing more
+        Path(ordnen).write_text(ORDNEN % self.zaehler)
+        os.remove(self.zaehler)
+        a.lauf("stündlich")
+        self.assertIsNone(self.finding(scan.AUSWERTUNG, "einrichtung"))
+        self.assertEqual(json.loads(Path(self.tmp, "dokumente-haengt.json").read_text()), {})
+
+    def test_the_finding_reaches_the_status_file_laib_reads(self):
+        ordnen = os.path.join(self.tmp, "ordnen.py")
+        Path(ordnen).write_text(HAENGT)
+        cfg = scan.Config.from_env({})
+        cfg.data = self.tmp
+        d = scan.Dienst(cfg)
+        dienst.Auswertung({**self.env, "ORDNEN_SKRIPT": ordnen}, d).lauf("neue Dokumente")
+        d.zeige()
+        st = json.loads(Path(self.tmp, "laib-status.json").read_text())
+        self.assertEqual(self.finding(st, "einrichtung")["severity"], "gelb")
+
+    def test_a_passing_hitch_is_quiet_until_it_repeats(self):
+        w = dienst.Wache(os.path.join(self.tmp, "w.json"), {})
+        modell = {"modell": {"detail": "Das Hausmodell antwortet nicht", "fix": "warten"}}
+        self.assertEqual(w.lauf(modell, now=1000), [])
+        self.assertEqual(w.lauf(modell, now=1100), [])
+        [f] = w.lauf(modell, now=1200)
+        self.assertEqual(f["severity"], "gelb")
+        [f] = w.lauf(modell, now=1000 + 6 * 3600)
+        self.assertEqual(f["severity"], "rot")
+        self.assertEqual(w.lauf({}, now=1000 + 7 * 3600), [])
+        self.assertEqual(w.lauf(modell, now=1000 + 8 * 3600), [], "over once: counted afresh")
+
+    def test_the_helper_failing_runs_in_a_row_is_a_finding(self):
+        Path(self.zaehler + ".exit").touch()
+        a = dienst.Auswertung(self.env)
+        for _ in range(3):
+            a.lauf("stündlich")
+        f = self.finding(scan.AUSWERTUNG, "vertraege-abbruch")
+        self.assertEqual(f["severity"], "gelb")
+        self.assertIn("vertraege: lief", f["einzelheiten"])
+
+    def test_without_a_token_it_is_a_finding(self):
+        a = dienst.Auswertung({**self.env, "PAPERLESS_TOKEN": ""})
+        a.schleife()
+        self.assertEqual(scan.AUSWERTUNG["findings"][0]["severity"], "gelb")
+
+    def test_the_family_reads_plain_words(self):
+        """laib's Say takes a status finding's detail as it is only when it is not technical"""
+        p = {}
+        dienst.vertraege_probleme({"modell_weg": True, "fehlt": "Vertragsfelder fehlen"}, 1, ["HTTP Error 401: Unauthorized"], False, p)
+        dienst.vertraege_probleme({}, 1, ["Traceback"], True, p)
+        fs = dienst.Wache(os.path.join(self.tmp, "w.json"), {"HAENGT_GELB_LAEUFE": "1"}).lauf(p)
+        self.assertEqual(len(fs), 4)
+        for f in fs:
+            self.assertFalse(TECHNISCH.search(f["detail"]), f["detail"])
+        self.assertTrue(TECHNISCH.search("Paperless: connection refused"), "the pattern is laib's and can match")
+
+
+class Doppelt(Basis):
+    def doppelt(self):
+        skript = os.path.join(self.tmp, "doppelt.py")
+        Path(skript).write_text(DOPPELT % os.path.join(self.tmp, "doppelt-argv"))
+        return skript
+
+    def argv(self):
+        return json.loads(Path(self.tmp, "doppelt-argv").read_text())
+
+    def test_duplicates_go_first_and_the_family_reads_how_many(self):
+        a = dienst.Auswertung({**self.env, "DOPPELT_SKRIPT": self.doppelt()})
+        a.lauf("neue Dokumente")
+        self.assertEqual(self.argv(), ["--neue"])
+        self.assertEqual(scan.AUSWERTUNG["lauf"]["doppelt_zusammengefuehrt"], 1)
+        self.assertIn("1 doppelt gescanntes Dokument zusammengeführt.", scan.AUSWERTUNG["detail"])
+        self.assertIn("1 Dokument vielleicht doppelt gescannt, zum Prüfen markiert.", scan.AUSWERTUNG["detail"])
+
+    def test_probe_is_a_dry_run_and_aus_is_off(self):
+        dienst.Auswertung({**self.env, "DOPPELT_SKRIPT": self.doppelt(), "DOPPELT": "probe"}).lauf("stündlich")
+        self.assertEqual(self.argv(), ["--neue", "--dry-run"])
+        os.remove(os.path.join(self.tmp, "doppelt-argv"))
+        dienst.Auswertung({**self.env, "DOPPELT_SKRIPT": self.doppelt(), "DOPPELT": "aus"}).lauf("stündlich")
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "doppelt-argv")))
