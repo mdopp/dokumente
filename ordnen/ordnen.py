@@ -35,9 +35,25 @@ field's shape; only empty things are filled, what someone set stays. A
 document the model is unsure of, or whose type or Bereich it cannot say, gets
 `prüfen` and a note why. Nothing is invented and no document is deleted.
 
+A contract type (VERTRAG_TYPEN: Vertrag, Versicherungsschein) is only the
+contract or policy itself and its amendments (Nachtrag, Vertragsänderung). A
+periodic statement — Wert- or Standmitteilung, Statusreport, Kontoauszug,
+Jahresmitteilung, Beitragsinformation in its title or first lines (STAND) —
+is never one, whatever the model says: it is a Kontoauszug (a
+Beitragsinformation a Beitrag/Bescheid), and the note says so (2026-11-08).
+
+A machine-made title (still the name of the file Paperless took, and filed
+by Dokumente or naming its correspondent; a title a person changed is never
+touched) is written „JJJJ-MM-TT Absender - Gegenstand“ when something is
+wrong with it: the date as the text has it (the model's, else Paperless'
+created, JJJJ-MM when the text names only „Dezember 2007“, none when the
+text names neither), no consume folder's „(n)“, never the bare „Dokument“
+(the model's gegenstand, else the statement's heading line, else the type).
+berichtigen.py puts right what was filed before.
+
 Commands (stdlib only; Paperless' API with PAPERLESS_TOKEN, else the admin's
 PAPERLESS_ADMIN_USER / PAPERLESS_ADMIN_PASSWORD; the model as vertraege.py
-asks it, PAPERLESS_AI_LLM_*):
+asks it, PAPERLESS_AI_LLM_*, else the scan's MODEL_URL, MODEL_KEY, MODEL_NAME):
 
   ordnen.py [--dry-run] [--personen "Michael,Carola"] [--eigentuemer mdopp]
             [--max N] [--zeit S] [--hintergrund]
@@ -48,16 +64,18 @@ asks it, PAPERLESS_AI_LLM_*):
       the real run asks again only for a changed text) and writes plan.json
       and zusammenfassung.txt. Needs an administrator: it makes types, fields,
       correspondents and views.
-  ordnen.py --neue [--max N]
+  ordnen.py --neue [--max N] [--zeit S] [--hintergrund]
       intake (dienst.py's run after Paperless' hook): documents without a
-      Bereich that this record has not seen, newest first, at most N. Uses
+      Bereich that this record has not seen, newest first, at most N
+      (PRO_LAUF); --max 0 is all of them, read and filed PRO_LAUF at a time
+      until --zeit is up or the model is away (the next run goes on). Uses
       the order as it is, makes nothing but a correspondent where Paperless
       lets it; without the order set up, nothing. What keeps it from its
       work (a piece of the order it does not see, the model away, Paperless
       refusing the token, documents piling up) is a line „hängt {json}“ for
       dienst.py's watch.
   ordnen.py wiederherstellen <sicherung.json> [--dry-run]
-      every document's type, tags, correspondent and fields back as the
+      every document's title, type, tags, correspondent and fields back as the
       backup has them; deleted tags made again, renamed types named back.
   ordnen.py felder [--dry-run] [--max N] [--zeit S] [--hintergrund]
       the medical fields (MEDIZIN_FELDER) for the medical documents there are:
@@ -75,15 +93,17 @@ E = os.environ
 PRUEFEN = "prüfen"
 TYPEN = {   # the set, with what the model is told
     "Rechnung": "eine Rechnung, Abschlags- oder Schlussrechnung, Mahnung, Zahlungsaufforderung",
-    "Vertrag": "ein Vertrag, Auftrag, Angebot, eine Vertragsänderung oder Kündigung",
-    "Versicherungsschein": "ein Versicherungsschein oder Nachtrag zu einer Versicherung",
-    "Beitrag/Bescheid": "ein Beitrags- oder Gebührenbescheid, eine Beitragsrechnung oder -anpassung, ein Bescheid einer Behörde oder Versicherung",
-    "Kontoauszug": "ein Kontoauszug, Depot- oder Jahreskontoauszug",
+    "Vertrag": "der Vertrag selbst, ein Auftrag, Angebot, eine Vertragsänderung oder Kündigung; nie eine regelmäßige Mitteilung zu einem Vertrag",
+    "Versicherungsschein": "der Versicherungsschein (die Police) selbst oder ein Nachtrag dazu; nie eine Wert-, Stand- oder Jahresmitteilung, "
+                           "ein Statusreport, Kontoauszug oder eine Information zu einer Versicherung",
+    "Beitrag/Bescheid": "ein Beitrags- oder Gebührenbescheid, eine Beitragsrechnung, -anpassung oder -information, ein Bescheid einer Behörde",
+    "Kontoauszug": "ein Kontoauszug, Depot- oder Jahreskontoauszug, eine (jährliche) Wert- oder Standmitteilung, ein Statusreport zu einer "
+                   "Versicherung, einem Bausparvertrag oder Depot",
     "Steuer": "Steuererklärung, Steuerbescheid, Lohnsteuerbescheinigung, Belege fürs Finanzamt",
     "Bestellung": "eine Bestellung, Auftrags- oder Bestellbestätigung, ein Lieferschein",
     "Beleg/Garantie": "ein Kassenbon, Zahlungsbeleg, Garantie- oder Gewährleistungsschein, eine Quittung",
     "Urkunde": "eine Urkunde, ein Zeugnis, Ausweis, eine Bescheinigung oder ein Nachweis",
-    "Brief": "ein Brief, eine Information, Auskunft oder Mitteilung, die keine der anderen Arten ist",
+    "Brief": "ein Brief, ein Informationsblatt, eine Auskunft oder Mitteilung, die keine der anderen Arten ist",
 }
 ZUSAMMENLEGEN = {"Beitragsrechnung": "Beitrag/Bescheid", "Auftragsbestätigung": "Bestellung",
                  "Versorgungsurkunde": "Urkunde", "Auskunft": "Brief"}
@@ -167,6 +187,12 @@ FRAGE_STAND = 3     # an answer from before the medical fields (or before their 
 ZEICHEN = 8000      # of a document's text for the model: who, what and which year stand on the first pages
 PRO_LAUF = 10       # documents an intake run reads: the household model is shared
 STAU_H = int(E.get("ORDNEN_STAU_H") or 24)   # a new document still without a Bereich after this long is a finding
+# a periodic statement (2026-11-08: a fund policy's yearly Wertmitteilung typed Versicherungsschein became a contract):
+# words of its heading (its title, else its first STAND_KOPF characters, folded) → the type it is; where the policy or an amendment
+# is named first (VERTRAG_KOPF: „Versicherungsschein Nr. …“, „Nachtrag zum …“), it stays a contract
+STAND = [(r"beitragsinformation", "Beitrag/Bescheid"), (r"wert ?(stands?)?mitteilung|standsmitteilung|standmitteilung|statusreport|"
+          r"kontoauszug|depotauszug|jahresmitteilung|jahresinformation|anteilmaessigen stand|stand ihres \w*vertrag", "Kontoauszug")]
+STAND_KOPF, VERTRAG_KOPF = 600, r"nachtrag|vertragsaenderung|aenderungsvertrag|versicherungsschein"
 
 
 def falten(s):
@@ -225,6 +251,67 @@ def datum(v):
         return None
 
 
+def stand(doc):
+    """the type a periodic statement is, by its heading's words (STAND); None for anything else"""
+    for kopf in (falten(doc.get("title")), falten((doc.get("content") or "")[:STAND_KOPF])):
+        st = min(((m.start(), t) for w, t in STAND for m in [re.search(w, kopf)] if m), default=None)
+        v = re.search(VERTRAG_KOPF, kopf)
+        if st or v:
+            return st[1] if st and not (v and v.start() < st[0]) else None
+    return None
+
+
+def monate(s):
+    """the months a text names: Dezember 2007, 12/2007, 12.2007"""
+    namen = "januar februar maerz april mai juni juli august september oktober november dezember".split()
+    out = {(int(y), namen.index(m) + 1) for m, y in re.findall(r"\b(%s)\s+(\d{4})\b" % "|".join(namen), falten(s))}
+    return out | {(int(y), int(m)) for m, y in re.findall(r"\b(\d{1,2})[./](\d{4})\b", s) if 1 <= int(m) <= 12}
+
+
+def titel_datum(text, *kandidaten):
+    """the document's date for its title: the first candidate (the model's, Paperless' created) the text names as
+    a day, JJJJ-MM-TT; else as a month (only „Dezember 2007“), JJJJ-MM; else none"""
+    tage, mon = daten(text), monate(text)
+    for k in kandidaten:
+        k = str(k or "")[:10]
+        d = datum(k)
+        if d and d in tage:
+            return d.isoformat()
+        m = re.fullmatch(r"(\d{4})-(\d{2})(?:-\d{2})?", k)
+        if m and (int(m.group(1)), int(m.group(2))) in mon:
+            return "%s-%s" % m.groups()
+    return ""
+
+
+def titel_neu(doc, absender=None, gegenstand=None, datum_=None, typ=None, stapel=None):
+    """a machine-made title in the form „JJJJ-MM-TT Absender - Gegenstand“, or None to leave it. Machine-made: it is
+    still the name of the file Paperless took (a person who renamed it is never overruled) and Dokumente filed it
+    (its field Stapel, id `stapel`) or it names the document's correspondent as its sender. Rewritten only for what
+    is wrong: no date the text backs, a „(n)“ from the consume folder, the bare word „Dokument“"""
+    t = rest = re.sub(r"\s+", " ", doc.get("title") or "").strip()
+    datei = os.path.splitext(doc.get("original_file_name") or "")[0].strip()
+    if not t or (datei and datei != t):
+        return None
+    mt, mn = re.match(r"(\d{4}-\d{2}(?:-\d{2})?) ", rest), re.search(r" \(\d+\)$", rest)
+    rest = rest[mt.end() if mt else 0:mn.start() if mn else len(rest)]
+    if absender and rest.casefold().startswith(absender.casefold() + " - "):
+        wer, was = rest[:len(absender)], rest[len(absender) + 3:]
+    else:
+        wer, _, was = rest.partition(" - ") if " - " in rest else ("", "", rest)
+    gefiltert = bool(stapel) and any(c["field"] == stapel and c.get("value") for c in doc.get("custom_fields") or [])
+    if not (gefiltert or (wer and absender and passt(wer, [absender]))):
+        return None
+    leer, tag = falten(was) in ("dokument", ""), mt.group(1) if mt else titel_datum(doc.get("content") or "", datum_, doc.get("created"))
+    if not (mn or leer or (tag and not mt)):
+        return None
+    if leer:
+        zeilen = [z.strip() for z in (doc.get("content") or "").splitlines() if any(re.search(w, falten(z)) for w, _ in STAND)]
+        was = gegenstand or next((z for z in zeilen if len(z) <= 80), None) or typ or ""
+    name = " - ".join(x for x in (absender or wer, was.strip()) if x)
+    neu = ("%s %s" % (tag, name)).strip()[:128]
+    return neu if neu != t else None
+
+
 class API:
     def __init__(self, base, token="", user="", password=""):
         self.base = base.rstrip("/")
@@ -248,12 +335,13 @@ class API:
 
 def modell(messages):
     """the household model through the lease's proxy, as background work; its JSON answer"""
-    url = E.get("PAPERLESS_AI_LLM_ENDPOINT", "").rstrip("/") + "/chat/completions"
-    body = {"model": E.get("PAPERLESS_AI_LLM_MODEL", ""), "messages": messages, "temperature": 0.1, "max_tokens": 1500,
+    # inside Paperless its PAPERLESS_AI_LLM_*; started by hand in Dokumente's container, the scan's MODEL_*
+    url = (E.get("PAPERLESS_AI_LLM_ENDPOINT") or E.get("MODEL_URL", "")).rstrip("/") + "/chat/completions"
+    body = {"model": E.get("PAPERLESS_AI_LLM_MODEL") or E.get("MODEL_NAME", ""), "messages": messages, "temperature": 0.1, "max_tokens": 1500,
             "response_format": {"type": "json_object"}, "chat_template_kwargs": {"enable_thinking": False}}
     r = urllib.request.Request(url, method="POST", data=json.dumps(body).encode(),
                                headers={"Content-Type": "application/json", "X-Laib-Background": "dokumente",
-                                        "Authorization": "Bearer " + E.get("PAPERLESS_AI_LLM_API_KEY", "")})
+                                        "Authorization": "Bearer " + (E.get("PAPERLESS_AI_LLM_API_KEY") or E.get("MODEL_KEY", ""))})
     with urllib.request.urlopen(r, timeout=600) as resp:
         content = json.loads(resp.read())["choices"][0]["message"].get("content") or ""
     m = re.search(r"\{.*\}", content, re.S)
@@ -270,7 +358,8 @@ def frage(doc, typen, personen, haushalt, korrespondenten):
               "\"versicherungsnummer\": {…} oder null, \"kundennummer\": {…} oder null, \"produkte\": {…} oder null, "
               "\"garantie_bis\": {…} oder null, \"steuerjahr\": {…} oder null, "
               "\"fachrichtung\": {\"wert\": eine der Fachrichtungen, \"beleg\": …} oder null, \"anlass\": {\"wert\": …, \"beleg\": …} oder null, "
-              "\"medikamente\": {\"wert\": …, \"beleg\": …} oder null, \"sicher\": true oder false}.\n"
+              "\"medikamente\": {\"wert\": …, \"beleg\": …} oder null, \"datum\": {…} oder null, \"gegenstand\": {…} oder null, "
+              "\"sicher\": true oder false}.\n"
               "Jeder Wert außer typ, bereiche und sicher ist ein Objekt {\"wert\": …, \"beleg\": …}, nie eine bloße Zeichenkette. "
               "beleg ist immer wörtlich der Ausschnitt des Textes, auf dem der Wert steht. Steht etwas nicht im Text, dann null. "
               "Rate nie, rechne nichts aus. absender ist die Firma, Behörde, Praxis oder Person, die das Dokument schickt oder ausstellt "
@@ -280,6 +369,10 @@ def frage(doc, typen, personen, haushalt, korrespondenten):
               "kundennummer: Kunden-, Mitglieds- oder Vertragskontonummer. produkte: die Produkte, Tarife oder Leistungen, um die es geht, "
               "kurz, mit Komma getrennt (z. B. \"Glasfaser 250, Festnetz\"). garantie_bis: JJJJ-MM-TT, nur wenn der Text das Ende einer "
               "Garantie nennt. steuerjahr: das Jahr, für das eine Steuer gilt, als Zahl, nur bei Steuerunterlagen. "
+              "datum: das Datum des Schreibens als JJJJ-MM-TT, als JJJJ-MM, wenn nur Monat und Jahr dastehen (\"Dezember 2007\"). "
+              "gegenstand: worum es geht, kurz und deutsch, ohne Absender und Datum (z. B. \"Jährliche Wertmitteilung Fondspolice\"), "
+              "nie nur \"Dokument\". Eine Wert- oder Standmitteilung, ein Statusreport oder eine Information zu einem Vertrag ist "
+              "kein Vertrag und kein Versicherungsschein. "
               "Nur bei medizinischen Unterlagen: fachrichtung ist eine der Fachrichtungen der Praxis, Klinik oder des Labors, das "
               "das Dokument ausstellt, nur wenn der Text sie nennt (Briefkopf, Stempel: \"Facharzt für Kardiologie\", "
               "\"Laborarztpraxis\"), nie aus dem Inhalt geschlossen. anlass ist die Diagnose oder der Anlass, kurz und wörtlich, "
@@ -349,6 +442,9 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
     out = {"typ": None, "bereiche": [], "absender": None, "person": None, "felder": {}, "pruefen": [], "weg": []}
     typ = a.get("typ")
     typ = next((t for t in typen if isinstance(typ, str) and falten(t) == falten(typ)), None)
+    if typ and typ in vertrag_typen() and stand(doc) in typen:
+        out["weg"].append("Art %s (eine regelmäßige Mitteilung, kein Vertrag: %s)" % (typ, stand(doc)))
+        typ = stand(doc)
     if typ:
         out["typ"] = typ
     else:
@@ -423,7 +519,19 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
         else:
             out["weg"].append("Steuerjahr %r (steht so nicht im Text)" % v["wert"])
     medizin_auswerten(a, text, out)
+    v, g = a.get("datum"), a.get("gegenstand")
+    if isinstance(v, dict) and belegt(v, text):
+        out["datum"] = titel_datum(belegt(v, text), v.get("wert")) or None
+    if isinstance(g, dict) and isinstance(g.get("wert"), str) and falten(g["wert"]) not in ("", "dokument"):
+        worte = set(falten(text).split())   # a subject in the text's own words, never one made up
+        out["gegenstand"] = kuerzen(re.sub(r"\s+", " ", g["wert"]).strip(), 80) if all(
+            w in worte for w in falten(g["wert"]).split() if len(w) >= 4) else None
     return out
+
+
+def vertrag_typen():
+    """the types that make a contract (vertraege.py's VERTRAG_TYPEN)"""
+    return [a.strip() for a in (E.get("VERTRAG_TYPEN") or "Vertrag, Versicherungsschein").split(",") if a.strip()]
 
 
 def nach_kopf(text, beleg, kopf, nah):
@@ -890,16 +998,16 @@ def wiederherstellen(api, path, dry=False, log=print):
             if not dry:
                 api("PATCH", "/api/document_types/%d/" % t["id"], {"name": t["name"]})
     felder = {f["id"] for f in api.all("/api/custom_fields/")}
-    jetzt = {d["id"]: d for d in api.all("/api/documents/?fields=id,document_type,correspondent,tags,custom_fields")}
+    jetzt = {d["id"]: d for d in api.all("/api/documents/?fields=id,title,document_type,correspondent,tags,custom_fields")}
     n = 0
     for d in s["dokumente"]:
         cur = jetzt.get(d["id"])
         if cur is None:
             continue
-        body = {"document_type": d.get("document_type"), "correspondent": d.get("correspondent"),
+        body = {"document_type": d.get("document_type"), "correspondent": d.get("correspondent"), **({"title": d["title"]} if d.get("title") else {}),
                 "tags": [tag_id.get(t, t) for t in d.get("tags") or []],
                 "custom_fields": [{"field": c["field"], "value": c.get("value")} for c in d.get("custom_fields") or [] if c["field"] in felder]}
-        if (cur.get("document_type"), cur.get("correspondent"), sorted(cur.get("tags") or []),
+        if body.get("title", cur.get("title")) == cur.get("title") and (cur.get("document_type"), cur.get("correspondent"), sorted(cur.get("tags") or []),
                 sorted((c["field"], json.dumps(c.get("value"))) for c in cur.get("custom_fields") or [])) == (
                 body["document_type"], body["correspondent"], sorted(body["tags"]),
                 sorted((c["field"], json.dumps(c["value"])) for c in body["custom_fields"])):
@@ -1093,9 +1201,20 @@ def neue(api, ordner, args, log=print, ask=modell):
     seen = rec.setdefault("gesehen", {})
     ohne = [d for d in api.all("/api/documents/?fields=id,title,content,document_type,correspondent,tags,custom_fields,added&ordering=-added")
             if str(d["id"]) not in seen and not bt & set(d.get("tags") or [])]
-    docs = ohne[:args.max or PRO_LAUF]
-    haushalt = haushalt_namen(api, personen)
-    fragen(api, o, docs, rec, personen, haushalt, time.monotonic() + args.zeit, log, ask, None, lambda: schreiben(rec_path, rec))
+    docs = ohne if args.max == 0 else ohne[:args.max or PRO_LAUF]   # --max 0: all of them, PRO_LAUF at a time
+    haushalt, n, frist = haushalt_namen(api, personen), 0, time.monotonic() + args.zeit
+    erlaubt = erlaubte_typen(o)
+    fach = fach_lesen(o, api.all("/api/documents/?fields=id,correspondent,custom_fields&custom_fields__id__in=%d" % o.feld("Fachrichtung")["id"])) \
+        if o.feld("Fachrichtung") and docs else {}
+    for i in range(0, len(docs), PRO_LAUF):
+        weiter = fragen(api, o, docs[i:i + PRO_LAUF], rec, personen, haushalt, frist, log, ask, None, lambda: schreiben(rec_path, rec))
+        n += einordnen(api, o, docs[i:i + PRO_LAUF], rec, seen, erlaubt, personen, haushalt, fach, log)
+        rec["lauf"] = {"am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "eingeordnet": n}
+        schreiben(rec_path, rec)
+        if not weiter:
+            break
+    rec["lauf"] = {"am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "eingeordnet": n}
+    schreiben(rec_path, rec)
     if rec.get("modell_weg"):
         haengt("modell", "Das Hausmodell antwortet nicht, neue Dokumente werden nicht eingeordnet",
                "Meist ist es nur eine Weile belegt, der nächste Lauf fragt wieder. Hält es an, die Leihe des Modells prüfen "
@@ -1106,10 +1225,12 @@ def neue(api, ordner, args, log=print, ask=modell):
                len(stau), "" if len(stau) == 1 else "e", "t" if len(stau) == 1 else "n", STAU_H),
                "Antwortet das Hausmodell, holt Dokumente %d je Lauf auf; geht die Zahl über Stunden nicht zurück, sollte der "
                "Operator nachsehen, warum nichts eingeordnet wird." % PRO_LAUF)
+    return 0
+
+
+def einordnen(api, o, docs, rec, seen, erlaubt, personen, haushalt, fach, log):
+    """the answered ones of docs into Paperless, each as it is now; how many changed"""
     n = 0
-    erlaubt = erlaubte_typen(o)
-    fach = fach_lesen(o, api.all("/api/documents/?fields=id,correspondent,custom_fields&custom_fields__id__in=%d" % o.feld("Fachrichtung")["id"])) \
-        if o.feld("Fachrichtung") and docs else {}
     for d in docs:
         a = rec["antworten"].get(str(d["id"]))
         if not a or a.get("sha") != sha(d):
@@ -1117,15 +1238,24 @@ def neue(api, ordner, args, log=print, ask=modell):
         frisch = api("GET", "/api/documents/%d/" % d["id"])   # the family or Gesundheit may have set something since
         plan = auswerten(a["antwort"], d, erlaubt, personen, haushalt, [c["name"] for c in o.korr])
         body, was = neue_werte(frisch, plan, o, fach)
+        titel = titel_fuer(frisch, body, plan, o)
+        if titel:   # the answer stays this document's: the title is part of what was asked
+            body["title"] = was["titel"] = titel
+            a["sha"] = sha({**d, "title": titel})
         if body:
             api("PATCH", "/api/documents/%d/" % d["id"], body)
             n += 1
             notiz(api, d["id"], was, plan)
             log("ordnen: %s (%d): %s" % (d.get("title"), d["id"], ", ".join(sorted(was))))
         seen[str(d["id"])] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    rec["lauf"] = {"am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "eingeordnet": n}
-    schreiben(rec_path, rec)
-    return 0
+    return n
+
+
+def titel_fuer(doc, body, plan, o):
+    """titel_neu for doc as body leaves it: its correspondent's and type's names, the model's date and subject"""
+    kid, tid = body.get("correspondent", doc.get("correspondent")), body.get("document_type", doc.get("document_type"))
+    return titel_neu(doc, name_von(o.korr, kid), (plan or {}).get("gegenstand"), (plan or {}).get("datum"), name_von(o.typen, tid),
+                     (o.feld("Stapel") or {}).get("id"))
 
 
 def fehlende_ordnung(o):

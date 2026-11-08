@@ -301,6 +301,23 @@ class Vertraege(Lauf):
         self.assertEqual(p.value(1, F["Vertragsnummer"]), "SW-12345")
         self.assertIsNone(p.value(2, F["Vertragsnummer"]))
 
+    def test_a_periodic_statement_is_no_contract_whatever_its_type(self):
+        # 2026-11-08: a fund policy's yearly statements typed Versicherungsschein got Vertragsbeginn, -ende, Betrag
+        wert = "Beispiel Leben AG\nJährliche Wertmitteilung über Ihre Fondspolice\nVersicherungsbeginn 01.12.2002, Ablauf 30.11.2039\n" + TEXT
+        stand = ("Beispiel Leben AG\nMitteilung zur Fondsgebundenen Lebensversicherung\nÜbersicht über den wert- und anteilmäßigen "
+                 "Stand Ihres Lebensversicherungsvertrages zum 05.12.2007\n" + TEXT)
+        nachtrag = "Beispiel Leben AG\nNachtrag zum Versicherungsschein\nab der nächsten Wertmitteilung gilt\n" + TEXT
+        p = Paperless([vertrag(1, typ=3, title="Beispiel - Dokument", text=wert), vertrag(2, typ=3, title="Mitteilung", text=stand),
+                       vertrag(3, typ=3, title="Nachtrag", text=nachtrag)])
+        m = Model(ANSWER)
+        r = self.run_job(p, m)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIsNone(p.value(1, F["Vertragsbeginn"]), "a Wertmitteilung is no contract")
+        self.assertIsNone(p.value(2, F["Betrag"]), "a Standmitteilung is no contract")
+        self.assertEqual(p.value(3, F["Vertragsnummer"]), "SW-12345", "a Nachtrag is the contract's amendment")
+        self.assertEqual(len(m.asks), 1)
+        self.assertIn("eine regelmäßige Mitteilung, kein Vertrag", r.stdout)
+
     def test_model_away_changes_nothing_and_the_next_run_asks_again(self):
         p = Paperless([vertrag()])
         m = Model(ANSWER, code=409)

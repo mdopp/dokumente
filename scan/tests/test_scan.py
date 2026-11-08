@@ -533,6 +533,8 @@ class Trennen(unittest.TestCase):
     def test_names_are_paperless_titles_and_never_collide(self):
         self.assertEqual(scan.dateiname(scan.Dokument([], absender="Mosel", datum="2023-05-01", titel="Rechnung")), "2023-05-01 Mosel - Rechnung")
         self.assertEqual(scan.dateiname(scan.Dokument([], absender="A/B: C", datum="1.5.23", titel="")), "A B C - Dokument")
+        self.assertEqual(scan.dateiname(scan.Dokument([], absender="Skandia", datum="2007-12", titel="Wertmitteilung")),
+                         "2007-12 Skandia - Wertmitteilung", "only „Dezember 2007“: the month")
         with tempfile.TemporaryDirectory() as d:
             open(os.path.join(d, "X.pdf"), "w").close()
             vergeben = set()

@@ -401,8 +401,8 @@ Für jedes Dokument, das du mit neu beginnst:
 - erste_seite: die Nummer der Seite, auf der es beginnt
 - art: Rechnung, Brief, Bescheid, Vertrag, Kontoauszug, Bescheinigung …
 - absender: kurz, z. B. „Stadtwerke“ oder „Finanzamt Osnabrück“
-- datum: das Datum des Schreibens als JJJJ-MM-TT, leer wenn keins zu sehen ist
-- titel: kurz und deutsch, ohne Absender und Datum, z. B. „Rechnung Schornsteinfeger 2023“
+- datum: das Datum des Schreibens als JJJJ-MM-TT, JJJJ-MM wenn nur Monat und Jahr dastehen („Dezember 2007“), leer wenn keins zu sehen ist
+- titel: kurz und deutsch, ohne Absender und Datum, z. B. „Rechnung Schornsteinfeger 2023“ oder „Jährliche Wertmitteilung Fondspolice“, nie nur „Dokument“
 
 Die erste Seite des Auszugs ist immer neu. Antworte nur mit JSON in genau dieser Form:
 {"seiten":[{"seite":1,"neu":true,"leer":false,"absender":"…","grund":"…"}],"dokumente":[{"erste_seite":1,"art":"…","absender":"…","datum":"JJJJ-MM-TT","titel":"…"}]}"""
@@ -413,8 +413,8 @@ BENENNEN = """Du bekommst den OCR-Text eines gescannten Dokuments, Seite für Se
 Bestimme:
 - art: Rechnung, Brief, Bescheid, Vertrag, Kontoauszug, Bescheinigung …
 - absender: kurz, z. B. „Stadtwerke“ oder „Finanzamt Osnabrück“
-- datum: das Datum des Schreibens als JJJJ-MM-TT, leer wenn keins zu sehen ist
-- titel: kurz und deutsch, ohne Absender und Datum, z. B. „Rechnung Schornsteinfeger 2023“
+- datum: das Datum des Schreibens als JJJJ-MM-TT, JJJJ-MM wenn nur Monat und Jahr dastehen („Dezember 2007“), leer wenn keins zu sehen ist
+- titel: kurz und deutsch, ohne Absender und Datum, z. B. „Rechnung Schornsteinfeger 2023“ oder „Jährliche Wertmitteilung Fondspolice“, nie nur „Dokument“
 
 Antworte nur mit JSON in genau dieser Form:
 {"art":"…","absender":"…","datum":"JJJJ-MM-TT","titel":"…"}"""
@@ -810,7 +810,7 @@ def sauber(s, n=60):
 
 def dateiname(d):
     """Paperless' title: "JJJJ-MM-TT Absender - Titel", parts it does not know left out"""
-    datum = d.datum if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.datum or "") else ""
+    datum = d.datum if re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", d.datum or "") else ""   # a month alone: „Dezember 2007“
     absender, titel = sauber(d.absender, 50), sauber(d.titel) or sauber(d.art) or "Dokument"
     name = (absender + " - " + titel) if absender else titel
     return sauber((datum + " " + name).strip(), 120) or "Dokument"
