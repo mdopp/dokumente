@@ -227,7 +227,8 @@ DOPPELT = r'''
 import json, sys
 open(%r, "w").write(json.dumps(sys.argv[1:]))
 print("doppelt: #438 steckt ganz in #405")
-print("doppelt " + json.dumps({"zusammengefuehrt": 1, "pruefen": 1}))
+print("hängt " + json.dumps({"was": "doppelt", "detail": "2 doppelte Scans warten auf dein Löschen: in Paperless den Tag „Doppelt“ öffnen und alle löschen.", "fix": "Jedes nennt das vollständige Dokument.", "einzelheiten": ""}, ensure_ascii=False))
+print("doppelt " + json.dumps({"zusammengefuehrt": 1, "zum_loeschen": 2, "pruefen": 1}))
 '''
 
 # laib's proposal.Technical (internal/proposal/plain.go): a status finding's detail that matches is not what the family reads
@@ -331,7 +332,20 @@ class Doppelt(Basis):
         self.assertEqual(self.argv(), ["--neue"])
         self.assertEqual(scan.AUSWERTUNG["lauf"]["doppelt_zusammengefuehrt"], 1)
         self.assertIn("1 doppelt gescanntes Dokument zusammengeführt.", scan.AUSWERTUNG["detail"])
+        self.assertIn("2 doppelt gescannte Dokumente zum Löschen markiert (Tag „Doppelt“).", scan.AUSWERTUNG["detail"])
         self.assertIn("1 Dokument vielleicht doppelt gescannt, zum Prüfen markiert.", scan.AUSWERTUNG["detail"])
+        [f] = [f for f in scan.AUSWERTUNG["findings"] if f.get("topic") == "dokumente-doppelt"]
+        self.assertEqual(f["severity"], "gelb", "a person's duplicates wait on them: yellow at once")
+        self.assertIn("2 doppelte Scans warten auf dein Löschen", f["detail"])
+
+    def test_duplicates_waiting_on_a_person_never_turn_red(self):
+        w = dienst.Wache(os.path.join(self.tmp, "w.json"), {})
+        p = {"doppelt": {"detail": "3 doppelte Scans warten auf dein Löschen", "fix": "Tag „Doppelt“ öffnen"}}
+        [f] = w.lauf(p, now=1000)
+        self.assertEqual(f["severity"], "gelb")
+        [f] = w.lauf(p, now=1000 + 48 * 3600)
+        self.assertEqual(f["severity"], "gelb", "two days later still the person's, not the Operator's")
+        self.assertEqual(w.lauf({}, now=1000 + 49 * 3600), [], "deleted: over")
 
     def test_probe_is_a_dry_run_and_aus_is_off(self):
         dienst.Auswertung({**self.env, "DOPPELT_SKRIPT": self.doppelt(), "DOPPELT": "probe"}).lauf("stündlich")

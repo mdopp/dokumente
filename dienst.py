@@ -173,7 +173,7 @@ class Auswertung:
             pass
         if eingeordnet:
             lauf = {**lauf, "eingeordnet": eingeordnet}
-        for k in ("zusammengefuehrt", "pruefen"):
+        for k in ("zusammengefuehrt", "zum_loeschen", "pruefen"):
             if doppelt.get(k):
                 lauf = {**lauf, "doppelt_" + k: doppelt[k]}
         dauer = int(time.monotonic() - start)
@@ -272,7 +272,8 @@ class Wache:
     mends itself (a missing piece, a refused token, a pile-up), else from the HAENGT_GELB_LAEUFE-th run in a row;
     red once it lasts HAENGT_ROT_H hours, which reaches the Operator and the owner's red message. The record
     survives a restart, so a restart is no cure."""
-    SOFORT = ("einrichtung", "zugang", "rechte", "loeschen", "stau", "vertraege-einrichtung")
+    SOFORT = ("einrichtung", "zugang", "rechte", "loeschen", "stau", "vertraege-einrichtung", "doppelt")
+    NUR_GELB = ("doppelt",)   # waits on a person (duplicates tagged Doppelt to delete), never the Operator's
 
     def __init__(self, pfad, env):
         self.pfad = pfad
@@ -294,7 +295,7 @@ class Wache:
             n = {"seit": a.get("seit") or now, "laeufe": int(a.get("laeufe") or 0) + 1, "detail": p.get("detail", "")}
             neu[was] = n
             dauer = now - n["seit"]
-            if dauer >= self.rot and n["laeufe"] >= 2:
+            if dauer >= self.rot and n["laeufe"] >= 2 and was not in self.NUR_GELB:
                 sev = "rot"
             elif was in self.SOFORT or n["laeufe"] >= self.gelb:
                 sev = "gelb"
@@ -377,6 +378,9 @@ def satz_lauf(lauf, anlass):
     n = int(lauf.get("doppelt_zusammengefuehrt") or 0)
     if n:   # doppelt.py --neue
         was = "%d doppelt gescannte%s Dokument%s zusammengeführt. " % (n, "s" if n == 1 else "", "" if n == 1 else "e") + was
+    if int(lauf.get("doppelt_zum_loeschen") or 0):   # a person's duplicates: tagged Doppelt, they delete
+        n = int(lauf["doppelt_zum_loeschen"])
+        was += " %d doppelt gescannte%s Dokument%s zum Löschen markiert (Tag „Doppelt“)." % (n, "s" if n == 1 else "", "" if n == 1 else "e")
     if int(lauf.get("doppelt_pruefen") or 0):
         n = int(lauf["doppelt_pruefen"])
         was += " %d Dokument%s vielleicht doppelt gescannt, zum Prüfen markiert." % (n, "" if n == 1 else "e")

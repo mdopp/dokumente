@@ -147,7 +147,7 @@ with the stack's first `scannt`, before the scanner runs), plus
 "lauf": {"am", "vertraege", "rechnungen", "kontakte", "erinnerungen",
 "pruefen", "fehlt"?}, "einzelheiten"? (the last log lines of a failed run),
 "findings"? }` (`lauf` also `eingeordnet`, `doppelt_zusammengefuehrt`,
-`doppelt_pruefen`); its findings (a household correspondent left without
+`doppelt_zum_loeschen`, `doppelt_pruefen`); its findings (a household correspondent left without
 documents, yellow; and the watch's, below) are also in the status's
 top-level `findings`.
 
@@ -167,11 +167,12 @@ so a restart is no cure) and makes each a status finding `{"severity",
 | `zugang`, `rechte`, `paperless` | Paperless refuses the token (401), a step (403), or does not answer | |
 | `modell` | the household model does not answer (ordnen or the helper) | |
 | `stau` | new documents without a Bereich older than `ORDNEN_STAU_H` | how many |
-| `loeschen` | a duplicate found, Dokumente may not trash it | |
+| `loeschen` | a household duplicate found, Dokumente may not trash it (no `delete_document`) | |
+| `doppelt` | a person's duplicates tagged „Doppelt“ wait for them to delete | how many; yellow only, never red: it waits on a person, not the Operator |
 | `vertraege-einrichtung`, `vertraege-abbruch`, `ordnen-abbruch`, `doppelt-abbruch`, `start` | a helper's fields missing, or a helper that breaks off | |
 
 Yellow at once for what never mends itself (`einrichtung`, `zugang`,
-`rechte`, `loeschen`, `stau`, `vertraege-einrichtung`), else from the
+`rechte`, `loeschen`, `doppelt`, `stau`, `vertraege-einrichtung`), else from the
 `HAENGT_GELB_LAEUFE`-th run in a row; red once it lasts `HAENGT_ROT_H` hours,
 its fix then starting „Das löst sich nicht von selbst; der Operator sollte
 nachsehen.“ Laib reads the findings from the status file: `laib status` /
@@ -228,22 +229,36 @@ touched, an emptied one is deleted), the new fields and the views.
 - **Doppelt gescannt** (`doppelt.py`, owner 2026-11-08): Paperless refuses only
   a byte-identical file, so a stack scanned again leaves a letter twice, one
   or both missing pages. Its docstring is the contract. Two documents are
-  compared only when they have the same date (`created`), no two different
-  correspondents and no owner; then page by page (the archive PDF's text per
-  page): a page is the same page when its folded text is 90 % alike and its
-  numbers are the same, so an insurer's letter of another year (same
-  template, other date and amounts) never pairs. One holding every page of
-  the other stays, takes what it lacks (title, type, correspondent, tags,
-  custom fields, notes; only what is empty, never `prüfen`), and the other
-  goes to Paperless' trash (restorable there). Two that start with the same
-  page and each have pages the other lacks become one new document, all
-  pages in order (printed page numbers, else their neighbours; not clear:
-  unsure), uploaded and once filed the household's, both originals trashed.
-  Any other shared page: both get `prüfen` and a note naming the other.
-  Every case is in `/dokumente/ordnen/doppelt.json` (`erledigt`). It needs
+  compared only when they have the same owner (the scanning person, whom
+  Paperless gives the scan, or both the household's), share a date
+  (`created`, the `YYYY-MM-DD` a title begins with, or a date written on the
+  first page: a scan whose date nobody set yet still finds its letter) and
+  have no two different correspondents (one empty, or both names one
+  sender's: ordnen's `ALIASE`, the legal form folded, one the other's
+  beginning, „Allianz Lebensversicherungs-AG“ and „… Aktiengesellschaft“).
+  Then page by page (the archive PDF's text per page): a page is the same
+  page when its folded text is 85 % alike and its numbers are the same, so
+  an insurer's letter of another year (same template, other date and
+  amounts) never pairs. One holding every page of the other stays and takes
+  what it lacks (title, type, correspondent, tags, custom fields, notes; only
+  what is empty, never `prüfen`); the other, when it is the household's,
+  goes to Paperless' trash (restorable there), and when it is a person's
+  (decided 2026-11-08: scans keep their owner, and Paperless lets Dokumente
+  delete only its own) gets the tag `Doppelt` and a note naming the one
+  kept, the kept one a note naming it, and the person deletes them (in
+  Paperless open the tag, delete all); until then every run says how many
+  wait (`doppelt`, yellow). A document tagged `Doppelt` is settled and never
+  compared again. Two that start with the same page and each have pages the
+  other lacks become one new document, all pages in order (printed page
+  numbers, else their neighbours; not clear: unsure), uploaded and once
+  filed whose the two were, both originals trashed or tagged `Doppelt`. Any
+  other shared page: both get `prüfen` and a note naming the other. Every
+  case is in `/dokumente/ordnen/doppelt.json` (`erledigt`). The trash needs
   Paperless' `delete_document` for Dokumente's user (laib's paperless
-  template); without it nothing is uploaded or trashed, the one that would
-  go is marked `prüfen`, and the watch says `loeschen`.
+  template); without it nothing of the household's is uploaded or trashed,
+  the one that would go is marked `prüfen`, and the watch says `loeschen`.
+  A delete Paperless refuses anyway (403) is marked `Doppelt` like a
+  person's, never a broken-off run.
   - On every run after the hook, before `ordnen.py --neue`: documents added
     since its record began, at most `DOPPELT_PRO_LAUF`.
   - Once over the documents there are, in Dokumente's container (its token
