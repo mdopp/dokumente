@@ -10,7 +10,10 @@ Haushalt URL and token come from the unit. The standard library only.
    VERTRAG_TYPEN (default Vertrag, Versicherungsschein; decided 2026-11-06):
    by its type only, never by a tag. A Bereich tag such as „Versicherung“
    orders documents and makes none a contract; VERTRAG_ARTEN, which also
-   counted tags, is no longer read. For each one with an empty contract field (paperless-mail.py's CONTRACT,
+   counted tags, is no longer read. A periodic statement (Wert- or
+   Standmitteilung, Statusreport, Kontoauszug, Jahresmitteilung,
+   Beitragsinformation in its heading; STAND) is none, whatever its type
+   (2026-11-08). For each one with an empty contract field (paperless-mail.py's CONTRACT,
    made by post-deploy) the household model is asked once per text, in German,
    for a JSON object: per field a value and the words of the text it stands on.
    A value is taken only when those words are in the text and it has its
@@ -113,6 +116,22 @@ ZEICHEN = 16000                # of a document's text: a contract's data is on i
 OCR_PRO_LAUF = 3               # documents recognised again a run: OCR is the box's CPU
 PRUEFEN = "prüfen"
 VERTRAG_TYPEN = "Vertrag, Versicherungsschein"   # the document types that make a contract (2026-11-06)
+# a periodic statement is never a contract, whatever its type (2026-11-08: a fund policy's yearly Wertmitteilung typed
+# Versicherungsschein got Vertragsbeginn, -ende and Betrag): the words of its heading, as ordnen.py's stand(); where the
+# policy or an amendment is named first, a contract
+STAND = re.compile(r"beitragsinformation|wert ?(stands?)?mitteilung|standsmitteilung|standmitteilung|statusreport|kontoauszug|"
+                   r"depotauszug|jahresmitteilung|jahresinformation|anteilmaessigen stand|stand ihres \w*vertrag")
+VERTRAG_KOPF = re.compile(r"nachtrag|vertragsaenderung|aenderungsvertrag|versicherungsschein")
+
+
+def regelmaessig(d):
+    """whether a document is a periodic statement by its title, else its first lines"""
+    for teil in (d.get("title") or "", (d.get("content") or "")[:600]):
+        kopf = " ".join(worte(teil.replace(",", " ")))
+        st, v = STAND.search(kopf), VERTRAG_KOPF.search(kopf)
+        if st or v:
+            return bool(st) and not (v and v.start() < st.start())
+    return False
 BEHALTEN = "korrespondent-ok"   # the family's tag: this document's correspondent stays (#737)
 # words before a name that are no part of it; the first three name a family by its surname
 FAMILIE = {"familie", "fam", "eheleute"}
@@ -169,7 +188,7 @@ FORM = {"Firma": lambda v: len(v) <= 128 and re.search(r"[^\W\d_]{2}", v),
 # words just before a number, mail or IBAN that make it the household's own (#820)
 EIGEN = re.compile(r"\bihr(?:e|em|en|er)?\s+(?:konto|iban|bank\w*|telefon\w*|rufnummer\w*|mobil\w*|handy\w*|anschluss\w*|e-?mail\w*)"
                    r"|lastschrift|abgebucht|abbuch|eingezogen|einzug|mandat|kontoinhaber", re.I)
-RECHNUNGSTITEL = re.compile(r"^(?:\d{4}-\d{2}-\d{2}\s+)?(?:.{1,60}?\s-\s)?rechnung\b", re.I)   # scan.py's dateiname
+RECHNUNGSTITEL = re.compile(r"^(?:\d{4}-\d{2}(?:-\d{2})?\s+)?(?:.{1,60}?\s-\s)?rechnung\b", re.I)   # scan.py's dateiname
 GUTSCHRIFT = re.compile(r"gutschrift|guthaben|erstatt|gutgeschrieben|zu ihren gunsten|rückzahlung", re.I)
 MINUS = re.compile(r"(?<![\w.,/])[-−]\s*(?:€|eur)?\s*\d|\d[\d.,]*\s*(?:€|eur)?\s*[-−](?![\w])", re.I)   # never an en dash: a separator
 FREMD = re.compile(r"[$£¥]|\b(?:usd|chf|gbp|dollar|franken|pfund)\b", re.I)
@@ -814,7 +833,10 @@ def main():
     docs = {}
     if typen:   # by type only: a tag makes no contract (2026-11-06)
         for d in api.all("/api/documents/?document_type__id__in=%s" % ",".join(map(str, typen))):
-            docs[d["id"]] = d
+            if regelmaessig(d):
+                print("vertraege: %s (%d): eine regelmäßige Mitteilung, kein Vertrag: nicht gelesen" % (d.get("title"), d["id"]))
+            else:
+                docs[d["id"]] = d
     rechnungen = {}   # #818: by type or tag, or the scan service's art at the title's start
     if not ohne:
         rarten = {a.strip().casefold() for a in E.get("RECHNUNG_ARTEN", "Rechnung").split(",") if a.strip()}

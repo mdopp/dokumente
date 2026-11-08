@@ -26,7 +26,7 @@ is `ghcr.io/mdopp/dokumente`, built on every push to main.
 
 Tests run in the image: `docker build -t dokumente:test -f Containerfile .`
 then `docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3
-dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py`.
+dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_berichtigen.py`.
 
 ## The contract with laib's template
 
@@ -253,6 +253,40 @@ touched, an emptied one is deleted), the new fields and the views.
     `--dry-run` (`--hintergrund` detaches, its log `lauf.log`; `--max N`
     acts on N pairs). A merge it uploads is finished by the next run after
     the hook.
+- **A periodic statement is no contract** (2026-11-08: a fund policy's yearly
+  Wertmitteilung came in as a Versicherungsschein, and vertraege.py filled
+  Vertragsbeginn, -ende and Betrag on each). Vertrag and Versicherungsschein
+  are the contract or policy itself and its amendments (Nachtrag,
+  Vertragsänderung). A document whose title, else first lines, name a Wert-
+  or Standmitteilung, Statusreport, Kontoauszug or Jahresmitteilung before
+  any Versicherungsschein or Nachtrag is a **Kontoauszug** (a
+  Beitragsinformation a Beitrag/Bescheid): the model is told so and ordnen
+  overrules a contract type it still answers (the note says why); vertraege.py
+  never reads one as a contract, whatever its type. Kontoauszug is one of the
+  order's types already, so nothing needs setting up: a value statement of a
+  policy, a Bausparvertrag or a depot is what that type is for, and the
+  Bereich (Versicherung) keeps it beside its policy.
+- **Titles**: a machine-made title (still the name of the file Paperless
+  took, and filed by Dokumente — its field Stapel — or naming its
+  correspondent; one a person changed is never touched) is written
+  „JJJJ-MM-TT Absender - Gegenstand“ when it lacks a date the text backs,
+  carries the consume folder's „(n)“ or is the bare „Dokument“; JJJJ-MM when
+  the text names only „Dezember 2007“, no date when it names neither.
+- **Once, what was filed before** (`berichtigen.py`, its docstring is the
+  contract), in Dokumente's container: `python3 /opt/berichtigen.py
+  --dry-run` writes `/dokumente/ordnen/zusammenfassung-berichtigen.txt` and
+  `plan-berichtigen.json`; then without `--dry-run` (a backup first, which
+  `ordnen.py wiederherstellen` puts back, titles included). It retypes the
+  statements Dokumente typed as a contract, takes off the contract fields
+  vertraege.py's note names on them, fixes machine titles, never asks the
+  model.
+- **All documents without a Bereich at once**, in Dokumente's container:
+  `python3 /opt/ordnen.py --neue --max 0 --zeit 86400 --hintergrund` (log
+  `/dokumente/ordnen/lauf.log`): read and filed 10 at a time until done, the
+  time is up or the model is away; the same command again goes on. ordnen.py
+  takes the scan's `MODEL_*` when Paperless' `PAPERLESS_AI_LLM_*` are not
+  there. One ordnen run at a time (`lauf.lock`): the hook's own run is
+  skipped meanwhile and its documents are in the next one.
 - A sender with two names is one correspondent under the fuller name
   (`ALIASE`: „DRV Bund“ is „Deutsche Rentenversicherung Bund“); a maker of a
   measuring device or of practice or lab software (`GERAETE`) heading a
