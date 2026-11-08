@@ -5,29 +5,42 @@ Paperless refuses only a byte-identical file, so a stack scanned again (the
 feeder took some sheets of the first scan, not all) leaves two documents of
 one letter, one or both missing pages. Doppelt finds them and makes one:
 
-- Candidates: documents with the same date (Paperless' `created`), whose
-  correspondents do not differ, both the household's (no owner). Annual
-  letters of one sender share a template and differ in their dates, so they
-  never pair.
+- Candidates (2026-11-08 on the box: 340 documents, 0 found, although the
+  same invoice stood there twice; the filter was too strict): two documents
+  with the same owner (the scanning person, or both the household's), that
+  share a date (Paperless' `created`, the YYYY-MM-DD a title begins with, or
+  a date written on the first page), and whose correspondents do not differ:
+  one empty, or the names one sender's („Allianz Lebensversicherungs-AG“ and
+  „… Aktiengesellschaft“: the legal form and ordnen's ALIASE folded, one the
+  other's beginning). Annual letters of one sender share a template and
+  differ in their dates and amounts, so they never pair (below).
 - Evidence is page by page: each document's archive PDF read per page
-  (pdftotext); two pages are the same page when their folded texts are 90 %
-  alike and their numbers (dates, amounts, policy numbers) are the same.
-  Pages with hardly any text say nothing either way.
+  (pdftotext); two pages are the same page when their folded texts are 85 %
+  alike (a feeder's second pass reads a letter here and there otherwise) and
+  their numbers (dates, amounts, policy numbers) are the same. Pages with
+  hardly any text say nothing either way.
 - Every page of one is a page of the other: it is contained. The fuller one
-  (the older one when both are whole) stays, takes what it lacks of the
+  (the older one when both are whole) stays and takes what it lacks of the
   other's title, type, correspondent, tags, custom fields and notes (only
-  what is empty; prüfen is not carried), and the other goes to Paperless'
-  trash, from where it can be restored.
+  what is empty; prüfen is not carried). The other:
+  - the household's (no owner): to Paperless' trash, restorable there;
+  - a person's (scans keep the scanning person as owner, decided
+    2026-11-08; Paperless lets Dokumente delete only its own): the tag
+    „Doppelt“ and a note naming the one kept, the kept one a note naming it;
+    the person deletes them (filter by the tag, delete all). Until then every
+    run says so (`hängt doppelt`, yellow, never red).
 - Both start with the same page and each has pages the other lacks: one PDF
   with all pages in order (the one's, the other's slotted in after the page
   they follow) is uploaded with the metadata of both; once Paperless filed
-  it, it is the household's, gets the notes, and the two go to the trash.
+  it, it belongs to whom the two belonged, gets the notes, and the two go to
+  the trash, or get „Doppelt“ when they are a person's.
 - Any other shared page: unsure. Nothing is deleted; both get `prüfen` and a
   note naming the other and why.
 
 Dokumente's Paperless user needs `delete_document` for the trash (laib's
-paperless template). Without it nothing is uploaded or trashed: the one that
-would go gets `prüfen` and a note, and the run says it hangs.
+paperless template). Without it nothing of the household's is uploaded or
+trashed: the one that would go gets `prüfen` and a note, and the run says it
+hangs.
 
 Commands (Paperless' API with PAPERLESS_TOKEN as ordnen.py; the folder as
 ordnen.py, record doppelt.json):
@@ -42,8 +55,9 @@ ordnen.py, record doppelt.json):
       zusammenfassung-doppelt.txt, the list to look at first.
 
 Each line „hängt {json}“ is a step that cannot do its work (dienst.py's
-watch); the last line „doppelt {json}“ counts what was done."""
-import argparse, difflib, hashlib, importlib.util, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+watch); the last line „doppelt {json}“ counts what was done: zusammengefuehrt
+(in the trash or one new document), zum_loeschen (tagged „Doppelt“), pruefen."""
+import argparse, datetime, difflib, hashlib, importlib.util, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 
 
 def _lade_ordnen():
@@ -55,16 +69,22 @@ def _lade_ordnen():
 
 
 ordnen = _lade_ordnen()
-falten, haengt, lesen, schreiben = ordnen.falten, ordnen.haengt, ordnen.lesen, ordnen.schreiben
+falten, haengt, lesen, schreiben, kanonisch = ordnen.falten, ordnen.haengt, ordnen.lesen, ordnen.schreiben, ordnen.kanonisch
 
 E = os.environ
 PRUEFEN = "prüfen"
-AEHNLICH = 0.9      # two pages' folded texts at least this alike …
-ZAHLEN = 0.8        # … and their numbers at least this much the same
+DOPPELT = "Doppelt"  # the tag a person's duplicate gets (ordnen's ARBEIT: it stays); the person deletes by it
+AEHNLICH = 0.85     # two pages' folded texts at least this alike (a second scan's OCR: 0.9–0.98 on the fixtures) …
+ZAHLEN = 0.8        # … and their numbers at least this much the same (a letter of another year: ~0.3)
 WENIG = 40          # a page with fewer folded characters says nothing
+ERSTE_SEITE = 3000  # of a document's text, its first page when the OCR text carries no form feed
 PRO_LAUF = int(E.get("DOPPELT_PRO_LAUF") or 5)
 KANDIDATEN = 6      # documents of one date a new one is compared with
 WARTEN_S = 2 * 3600  # an uploaded merge Paperless has not filed by then is given up
+# words of a legal form: „Allianz Lebensversicherungs-AG“ and „… Aktiengesellschaft“ name one sender
+RECHTSFORM = {"ag", "aktiengesellschaft", "gmbh", "mbh", "co", "kg", "se", "e", "v", "ev", "ohg", "gbr", "ug", "vvag", "ltd", "inc"}
+MONATE = {m: i + 1 for i, m in enumerate(("januar", "februar", "maerz", "april", "mai", "juni", "juli", "august", "september",
+                                           "oktober", "november", "dezember"))}
 
 
 def jetzt():
@@ -180,7 +200,19 @@ class Quelle:
             return resp.read()
 
     def dokumente(self):
-        return self.api.all("/api/documents/?fields=id,title,created,added,correspondent,document_type,tags,custom_fields,owner")
+        """every document with its text (the first page's dates; ordnen --neue reads them all too)"""
+        return self.api.all("/api/documents/?fields=id,title,created,added,correspondent,document_type,tags,custom_fields,owner,content")
+
+    def korrespondenten(self):
+        """id → name"""
+        return {k["id"]: k.get("name") or "" for k in self.api.all("/api/correspondents/?fields=id,name")}
+
+    def benutzer(self, i):
+        """a user's name, for the family; the id when Dokumente may not read users"""
+        try:
+            return (self.api("GET", "/api/users/%d/" % i) or {}).get("username") or "Benutzer %d" % i
+        except urllib.error.HTTPError:
+            return "Benutzer %d" % i
 
     def dokument(self, i):
         return self.api("GET", "/api/documents/%d/" % i)
@@ -227,11 +259,12 @@ class Quelle:
     def aendern(self, i, body):
         self.api("PATCH", "/api/documents/%d/" % i, body)
 
-    def pruefen_tag(self):
-        t = next((t for t in self.api.all("/api/tags/") if falten(t["name"]) == falten(PRUEFEN)), None)
-        if t is None:
-            t = self.api("POST", "/api/tags/", {"name": PRUEFEN, "matching_algorithm": 0, "owner": None})
-        return t["id"]
+    def tag_id(self, name, anlegen=True):
+        """a workflow tag's id (prüfen, Doppelt): made once, the household's, when it is missing; None when only asked"""
+        t = next((t for t in self.api.all("/api/tags/") if falten(t["name"]) == falten(name)), None)
+        if t is None and anlegen:
+            t = self.api("POST", "/api/tags/", {"name": name, "matching_algorithm": 0, "owner": None})
+        return t["id"] if t else None
 
     def hochladen(self, inhalt, titel, felder):
         grenze = "doppelt-%d" % time.monotonic_ns()
@@ -302,10 +335,59 @@ def tag_von(d):
     return str(d.get("created") or "")[:10]
 
 
-def paar_moeglich(a, b):
-    """the same date, no two different correspondents, both the household's"""
-    return (a["id"] != b["id"] and tag_von(a) and tag_von(a) == tag_von(b) and a.get("owner") is None and b.get("owner") is None
-            and not (a.get("correspondent") and b.get("correspondent") and a["correspondent"] != b["correspondent"]))
+def datum(j, m, t):
+    try:
+        return datetime.date(int(j), int(m), int(t)).isoformat() if 1950 <= int(j) <= 2100 else None
+    except ValueError:
+        return None
+
+
+def daten_im_text(t):
+    """the dates written in a text (17.06.2017, 2017-06-17, 17. Juni 2017), as YYYY-MM-DD"""
+    out = set()
+    for tag, monat, jahr in re.findall(r"\b(\d{1,2})\.\s?(\d{1,2})\.\s?(\d{4})\b", t):
+        out.add(datum(jahr, monat, tag))
+    for jahr, monat, tag in re.findall(r"\b(\d{4})-(\d{2})-(\d{2})\b", t):
+        out.add(datum(jahr, monat, tag))
+    for tag, monat, jahr in re.findall(r"\b(\d{1,2})\.\s*([A-Za-zÄäÖöÜü]+)\s+(\d{4})\b", t):
+        if falten(monat) in MONATE:
+            out.add(datum(jahr, MONATE[falten(monat)], tag))
+    return out - {None}
+
+
+def erste_seite(d):
+    """a document's first page as Paperless' text has it (a form feed between pages, else its first ERSTE_SEITE characters)"""
+    return str(d.get("content") or "").split("\f")[0][:ERSTE_SEITE]
+
+
+def daten(d):
+    """the dates a document may be of: created, the one its title begins with, those on its first page"""
+    out = {tag_von(d)} if tag_von(d) else set()
+    m = re.match(r"\s*(\d{4})-(\d{2})-(\d{2})\b", str(d.get("title") or ""))
+    if m:
+        out.add(datum(*m.groups()))
+    return (out | daten_im_text(erste_seite(d))) - {None}
+
+
+def absender_wort(name):
+    return [w for w in falten(kanonisch(name)).split() if w not in RECHTSFORM]
+
+
+def absender_passen(na, nb):
+    """two correspondents' names name one sender: an alias (ordnen's ALIASE) or the legal form apart, one begins with the other"""
+    a, b = absender_wort(na), absender_wort(nb)
+    return bool(a and b) and (a[:len(b)] == b or b[:len(a)] == a)
+
+
+def paar_moeglich(a, b, namen=None):
+    """the same owner (the household's, or one person's), a date in common, no two different correspondents"""
+    if a["id"] == b["id"] or a.get("owner") != b.get("owner") or not (daten(a) & daten(b)):
+        return False
+    ka, kb = a.get("correspondent"), b.get("correspondent")
+    if not ka or not kb or ka == kb:
+        return True
+    namen = namen or {}
+    return ka in namen and kb in namen and absender_passen(namen[ka], namen[kb])
 
 
 def leer(v):
@@ -343,11 +425,13 @@ class Doppelt:
         self.q, self.dry, self.log = q, dry, log
         self.pfad = os.path.join(ordner, "doppelt.json")
         self.rec = lesen(self.pfad, {})
-        self.weg = set()        # trashed or about to be, this run
+        self.weg = set()        # trashed, tagged Doppelt or about to be, this run
         self.plan = []          # what was (or in a dry run would be) done
-        self.zaehler = {"zusammengefuehrt": 0, "pruefen": 0}
+        self.zaehler = {"zusammengefuehrt": 0, "zum_loeschen": 0, "pruefen": 0}
         self._loeschen = None
-        self._pruefen = None
+        self._tags = {}
+        self._namen = None
+        self._benutzer = {}
 
     def speichern(self):
         if not self.dry:
@@ -358,16 +442,33 @@ class Doppelt:
             self._loeschen = self.q.darf_loeschen()
         return self._loeschen
 
-    def pruefen_id(self):
-        if self._pruefen is None and not self.dry:
-            self._pruefen = self.q.pruefen_tag()
-        return self._pruefen
+    def tag_id(self, name):
+        if name not in self._tags and not self.dry:
+            self._tags[name] = self.q.tag_id(name)
+        return self._tags.get(name)
 
-    def markieren(self, d, text):
-        """prüfen and a note: someone should look"""
+    def pruefen_id(self):
+        return self.tag_id(PRUEFEN)
+
+    def namen(self):
+        if self._namen is None:
+            self._namen = self.q.korrespondenten()
+        return self._namen
+
+    def besitzer(self, d):
+        """whose a document is, for the family: the owner's name; „“ for the household's"""
+        i = d.get("owner")
+        if i is None:
+            return ""
+        if i not in self._benutzer:
+            self._benutzer[i] = self.q.benutzer(i)
+        return self._benutzer[i]
+
+    def markieren(self, d, text, tag=PRUEFEN):
+        """a tag (prüfen: someone should look; Doppelt: a person's duplicate to delete) and a note"""
         if self.dry:
             return
-        t = self.pruefen_id()
+        t = self.tag_id(tag)
         try:
             frisch = self.q.dokument(d["id"])
         except urllib.error.HTTPError as e:
@@ -412,14 +513,18 @@ class Doppelt:
     def enthalten(self, key, behalten, weg, n_b, n_w, grund):
         body, namen = uebernehmen(self.q.dokument(behalten["id"]) if not self.dry else behalten,
                                   self.q.dokument(weg["id"]) if not self.dry else weg, self.pruefen_id())
+        wessen = self.besitzer(weg)   # a person's: tagged Doppelt for them to delete; the household's: the trash
         eintrag = {"art": "enthalten", "behalten": behalten["id"], "weg": [weg["id"]], "seiten": [n_b, n_w], "grund": grund,
-                   "uebernommen": namen, "am": jetzt()}
-        if not self.darf_loeschen():
+                   "uebernommen": namen, "am": jetzt(), **({"besitzer": wessen} if wessen else {})}
+        if not wessen and not self.darf_loeschen():
             return self.ohne_loeschen(key, eintrag, weg, behalten, n_b)
         self.plan.append(eintrag)
         self.weg.add(weg["id"])
-        self.log("doppelt: %s steckt ganz in %s: %s%s" % (beschreibung(weg, n_w), beschreibung(behalten, n_b),
-                 "würde in den Papierkorb gelegt" if self.dry else "in den Papierkorb gelegt",
+        if wessen:
+            was = "%s den Tag „%s“ (gehört %s)" % ("bekäme" if self.dry else "bekommt", DOPPELT, wessen)
+        else:
+            was = "würde in den Papierkorb gelegt" if self.dry else "in den Papierkorb gelegt"
+        self.log("doppelt: %s steckt ganz in %s: %s%s" % (beschreibung(weg, n_w), beschreibung(behalten, n_b), was,
                  ", übernommen: " + ", ".join(namen) if namen else ""))
         if self.dry:
             return True
@@ -427,13 +532,28 @@ class Doppelt:
             self.q.aendern(behalten["id"], body)
         for n in self.q.notizen(weg["id"]):
             self.q.notiz(behalten["id"], "Aus #%d übernommen: %s" % (weg["id"], n))
-        self.q.notiz(behalten["id"], "Doppelt gescannt (Dokumente, %s): %s stand ganz in diesem und liegt im Papierkorb von "
-                                     "Paperless, von dort lässt es sich wiederherstellen.%s"
-                     % (jetzt()[:10], beschreibung(weg, n_w), " Übernommen: %s." % ", ".join(namen) if namen else ""))
-        self.q.loeschen(weg["id"])
+        if not wessen:
+            try:
+                self.q.loeschen(weg["id"])
+            except urllib.error.HTTPError as e:
+                if e.code != 403:
+                    raise
+                wessen = eintrag["besitzer"] = "Paperless lässt es nicht zu"   # the household's, yet refused: marked like a person's
+                self.log("doppelt: Paperless lässt #%d nicht löschen (403): bekommt den Tag „%s“" % (weg["id"], DOPPELT))
+        if wessen:
+            kopie = "eine unvollständige Kopie (%d von %d Seiten)" % (n_w, n_b) if n_w < n_b else "eine zweite Kopie (%s)" % seiten_wort(n_w)
+            self.q.notiz(behalten["id"], "Doppelt gescannt (Dokumente, %s): #%d ist %s – zum Löschen markiert.%s"
+                         % (jetzt()[:10], weg["id"], kopie, " Übernommen: %s." % ", ".join(namen) if namen else ""))
+            self.markieren(weg, "Doppelt gescannt (Dokumente, %s): alle Seiten stehen auch in %s, das bleibt. Dieses bitte löschen "
+                                "(in Paperless den Tag „%s“ öffnen)." % (jetzt()[:10], beschreibung(behalten, n_b), DOPPELT), DOPPELT)
+            self.zaehler["zum_loeschen"] += 1
+        else:
+            self.q.notiz(behalten["id"], "Doppelt gescannt (Dokumente, %s): %s stand ganz in diesem und liegt im Papierkorb von "
+                                         "Paperless, von dort lässt es sich wiederherstellen.%s"
+                         % (jetzt()[:10], beschreibung(weg, n_w), " Übernommen: %s." % ", ".join(namen) if namen else ""))
+            self.zaehler["zusammengefuehrt"] += 1
         self.rec["paare"][key] = eintrag
         self.rec.setdefault("erledigt", []).append(eintrag)
-        self.zaehler["zusammengefuehrt"] += 1
         self.speichern()
         return True
 
@@ -456,33 +576,36 @@ class Doppelt:
             v = vergleich(pa, pb)
             if v["art"] != "ergaenzt":
                 return False
+        wessen = self.besitzer(a)
         reihe = "".join("%s%d " % ("A" if s == "a" else "B", i + 1) for s, i in v["folge"]).strip()
         eintrag = {"art": "zusammengesetzt", "aus": [a["id"], b["id"]], "seiten": [len(pa), len(pb), len(v["folge"])],
-                   "reihe": reihe, "grund": v["grund"], "am": jetzt()}
-        if not self.darf_loeschen():
+                   "reihe": reihe, "grund": v["grund"], "am": jetzt(), **({"besitzer": wessen} if wessen else {})}
+        if not wessen and not self.darf_loeschen():
             return self.ohne_loeschen(key, eintrag, b, a, len(pa))
         self.plan.append(eintrag)
         self.weg |= {a["id"], b["id"]}
-        self.log("doppelt: %s und %s ergänzen sich: %s ein Dokument mit %d Seiten (A=#%d, B=#%d: %s)" % (
-            beschreibung(a, len(pa)), beschreibung(b, len(pb)), "würden" if self.dry else "werden", len(v["folge"]), a["id"], b["id"], reihe))
+        self.log("doppelt: %s und %s ergänzen sich: %s ein Dokument mit %d Seiten (A=#%d, B=#%d: %s)%s" % (
+            beschreibung(a, len(pa)), beschreibung(b, len(pb)), "würden" if self.dry else "werden", len(v["folge"]), a["id"], b["id"], reihe,
+            ", beide bekommen den Tag „%s“ (gehören %s)" % (DOPPELT, wessen) if wessen else ""))
         if self.dry:
             return True
         da, db = self.q.dokument(a["id"]), self.q.dokument(b["id"])
         body, namen = uebernehmen(da, db, self.pruefen_id())
         meta = {**{k: da.get(k) for k in ("title", "correspondent", "document_type", "created", "tags", "custom_fields")}, **body}
-        meta["tags"] = [t for t in meta.get("tags") or [] if t != self._pruefen]
+        meta["tags"] = [t for t in meta.get("tags") or [] if t != self.pruefen_id()]
         meta["custom_fields"] = [{"field": c["field"], "value": c.get("value")} for c in meta.get("custom_fields") or []]
         pdfs = {"a": self.q.pdf(a["id"]), "b": self.q.pdf(b["id"])}
         inhalt = pdf_bauen([(pdfs[s], i) for s, i in v["folge"]])
         self.q.hochladen(inhalt, meta.get("title") or "Dokument", meta)
         self.rec.setdefault("offen", []).append({**eintrag, "summen": summen(inhalt), "meta": meta, "uebernommen": namen, "tag": tag_von(a),
-                                                 "seit": time.time()})
+                                                 "owner": a.get("owner"), "seit": time.time()})
         self.rec["paare"][key] = eintrag
         self.speichern()
         return True
 
     def offene(self):
-        """the merges a run before uploaded: once Paperless filed one, it is the household's with both notes, the two go"""
+        """the merges a run before uploaded: once Paperless filed one, it is whose the two were, with both notes; the two go
+        (the household's: the trash; a person's: the tag Doppelt, for them to delete)"""
         bleiben = []
         for o in self.rec.get("offen") or []:
             self.weg |= set(o["aus"])
@@ -498,33 +621,65 @@ class Doppelt:
                 self.weg -= set(o["aus"])
                 continue
             neu = ids[0]   # not seen: it is compared as a new one, so a third scan of the same letter finds it
-            body = {"owner": None, "tags": o["meta"].get("tags") or []}
+            body = {"owner": o.get("owner"), "tags": o["meta"].get("tags") or []}
             if o["meta"].get("custom_fields"):
                 body["custom_fields"] = o["meta"]["custom_fields"]
             self.q.aendern(neu, body)
             for i in o["aus"]:
                 for n in self.q.notizen(i):
                     self.q.notiz(neu, "Aus #%d übernommen: %s" % (i, n))
-            self.q.notiz(neu, "Zusammengesetzt (Dokumente, %s) aus #%d (%d Seiten) und #%d (%d Seiten), %s; Seiten: %s. Beide liegen im "
-                              "Papierkorb von Paperless und lassen sich von dort wiederherstellen."
-                         % (jetzt()[:10], o["aus"][0], o["seiten"][0], o["aus"][1], o["seiten"][1], o["grund"], o["reihe"]))
+            wessen, markiert = o.get("besitzer"), []
             for i in o["aus"]:
-                try:
-                    self.q.loeschen(i)
-                except urllib.error.HTTPError as e:
-                    if e.code != 404:   # already in the trash
-                        raise
-            self.rec.setdefault("erledigt", []).append({**{k: v for k, v in o.items() if k not in ("summen", "meta", "seit")}, "neu": neu})
+                if not wessen:
+                    try:
+                        self.q.loeschen(i)
+                        continue
+                    except urllib.error.HTTPError as e:
+                        if e.code == 404:   # already in the trash
+                            continue
+                        if e.code != 403:
+                            raise
+                        self.log("doppelt: Paperless lässt #%d nicht löschen (403): bekommt den Tag „%s“" % (i, DOPPELT))
+                self.markieren({"id": i}, "Doppelt gescannt (Dokumente, %s): alle Seiten stehen jetzt in #%d, das bleibt. Dieses bitte "
+                                          "löschen (in Paperless den Tag „%s“ öffnen)." % (jetzt()[:10], neu, DOPPELT), DOPPELT)
+                self.rec["paare"]["%d-%d" % tuple(sorted((neu, i)))] = {"art": "markiert", "am": jetzt()}   # not paired with its parts
+                self.zaehler["zum_loeschen"] += 1
+                markiert.append(i)
+            self.q.notiz(neu, "Zusammengesetzt (Dokumente, %s) aus #%d (%d Seiten) und #%d (%d Seiten), %s; Seiten: %s. %s"
+                         % (jetzt()[:10], o["aus"][0], o["seiten"][0], o["aus"][1], o["seiten"][1], o["grund"], o["reihe"],
+                            "Beide sind zum Löschen markiert (Tag „%s“)." % DOPPELT if len(markiert) == 2 else
+                            "#%d ist zum Löschen markiert (Tag „%s“), das andere liegt im Papierkorb von Paperless." % (markiert[0], DOPPELT)
+                            if markiert else "Beide liegen im Papierkorb von Paperless und lassen sich von dort wiederherstellen."))
+            self.rec.setdefault("erledigt", []).append({**{k: v for k, v in o.items() if k not in ("summen", "meta", "seit", "owner")}, "neu": neu})
             self.zaehler["zusammengefuehrt"] += 1
             self.log("doppelt: #%d und #%d sind jetzt #%d" % (o["aus"][0], o["aus"][1], neu))
         self.rec["offen"] = bleiben
         self.speichern()
 
+    def markierte(self, docs):
+        """the documents tagged Doppelt: settled, a person deletes them; never compared again"""
+        t = self.q.tag_id(DOPPELT, anlegen=False)
+        return {d["id"] for d in docs if t is not None and t in (d.get("tags") or [])}
+
+    def warten(self, docs):
+        """the duplicates tagged Doppelt a person has yet to delete: said on every run until they are gone (yellow, never red)"""
+        offen = self.markierte(docs)
+        if not self.dry:
+            for p in self.plan:
+                if p.get("besitzer"):
+                    offen |= set(p["weg"] if p["art"] == "enthalten" else p["aus"])
+        if offen:
+            haengt("doppelt", "%d doppelte Scans warten auf dein Löschen: in Paperless den Tag „%s“ öffnen und alle löschen."
+                   % (len(offen), DOPPELT),
+                   "Jedes nennt in einer Notiz das vollständige Dokument, das bleibt; Dokumente darf die Dokumente einer Person nicht löschen.")
+        return len(offen)
+
     def neue(self, maximal):
-        """intake: documents added since the record began, each against the documents of its date"""
+        """intake: documents added since the record began, each against the documents of its dates"""
         if not self.dry:
             self.offene()
         docs = self.q.dokumente()
+        self.weg |= self.markierte(docs)
         hoechste = max((d["id"] for d in docs), default=0)
         if "ab" not in self.rec:   # the documents there were before are --alle's, after the owner saw its list
             self.rec["ab"] = hoechste
@@ -537,27 +692,35 @@ class Doppelt:
         for d in neue:
             if tag_von(d) in warten:   # perhaps the merge itself, filed meanwhile: after it is done
                 continue
-            andere = sorted((x for x in docs if paar_moeglich(d, x)), key=lambda x: -x["id"])[:KANDIDATEN]
+            andere = sorted((x for x in docs if paar_moeglich(d, x, self.namen())), key=lambda x: -x["id"])[:KANDIDATEN]
             for x in andere:
                 if self.paar(d, x) and d["id"] in self.weg:
                     break
             if not self.dry:
                 gesehen[str(d["id"])] = jetzt()
                 self.speichern()
+        self.warten(docs)
 
     def alle(self, maximal=None):
         """once: every date's documents pairwise; the contained ones first, so a letter scanned three times ends as one"""
         if not self.dry:
             self.offene()
         docs = sorted(self.q.dokumente(), key=lambda d: d["id"])
+        self.weg |= self.markierte(docs)
         if "ab" not in self.rec:   # intake goes on after these
             self.rec["ab"] = max((d["id"] for d in docs), default=0)
             self.speichern()
         tage = {}
         for d in docs:
-            if tag_von(d) and d.get("owner") is None:
-                tage.setdefault(tag_von(d), []).append(d)
-        paare = [(a, b) for gruppe in tage.values() for i, a in enumerate(gruppe) for b in gruppe[i + 1:] if paar_moeglich(a, b)]
+            for t in daten(d):
+                tage.setdefault(t, []).append(d)
+        paare, gesehen = [], set()
+        for gruppe in tage.values():
+            for i, a in enumerate(gruppe):
+                for b in gruppe[i + 1:]:
+                    if (a["id"], b["id"]) not in gesehen and paar_moeglich(a, b, self.namen()):
+                        gesehen.add((a["id"], b["id"]))
+                        paare.append((a, b))
         self.log("doppelt: %d Dokumente, %d Paare mit demselben Datum" % (len(docs), len(paare)))
         rang = {"gleich": 0, "a_in_b": 0, "b_in_a": 0, "ergaenzt": 1, "unsicher": 2}
         bewertet = []
@@ -571,18 +734,22 @@ class Doppelt:
                 self.log("doppelt: Menge erreicht, der Rest beim nächsten Mal")
                 break
             n += bool(self.paar(a, b))
+        self.warten(docs)
 
     def zusammenfassung(self):
         zeilen = ["Doppelt gescannt: %d Fälle" % len(self.plan), ""]
         for p in self.plan:
             if p["art"].startswith("enthalten"):
-                zeilen.append("  #%d (%d S.) steckt ganz in #%d (%d S.) → #%d in den Papierkorb%s%s" % (
-                    p["weg"][0], p["seiten"][1], p["behalten"], p["seiten"][0], p["weg"][0],
+                zeilen.append("  #%d (%d S.) steckt ganz in #%d (%d S.) → %s%s%s" % (
+                    p["weg"][0], p["seiten"][1], p["behalten"], p["seiten"][0],
+                    "#%d bekommt den Tag „%s“ (gehört %s), #%d bleibt" % (p["weg"][0], DOPPELT, p["besitzer"], p["behalten"]) if p.get("besitzer")
+                    else "#%d in den Papierkorb" % p["weg"][0],
                     "; übernommen: " + ", ".join(p["uebernommen"]) if p.get("uebernommen") else "",
                     "" if p["art"] == "enthalten" else " (Dokumente darf nicht löschen: nur markiert)"))
             elif p["art"] == "zusammengesetzt":
-                zeilen.append("  #%d (%d S.) + #%d (%d S.) → ein neues Dokument mit %d Seiten (%s), beide in den Papierkorb" % (
-                    p["aus"][0], p["seiten"][0], p["aus"][1], p["seiten"][1], p["seiten"][2], p["reihe"]))
+                zeilen.append("  #%d (%d S.) + #%d (%d S.) → ein neues Dokument mit %d Seiten (%s), %s" % (
+                    p["aus"][0], p["seiten"][0], p["aus"][1], p["seiten"][1], p["seiten"][2], p["reihe"],
+                    "beide bekommen den Tag „%s“ (gehören %s)" % (DOPPELT, p["besitzer"]) if p.get("besitzer") else "beide in den Papierkorb"))
             else:
                 zeilen.append("  #%d und #%d: unsicher (%s) → beide prüfen" % (p["dokumente"][0], p["dokumente"][1], p["grund"]))
         return "\n".join(zeilen)

@@ -118,7 +118,7 @@ BEREICHE = {
     "Arbeit & Rente": "Arbeit und Rente: Arbeitgeber, Gehalt, Rentenversicherung, Betriebsrente, Pension",
     "Freizeit": "Freizeit: Reisen, Konzerte, Tickets, Hobbys, Vereine, Einkäufe für die Freizeit",
 }
-ARBEIT = {"Stapel", "prüfen", "KI-ausgewertet", "korrespondent-ok"}   # workflow tags: stay
+ARBEIT = {"Stapel", "prüfen", "KI-ausgewertet", "korrespondent-ok", "Doppelt"}   # workflow tags: stay (Doppelt: doppelt.py)
 # the tags that grew before the order, and where each goes (a tag not named here is never touched)
 K, T, P = "korrespondent", "typ", "thema"
 TAG_REGELN = {
