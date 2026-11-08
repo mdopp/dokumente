@@ -52,7 +52,10 @@ asks it, PAPERLESS_AI_LLM_*):
       intake (dienst.py's run after Paperless' hook): documents without a
       Bereich that this record has not seen, newest first, at most N. Uses
       the order as it is, makes nothing but a correspondent where Paperless
-      lets it; without the order set up, nothing.
+      lets it; without the order set up, nothing. What keeps it from its
+      work (a piece of the order it does not see, the model away, Paperless
+      refusing the token, documents piling up) is a line „hängt {json}“ for
+      dienst.py's watch.
   ordnen.py wiederherstellen <sicherung.json> [--dry-run]
       every document's type, tags, correspondent and fields back as the
       backup has them; deleted tags made again, renamed types named back.
@@ -66,7 +69,7 @@ asks it, PAPERLESS_AI_LLM_*):
 The folder: ORDNEN_DIR, else /dokumente/ordnen (Dokumente's backed-up
 folder), else /usr/src/paperless/data/ordnen (inside Paperless)."""
 import argparse, base64, hashlib, json, os, re, subprocess, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
-from datetime import date
+from datetime import date, datetime, timezone
 
 E = os.environ
 PRUEFEN = "prüfen"
@@ -163,6 +166,7 @@ MEDIKAMENT_NAH = 1500
 FRAGE_STAND = 3     # an answer from before the medical fields (or before their shape was spelled out) is asked again by `felder`
 ZEICHEN = 8000      # of a document's text for the model: who, what and which year stand on the first pages
 PRO_LAUF = 10       # documents an intake run reads: the household model is shared
+STAU_H = int(E.get("ORDNEN_STAU_H") or 24)   # a new document still without a Bereich after this long is a finding
 
 
 def falten(s):
@@ -1075,17 +1079,33 @@ def neue(api, ordner, args, log=print, ask=modell):
     rec = lesen(rec_path, {})
     o = Ordnung(api, log=log)
     bt = {t["id"] for t in o.bereich_tags().values() if t}
-    if len(bt) < len(BEREICHE) or not o.feld("Person"):
-        log("ordnen: die Ordnung ist in Paperless noch nicht eingerichtet, nichts eingeordnet")
+    fehlt = fehlende_ordnung(o)
+    if fehlt:
+        log("ordnen: die Ordnung ist in Paperless noch nicht eingerichtet (%s), nichts eingeordnet" % "; ".join(fehlt))
+        haengt("einrichtung", "Neue Dokumente werden nicht eingeordnet: %s" % "; ".join(fehlt),
+               "In Paperless nachsehen, ob es das gibt und wem es gehört: was einem anderen Benutzer gehört, sieht Dokumente nicht. "
+               "Eigentümer leeren (dann gehört es allen) oder Dokumente das Ansehen erlauben; fehlt es ganz, legt die Einrichtung "
+               "der Ordnung (README von Dokumente, als Administrator) es an. Der nächste Lauf ordnet dann ein.")
         rec["lauf"] = {"am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "eingeordnet": 0}
         schreiben(rec_path, rec)
         return 0
     personen = list(personen_von(o))
     seen = rec.setdefault("gesehen", {})
-    docs = [d for d in api.all("/api/documents/?fields=id,title,content,document_type,correspondent,tags,custom_fields&ordering=-added")
-            if str(d["id"]) not in seen and not bt & set(d.get("tags") or [])][:args.max or PRO_LAUF]
+    ohne = [d for d in api.all("/api/documents/?fields=id,title,content,document_type,correspondent,tags,custom_fields,added&ordering=-added")
+            if str(d["id"]) not in seen and not bt & set(d.get("tags") or [])]
+    docs = ohne[:args.max or PRO_LAUF]
     haushalt = haushalt_namen(api, personen)
     fragen(api, o, docs, rec, personen, haushalt, time.monotonic() + args.zeit, log, ask, None, lambda: schreiben(rec_path, rec))
+    if rec.get("modell_weg"):
+        haengt("modell", "Das Hausmodell antwortet nicht, neue Dokumente werden nicht eingeordnet",
+               "Meist ist es nur eine Weile belegt, der nächste Lauf fragt wieder. Hält es an, die Leihe des Modells prüfen "
+               "(Laib-Status, Dienst des Modells).")
+    stau = [d for d in ohne if gestaut(d)]
+    if stau:
+        haengt("stau", "%d neue Dokument%s warte%s seit über %d Stunden darauf, eingeordnet zu werden" % (
+               len(stau), "" if len(stau) == 1 else "e", "t" if len(stau) == 1 else "n", STAU_H),
+               "Antwortet das Hausmodell, holt Dokumente %d je Lauf auf; geht die Zahl über Stunden nicht zurück, sollte der "
+               "Operator nachsehen, warum nichts eingeordnet wird." % PRO_LAUF)
     n = 0
     erlaubt = erlaubte_typen(o)
     fach = fach_lesen(o, api.all("/api/documents/?fields=id,correspondent,custom_fields&custom_fields__id__in=%d" % o.feld("Fachrichtung")["id"])) \
@@ -1106,6 +1126,35 @@ def neue(api, ordner, args, log=print, ask=modell):
     rec["lauf"] = {"am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "eingeordnet": n}
     schreiben(rec_path, rec)
     return 0
+
+
+def fehlende_ordnung(o):
+    """what intake needs of the order and does not see, each named (the Bereich tag „gesundheit“ owned by a
+    retired user was invisible to Dokumente's token, and nothing was filed for hours, 2026-11-08)"""
+    tags = ["„%s“" % b for b, t in o.bereich_tags().items() if not t]
+    fehlt = ["Bereich-Tag%s %s" % ("" if len(tags) == 1 else "s", ", ".join(tags))] if tags else []
+    if not o.feld("Person"):
+        fehlt.append("Feld „Person“")
+    if not fehlt:
+        return []
+    return ["%s %s für Dokumente in Paperless nicht sichtbar" % (" und ".join(fehlt), "ist" if len(fehlt) == 1 and len(tags) <= 1 else "sind")]
+
+
+def gestaut(doc, jetzt=None):
+    """whether a document was added longer than STAU_H ago (Paperless writes its own offset)"""
+    try:
+        t = datetime.fromisoformat(str(doc.get("added") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return ((jetzt or time.time()) - t.timestamp()) > STAU_H * 3600
+
+
+def haengt(was, detail, fix, einzelheiten=""):
+    """a step that cannot do its work, for dienst.py's watch (dokumente: „Es muss auffallen“, 2026-11-08): one line
+    „hängt {json}“ on stdout; the detail and fix are German for the family, the raw error only in einzelheiten"""
+    print("hängt " + json.dumps({"was": was, "detail": detail, "fix": fix, "einzelheiten": einzelheiten[:300]}, ensure_ascii=False), flush=True)
 
 
 def felder(api, ordner, args, log=print, ask=modell):
@@ -1188,6 +1237,21 @@ def sperre(ordner):
     return True
 
 
+def zugang_haengt(e):
+    """Paperless refusing the token, or not answering, as a step that hangs"""
+    code = getattr(e, "code", None)
+    if code == 401:
+        haengt("zugang", "Paperless lehnt den Zugang von Dokumente ab, neue Dokumente werden nicht eingeordnet",
+               "Der Zugang wird beim Einrichten von Paperless neu ausgestellt (Laib: Paperless neu anwenden); "
+               "sonst sollte der Operator nachsehen.", str(e))
+    elif code == 403:
+        haengt("rechte", "Paperless verweigert Dokumente einen Schritt beim Einordnen",
+               "Die Rechte des Paperless-Benutzers dokumente prüfen (Laib: Vorlage paperless); sonst sollte der Operator nachsehen.", str(e))
+    else:
+        haengt("paperless", "Paperless antwortet Dokumente nicht, neue Dokumente werden nicht eingeordnet",
+               "Meist ist Paperless nur kurz weg, der nächste Lauf versucht es wieder; hält es an, Paperless im Laib-Status ansehen.", str(e))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ordnen")
     ap.add_argument("befehl", nargs="?", default="alles", choices=["alles", "wiederherstellen", "felder"])
@@ -1222,6 +1286,8 @@ def main(argv=None):
         return 0
     except (OSError, ValueError) as e:   # Paperless away: said, and the next run tries again
         print("ordnen: abgebrochen: %s" % e, flush=True)
+        if args.neue:
+            zugang_haengt(e)
         return 0 if args.neue or args.hintergrund else 2
     finally:
         try:

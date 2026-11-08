@@ -4,7 +4,7 @@ that grew move into correspondents, types, Bereiche and Produkte and go once
 empty, each document is read by the model and only what the text backs is
 filled into what is empty; a backup comes first and puts everything back.
 Against a fake Paperless and a fake model; no real names or documents."""
-import copy, importlib.util, json, os, re, tempfile, unittest, urllib.error
+import contextlib, copy, importlib.util, io, json, os, re, tempfile, unittest, urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -567,6 +567,61 @@ class Kommando(unittest.TestCase):
         finally:
             for k in ("ORDNEN_DIR", "PAPERLESS_API", "PAPERLESS_TOKEN"):
                 del os.environ[k]
+
+
+def haengt_zeilen(text):
+    return [json.loads(z[len("hängt "):]) for z in text.splitlines() if z.startswith("hängt {")]
+
+
+class Haengt(unittest.TestCase):
+    """intake says which step hangs and why (2026-11-08: the tag „gesundheit“ of a retired user, invisible for hours)"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def neue(self, f, ask=lambda m: answer_invoice()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ordnen.neue(f, self.dir, args(max=5), log=lambda *_: None, ask=ask)
+        return haengt_zeilen(out.getvalue())
+
+    def eingerichtet(self, docs=()):
+        f = base(list(docs))
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna"], log=lambda *_: None)
+        return f
+
+    def test_an_invisible_bereich_tag_is_named(self):
+        f = self.eingerichtet()
+        f.tags = [t for t in f.tags if t["name"] != "gesundheit"]   # owned by someone Dokumente's token cannot see
+        [h] = self.neue(f)
+        self.assertEqual(h["was"], "einrichtung")
+        self.assertEqual(h["detail"], "Neue Dokumente werden nicht eingeordnet: Bereich-Tag „Gesundheit“ ist für Dokumente in Paperless nicht sichtbar")
+        self.assertIn("Eigentümer", h["fix"])
+
+    def test_nothing_set_up_names_all_of_it(self):
+        [h] = self.neue(base([]))
+        self.assertIn("Bereich-Tags „Haus“, „Auto“", h["detail"])
+        self.assertTrue(h["detail"].endswith("und Feld „Person“ sind für Dokumente in Paperless nicht sichtbar"), h["detail"])
+
+    def test_set_up_and_working_says_nothing(self):
+        f = self.eingerichtet([{"id": 1, "title": "Stadtwerke", "content": INVOICE, "added": "2099-01-01T00:00:00+01:00"}])
+        self.assertEqual(self.neue(f), [])
+
+    def test_the_model_away_and_a_pile_up_hang(self):
+        f = self.eingerichtet([{"id": i, "title": "x%d" % i, "content": INVOICE + str(i), "added": "2026-11-01T08:00:00+01:00"} for i in range(1, 4)])
+
+        def weg(m):
+            raise OSError("connection refused")
+        hs = {h["was"]: h for h in self.neue(f, ask=weg)}
+        self.assertEqual(set(hs), {"modell", "stau"})
+        self.assertEqual(hs["stau"]["detail"], "3 neue Dokumente warten seit über 24 Stunden darauf, eingeordnet zu werden")
+
+    def test_a_refused_token_hangs(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ordnen.zugang_haengt(urllib.error.HTTPError("/api/tags/", 401, "Unauthorized", {}, None))
+            ordnen.zugang_haengt(urllib.error.URLError("connection refused"))
+        self.assertEqual([h["was"] for h in haengt_zeilen(out.getvalue())], ["zugang", "paperless"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY scan/scan.py /opt/scan.py
 COPY vertraege/vertraege.py /opt/vertraege.py
 COPY ordnen/ordnen.py /opt/ordnen.py
+COPY ordnen/doppelt.py /opt/doppelt.py
 COPY dienst.py /opt/dienst.py
 LABEL org.opencontainers.image.source=https://github.com/mdopp/dokumente
 ENV PYTHONUNBUFFERED=1
