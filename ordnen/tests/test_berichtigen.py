@@ -3,7 +3,7 @@ Versicherungsschein (so vertraege.py read them as contracts and filled Vertragsb
 scanned titles came out as „Skandia - Dokument“ or „… (5)“ without a date. ordnen.py's guard and title
 form for new documents; berichtigen.py for the ones filed before; ordnen.py --neue --max 0 for all at once.
 Against test_ordnen's fake Paperless and a fake model; the texts are the box's, without names or numbers."""
-import contextlib, copy, importlib.util, io, json, os, tempfile, unittest
+import contextlib, copy, importlib.util, io, json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -284,13 +284,16 @@ class Berichtigen(unittest.TestCase):
 
     def test_one_run_at_a_time_with_ordnen(self):
         os.environ["ORDNEN_DIR"] = self.dir
+        anderer = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])   # an ordnen run that is alive
         try:
-            Path(self.dir, "lauf.lock").write_text(str(os.getppid()))
+            Path(self.dir, "lauf.lock").write_text(str(anderer.pid))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(berichtigen.main(["--dry-run"]), 1)
             self.assertIn("ordnen.py läuft gerade", out.getvalue())
         finally:
+            anderer.kill()
+            anderer.wait()
             del os.environ["ORDNEN_DIR"]
 
 
