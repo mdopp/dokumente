@@ -11,7 +11,8 @@ and invoices get their fields read and their notice and due dates reminded.
   (frozen at laib 8236b19).
 - `ordnen/` — the household's order in Paperless (decided 2026-11-05): document
   types, Bereich tags, the fields Person, Produkte, Kundennummer,
-  Versicherungsnummer, Garantie bis, Steuerjahr, and for medical documents
+  Versicherungsnummer, Garantie bis, Steuerjahr, Steuer-Art and Lohnkosten
+  with the tag `steuerlich` (for the tax return), and for medical documents
   Fachrichtung, Anlass/Diagnose, Medikamente; a saved view per Bereich and
   per person; each document's type, Bereich, sender, person and fields read
   by the household model; and `doppelt.py`: a document scanned twice becomes
@@ -219,6 +220,29 @@ touched, an emptied one is deleted), the new fields and the views.
   it asks the model again for medical documents only, sets nothing but these
   three fields where empty, backs up first and writes counts to
   `zusammenfassung-felder.txt`.
+- **Für die Steuer** (owner 2026-11-09): a receipt, invoice, contract,
+  notice, certificate or statement the model says counts for the German
+  income-tax return gets the tag `steuerlich`, the field `Steuer-Art` (one of
+  ten kinds: Handwerkerleistungen and Haushaltsnahe Dienstleistungen (§35a),
+  Arbeitszimmer & Arbeitsmittel, Fortbildung, Krankheitskosten, Versicherungen
+  & Vorsorge, Spenden, Kinderbetreuung, Kapitalerträge, Steuerbescheid &
+  Finanzamt), `Steuerjahr` (the invoice's or payment's year, never the
+  scan's) and, for §35a, `Lohnkosten` (monetary) when the invoice shows the
+  labour cost apart. Only on the words the text has; unsure is no mark; a
+  Steuer-Art set by hand stays. Homes' Dokumente page shows them as „Für die
+  Steuer“ per year, with the download for the tax adviser (mdopp/homes).
+  **Setup, once, by an administrator** (it makes the tag `steuerlich` and the
+  fields `Steuer-Art` and `Lohnkosten`, which Dokumente's own Paperless user
+  may not), and the run over the documents there already are, in Paperless'
+  container as above: `python3 ordnen.py steuer --dry-run --hintergrund`, look
+  at `zusammenfassung-steuer.txt` (per Steuer-Art, then each document), then
+  `python3 ordnen.py steuer --hintergrund`. It asks the model again only for
+  documents of the receipt types (Rechnung, Beleg/Garantie, Vertrag,
+  Versicherungsschein, Beitrag/Bescheid, Kontoauszug, Steuer, Urkunde), sets
+  nothing but the marking where empty, backs up first
+  (`ordnen.py wiederherstellen <sicherung>` puts it back). The dry run makes
+  nothing, not even the fields; intake marks new documents once the fields
+  are there. A full `ordnen.py` run makes them too.
 - **On every run after Paperless' hook** (`dienst.py`): `doppelt.py --neue`,
   then `ordnen.py --neue` before the contract helper, with Dokumente's token: the newest documents
   without a Bereich it has not seen, at most 10; it uses the order as it is
