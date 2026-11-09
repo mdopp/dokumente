@@ -171,3 +171,14 @@ def ligaturen(name, bekannt, fremd=frozenset()):
 def mit_umlaut(name):
     """whether a name has a letter OCR loses more often than it adds (ä, ö, ü, ß, an accent)"""
     return any(unicodedata.decomposition(c) or c == "ß" for c in str(name))
+
+
+def derselbe(a, b):
+    """whether a document's sender a is the firm b by the rules above, or all of one name's words are in the other's
+    („Wienkämper GmbH“ for „Friedr. Wilh. Wienkämper GmbH & Co. KG“), one of them a word of 4 letters or more. Only
+    where the document was found for b already (its correspondent, a search for its name)"""
+    if gleich(a, b) or gleich(b, a):
+        return True
+    x, y = set(kern(a)), set(kern(b))
+    klein = min((x, y), key=len)
+    return bool(klein) and (x <= y or y <= x) and any(len(w) >= 4 for w in klein)

@@ -19,6 +19,7 @@ COPY ordnen/doppelt.py /opt/doppelt.py
 COPY ordnen/berichtigen.py /opt/berichtigen.py
 COPY ordnen/firmen.py /opt/firmen.py
 COPY ordnen/kontakte_aufraeumen.py /opt/kontakte_aufraeumen.py
+COPY ordnen/kontakte_nachlesen.py /opt/kontakte_nachlesen.py
 COPY dienst.py /opt/dienst.py
 LABEL org.opencontainers.image.source=https://github.com/mdopp/dokumente
 ENV PYTHONUNBUFFERED=1
