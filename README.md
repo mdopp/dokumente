@@ -311,7 +311,12 @@ touched, an emptied one is deleted), the new fields and the views.
   documents in Paperless (its correspondent by firmen.py's rules, else a
   phrase search of the name; the newest 3) and asks the model vertraege.py's
   sender question; only values the text backs go into the card, only where
-  it is empty, never into a card edited on a phone. In Dokumente's
+  it is empty, never into a card edited on a phone. First, though, the
+  owner's own phone contacts (Homes' tool handy_firmen: the firms in the
+  Immich key owner's `/<login>/handy-kontakte/`, nobody else's): when
+  exactly one is the card's firm, its number, mail and address fill the
+  empty fields and win over a document's text; each value's line says
+  where it came from („aus deinen Handy-Kontakten“, „aus Dokument #123“). In Dokumente's
   container: `python3 /opt/kontakte_nachlesen.py` (the dry run; asks the
   model, writes no card), then `python3 /opt/kontakte_nachlesen.py --apply`
   (`--firma "<Name>"` narrows it, `--max N` bounds it). Its record
