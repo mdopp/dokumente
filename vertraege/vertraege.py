@@ -110,6 +110,17 @@ Haushalt URL and token come from the unit. The standard library only.
    a note with Homes' reason. Homes away or without the tool: the contact
    waits in the record, the model is not asked again. Without Homes nothing
    is asked, sent or recorded.
+   Letters too (2026-11-09: „Friedr. Wilh. Wienkämper GmbH & Co. KG“, a card
+   made on an older path, held only its IBAN): a household firm card
+   (Homes' firmenkontakte) without a phone or a whole address, not edited by
+   hand, whose correspondent (firmen.py's gleich or ocr) has a document not
+   asked yet, of any type, gets its newest one's sender asked (KONTAKT
+   only), once per document, one document per card a run and at most
+   BRIEFE_PRO_LAUF a run within PRO_LAUF. Only what the card lacks goes to
+   kontakt_ergaenzen, under the card's name, and only when the letter's
+   sender is the card's firm (firmen.derselbe); the record's entry names the
+   card (fuer). ordnen/kontakte_nachlesen.py does the same once over all
+   cards.
 
 What it filled and reminded is kept in laib-vertraege.json in Paperless' data
 folder (backed up), so a run never asks or reminds twice. The record's lauf
@@ -135,6 +146,7 @@ def _firmen():
 
 firmen = _firmen()
 PRO_LAUF = 10                  # documents read a run: the household model is shared
+BRIEFE_PRO_LAUF = 3            # letters read a run for a firm card that lacks a phone or an address (2026-11-09)
 ZEICHEN = 16000                # of a document's text: a contract's data is on its first pages
 OCR_PRO_LAUF = 3               # documents recognised again a run: OCR is the box's CPU
 PRUEFEN = "prüfen"
@@ -866,7 +878,7 @@ def kontakte(api, rec, prüfen_tag):
         except (IndexError, ValueError):
             a = {}
         felder = a.get("felder") or {}
-        rec["kontakte"][k] = {"status": a.get("status") or "?", "felder": felder, "am": am}
+        rec["kontakte"][k] = {"status": a.get("status") or "?", "felder": felder, "am": am, **({"fuer": e["fuer"]} if e.get("fuer") else {})}
         if args["firma"] != firma:
             rec["kontakte"][k]["als"] = args["firma"]
         if a.get("status") == "angelegt":
@@ -881,6 +893,88 @@ def kontakte(api, rec, prüfen_tag):
                           prüfen_tag)
             except urllib.error.HTTPError as x:
                 print("vertraege: Dokument %s: IBAN abweichend, aber nicht markiert (%d)" % (k, x.code))
+
+
+def firmenkarten():
+    """Homes' firm cards (firmenkontakte); [] from a Homes without the tool"""
+    res = werkzeug("firmenkontakte", {})
+    out = res.get("result") or {}
+    if res.get("error") or out.get("isError"):
+        return []
+    try:
+        a = json.loads(str(((out.get("content") or [{}])[0]).get("text") or "").rsplit("\n", 1)[-1])
+    except ValueError:
+        return []
+    return [] if not isinstance(a, dict) or a.get("teilweise") else a.get("kontakte") or []
+
+
+def hat_anschrift(k):
+    return any(a.get("strasse") and a.get("plz") and a.get("ort") for a in k.get("anschrift") or [])
+
+
+def ohne_nummer(k):
+    """whether a card lacks a phone or a whole address"""
+    return not k.get("telefon") or not hat_anschrift(k)
+
+
+def briefe(api, rec, gelesen, schon, salat, personen, mails, namen):
+    """the sender of a letter (any type, not only a contract or invoice) whose correspondent is a household firm
+    card lacking a phone or an address, asked once per document like a contract's (2026-11-09: a card made on an
+    older path stayed without them): per card its newest document not asked yet, at most BRIEFE_PRO_LAUF a run
+    and within PRO_LAUF; the answer waits in the record's kontakte for kontakte(). A card edited by hand is
+    left alone. Returns how many documents the run read"""
+    try:
+        karten = [k for k in firmenkarten() if not k.get("von_hand") and ohne_nummer(k)]
+    except (OSError, ValueError) as x:
+        print("vertraege: Homes nennt seine Firmenkontakte nicht (%s): im nächsten Lauf" % x)
+        return gelesen
+    if not karten:
+        return gelesen
+    try:
+        korr = api.all("/api/correspondents/")
+    except urllib.error.HTTPError as x:
+        print("vertraege: Paperless nennt seine Korrespondenten nicht (%d): Absender von Briefen nicht nachgelesen" % x.code)
+        return gelesen
+    gefragt = rec.setdefault("kontakte", {})
+    n = 0
+    for k in sorted(karten, key=lambda k: firmen.falten(k.get("name") or "")):
+        ids = [c["id"] for c in korr if firmen.gleich(k["name"], c["name"]) in ("gleich", "ocr")]
+        if not ids:
+            continue
+        docs = api("GET", "/api/documents/?correspondent__id__in=%s&ordering=-created&page_size=10" % ",".join(map(str, ids)))
+        d = next((d for d in sorted(docs.get("results") or [], key=lambda d: (str(d.get("created") or ""), d["id"]), reverse=True)
+                  if str(d["id"]) not in gefragt and d["id"] not in schon and d["id"] not in salat and (d.get("content") or "").strip()), None)
+        if not d:
+            continue
+        if n >= BRIEFE_PRO_LAUF or gelesen >= PRO_LAUF:
+            print("vertraege: weitere Absender von Briefen im nächsten Lauf")
+            LAUF["weitere"] = True
+            break
+        try:
+            antwort = modell(frage(d["content"], dict(KONTAKT), "den Absender"))
+        except (OSError, ValueError, KeyError, IndexError) as e:
+            print("vertraege: das Modell antwortet nicht (%s), der nächste Lauf fragt wieder" % e)
+            LAUF["modell_weg"] = True
+            break
+        gelesen, n = gelesen + 1, n + 1
+        args, weg = kontaktdaten(antwort if isinstance(antwort, dict) else {}, d["content"], personen, mails, namen)
+        am = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        fehlt = " und ".join(w for w, ja in (("Telefon", not k.get("telefon")), ("Anschrift", not hat_anschrift(k))) if ja)
+        if args and not firmen.derselbe(args["firma"], k["name"]):
+            gefragt[str(d["id"])] = {"status": "anderer Absender", "firma": args["firma"], "am": am, "fuer": k["name"]}
+            print("vertraege: %s (%d): Absender „%s“ ist nicht „%s“: nichts übernommen" % (d.get("title"), d["id"], args["firma"], k["name"]))
+            continue
+        if args:   # only what the card lacks, under its own name: Homes would add a second number beside one
+            hat = {"telefon": k.get("telefon"), "email": k.get("email"), "iban": k.get("iban"), "anschrift": hat_anschrift(k),
+                   "bank": k.get("iban"), "kontoinhaber": k.get("iban")}
+            args = {a: v for a, v in args.items() if not hat.get(a)}
+            args["firma"] = k["name"]
+            if len(args) == 1:
+                args, weg = None, weg + ["nichts, was „%s“ fehlt" % k["name"]]
+        gefragt[str(d["id"])] = {"offen": args, "am": am, "fuer": k["name"]} if args else {"status": "keiner", "verworfen": weg, "am": am, "fuer": k["name"]}
+        print("vertraege: %s (%d): Absender gelesen, weil „%s“ im Adressbuch %s fehlt: %s" % (
+            d.get("title"), d["id"], k["name"], fehlt, ", ".join(a for a in (args or {}) if a != "firma") or "nichts gefunden"))
+    return gelesen
 
 
 def verlaengern(api, d, fid, termin, heute, markiert, prüfen_tag):
@@ -1031,6 +1125,8 @@ def main():
                                           "am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         print("vertraege: %s (%d): gefüllt %s%s" % (d.get("title"), d["id"], ", ".join(gefuellt) or "nichts",
                                                     "; prüfen: " + ", ".join(verworfen) if verworfen else ""))
+    if homes and ki and not LAUF.get("modell_weg"):
+        gelesen = briefe(api, rec, gelesen, set(docs) | set(rechnungen), salat, personen, mails, namen)
     if homes:
         kontakte(api, rec, prüfen_tag)
 

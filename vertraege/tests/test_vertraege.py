@@ -100,6 +100,11 @@ class Paperless:
                     if "title__icontains" in q:
                         w = urllib.parse.unquote(q["title__icontains"]).casefold()
                         out = [d for d in out if w in (d.get("title") or "").casefold()]
+                    if "correspondent__id__in" in q:
+                        ids = {int(i) for i in urllib.parse.unquote(q["correspondent__id__in"]).split(",")}
+                        out = [d for d in out if d.get("correspondent") in ids]
+                    if q.get("ordering") == "-created":
+                        out = sorted(out, key=lambda d: (str(d.get("created") or ""), d["id"]), reverse=True)
                     return reply(self, 200, {"next": None, "results": out})
                 parts = path.strip("/").split("/")
                 if parts[:2] == ["api", "documents"] and len(parts) >= 3 and parts[2].isdigit():
@@ -171,8 +176,9 @@ class Homes:
     """Homes' /mcp/haushalt: tools/call erinnerung_anlegen, kontakt_ergaenzen (#820), kontakte_suchen over
     adressbuch [(name, numbers, mails)], to which a card kontakt_ergaenzen made is added"""
 
-    def __init__(self, kontakt=kontakt_angelegt, adressbuch=()):
+    def __init__(self, kontakt=kontakt_angelegt, adressbuch=(), karten=None):
         self.calls, self.kontakt, self.ohne_kontakte = [], kontakt, False
+        self.karten = karten   # firmenkontakte's cards; None: a Homes without the tool
         self.adressbuch = [(a[0], list(a[1]) if len(a) > 1 else [], list(a[2]) if len(a) > 2 else []) for a in adressbuch]
         fake = self
 
@@ -194,6 +200,11 @@ class Homes:
                     if '"status": "angelegt"' in text:
                         fake.adressbuch.append((b["params"]["arguments"]["firma"], [], []))
                     return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": text}], "isError": fehler}})
+                if b["params"]["name"] == "firmenkontakte":
+                    if fake.karten is None:
+                        return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "error": {"code": -32602, "message": "unknown tool: firmenkontakte"}})
+                    text = "%d Firmenkontakte\n%s" % (len(fake.karten), json.dumps({"kontakte": fake.karten, "teilweise": False}))
+                    return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": text}], "isError": False}})
                 if b["params"]["name"] == "kontakte_suchen":
                     if fake.adressbuch is None:   # a Homes without Radicale
                         return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "error": {"code": -32602, "message": "unknown tool: kontakte_suchen"}})

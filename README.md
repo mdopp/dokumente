@@ -26,7 +26,7 @@ is `ghcr.io/mdopp/dokumente`, built on every push to main.
 
 Tests run in the image: `docker build -t dokumente:test -f Containerfile .`
 then `docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3
-dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py vertraege/tests/test_kontakte_abgleich.py`.
+dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py`.
 
 ## The contract with laib's template
 
@@ -305,6 +305,20 @@ touched, an emptied one is deleted), the new fields and the views.
   `python3 /opt/kontakte_aufraeumen.py` lists what would become one,
   `--apply` does it. It needs Homes' tools firmenkontakte and
   kontakt_entfernen.
+- **A firm card without a phone or address** (owner 2026-11-09):
+  `kontakte_nachlesen.py` (its docstring is the contract) reads the
+  household firm cards lacking a phone, e-mail or address, finds each one's
+  documents in Paperless (its correspondent by firmen.py's rules, else a
+  phrase search of the name; the newest 3) and asks the model vertraege.py's
+  sender question; only values the text backs go into the card, only where
+  it is empty, never into a card edited on a phone. In Dokumente's
+  container: `python3 /opt/kontakte_nachlesen.py` (the dry run; asks the
+  model, writes no card), then `python3 /opt/kontakte_nachlesen.py --apply`
+  (`--firma "<Name>"` narrows it, `--max N` bounds it). Its record
+  `/dokumente/ordnen/nachlesen.json` keeps the answers and the firms read: a
+  rerun skips a firm whose documents did not change. On every run after
+  the hook, vertraege.py asks the same of a letter (any type) whose
+  correspondent's card lacks a phone or an address, at most 3 a run.
 - **All documents without a Bereich at once**, in Dokumente's container:
   `python3 /opt/ordnen.py --neue --max 0 --zeit 86400 --hintergrund` (log
   `/dokumente/ordnen/lauf.log`): read and filed 10 at a time until done, the
