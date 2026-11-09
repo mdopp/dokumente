@@ -758,6 +758,20 @@ class Steuer(unittest.TestCase):
         self.assertNotIn("Steuer-Art", was, "the owner's Steuer-Art stays")
         self.assertNotIn(o.tag("steuerlich")["id"], body.get("tags", []), "and the owner decides the tag")
 
+    def test_the_tax_year_from_the_title_when_the_model_named_none(self):
+        """owner 2026-11-09: the date ordnen put in front of the title, never Paperless' (often the scan's)"""
+        text, beleg = STEUER_FAELLE["Handwerkerleistungen"]
+        f, o = self.eingerichtet([{"id": 1, "title": "2022-07-16 Mosel - Rechnung", "created": "2026-11-08", "content": text},
+                                  {"id": 2, "title": "LBS - Antrag", "created": "2026-11-08", "content": text}])
+        plan = self.plan(answer_steuer("Handwerkerleistungen", beleg), text)
+        self.assertNotIn("Steuerjahr", plan["felder"])
+        werte = {c["field"]: c["value"] for c in ordnen.neue_werte(f.docs[1], plan, o, {})[0]["custom_fields"]}
+        self.assertEqual(werte[o.feld("Steuerjahr")["id"]], 2022)
+        body, was = ordnen.neue_werte(f.docs[2], plan, o, {})
+        self.assertNotIn("Steuerjahr", was, "no date in front: no year, not the scan's")
+        f.docs[1]["custom_fields"] = [{"field": o.feld("Steuerjahr")["id"], "value": 2021}]
+        self.assertNotIn("Steuerjahr", ordnen.neue_werte(f.docs[1], plan, o, {})[1], "a year there stays")
+
     def test_intake_marks_a_new_invoice(self):
         text, beleg = STEUER_FAELLE["Haushaltsnahe Dienstleistungen"]
         f, o = self.eingerichtet([{"id": 1, "title": "Reinigung", "content": text}])
