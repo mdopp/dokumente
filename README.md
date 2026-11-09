@@ -26,7 +26,7 @@ is `ghcr.io/mdopp/dokumente`, built on every push to main.
 
 Tests run in the image: `docker build -t dokumente:test -f Containerfile .`
 then `docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3
-dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_berichtigen.py`.
+dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py vertraege/tests/test_kontakte_abgleich.py`.
 
 ## The contract with laib's template
 
@@ -295,6 +295,16 @@ touched, an emptied one is deleted), the new fields and the views.
   statements Dokumente typed as a contract, takes off the contract fields
   vertraege.py's note names on them, fixes machine titles, never asks the
   model.
+- **One firm, one contact** (`firmen.py`, owner 2026-11-09): vertraege.py
+  matches a sender against the household address book (Homes'
+  kontakte_suchen) before kontakt_ergaenzen makes a card: legal form and
+  ALIASE folded, OCR's misreading of one word, the shorter name for the
+  fuller one, the fi/fl/ff OCR dropped put back where a correspondent or the
+  text has the word. `kontakte_aufraeumen.py` (its docstring is the
+  contract) puts right the cards made before, in Dokumente's container:
+  `python3 /opt/kontakte_aufraeumen.py` lists what would become one,
+  `--apply` does it. It needs Homes' tools firmenkontakte and
+  kontakt_entfernen.
 - **All documents without a Bereich at once**, in Dokumente's container:
   `python3 /opt/ordnen.py --neue --max 0 --zeit 86400 --hintergrund` (log
   `/dokumente/ordnen/lauf.log`): read and filed 10 at a time until done, the

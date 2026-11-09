@@ -1,0 +1,142 @@
+"""Owner 2026-11-09: a backfill of vertraege.py made one firm several household contacts („Union
+Krankenversicherung“ and „… Aktiengesellschaft“) and OCR's damage („BKK rmus“ for BKK firmus). Before
+kontakt_ergaenzen makes a card, the sender is matched against the address book by ordnen/firmen.py's rules;
+only when nothing matches is one made. Against test_vertraege's fake Paperless, model and Homes."""
+import importlib.util, json, os, unittest
+from pathlib import Path
+
+HIER = Path(__file__).resolve().parent
+
+
+def _lade(name, pfad):
+    spec = importlib.util.spec_from_file_location(name, pfad)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+t = _lade("test_vertraege_fakes", HIER / "test_vertraege.py")
+v = _lade("vertraege_skript", HIER.parent / "vertraege.py")
+
+
+def absender(firma, text=None):
+    """MALER_KONTAKT and its answer with another sender's name"""
+    return (text or t.MALER_KONTAKT).replace("Malerbetrieb Beispiel GmbH", firma), \
+        {**t.KONTAKT_ANTWORT, "Firma": {"wert": firma, "beleg": firma}}
+
+
+class Nacheinander(t.Model):
+    """a model that gives each ask the next answer"""
+
+    def __init__(self, antworten):
+        self.folge = list(antworten)
+        super().__init__(None)
+
+    @property
+    def answer(self):
+        return self.folge.pop(0) if len(self.folge) > 1 else self.folge[0]
+
+    @answer.setter
+    def answer(self, _):
+        pass
+
+
+class Abgleich(t.Lauf):
+    def rec(self):
+        with open(self.record) as f:
+            return json.load(f)
+
+    def lauf(self, firma, adressbuch=(), korrespondenten=None, text=None):
+        if os.path.exists(self.record):
+            os.remove(self.record)
+        text, antwort = absender(firma, text)
+        p, h = t.Paperless([t.rechnung(text=text)], correspondents=korrespondenten), t.Homes(adressbuch=adressbuch)
+        r = self.run_job(p, t.Model(antwort), homes=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return h, r
+
+    def test_another_legal_form_is_the_card_there(self):
+        h, r = self.lauf("Union Krankenversicherung Aktiengesellschaft", [("Union Krankenversicherung AG",)])
+        self.assertEqual([k["firma"] for k in h.kontakte()], ["Union Krankenversicherung AG"], "the card's own name: Homes finds it")
+        self.assertEqual(self.rec()["kontakte"]["1"]["als"], "Union Krankenversicherung AG")
+        self.assertIn("ist „Union Krankenversicherung AG“ im Adressbuch", r.stdout)
+
+    def test_an_alias_is_the_card_there_and_a_new_card_takes_the_fuller_name(self):
+        h, _ = self.lauf("Deutsche Krankenversicherung", [("DKV Deutsche Krankenversicherung AG",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "DKV Deutsche Krankenversicherung AG")
+        h, r = self.lauf("LBS Norddeutsche Landesbausparkasse Berlin - Hannover")
+        self.assertEqual(h.kontakte()[0]["firma"], "LBS Landesbausparkasse NordWest", "nothing there: made under ALIASE's name")
+        self.assertIn("kommt als „LBS Landesbausparkasse NordWest“ ins Adressbuch", r.stdout)
+
+    def test_a_life_insurer_is_not_the_property_insurer_of_the_same_group(self):
+        h, _ = self.lauf("Allianz Lebensversicherungs-AG", [("Allianz Versicherungs-AG",), ("Allianz",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "Allianz Lebensversicherungs-AG", "neither the Sach-AG nor the bare name: its own card")
+
+    def test_the_short_name_is_the_one_fuller_card_and_several_write_nothing(self):
+        h, _ = self.lauf("Allianz", [("Allianz Versicherungs-AG",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "Allianz Versicherungs-AG")
+        h, r = self.lauf("Allianz", [("Allianz Versicherungs-AG",), ("Allianz Lebensversicherungs-AG",)])
+        self.assertEqual(h.kontakte(), [], "two firms fit: none is guessed, none made")
+        e = self.rec()["kontakte"]["1"]
+        self.assertEqual((e["status"], e["kandidaten"]), ("mehrdeutig", ["Allianz Lebensversicherungs-AG", "Allianz Versicherungs-AG"]))
+        self.assertIn("passt zu mehreren Kontakten", r.stdout)
+        h, _ = self.lauf("Allianz", [("Allianz Versicherungs-AG",), ("Allianz Lebensversicherungs-AG", ["+49 30 1234567"])])
+        self.assertEqual(h.kontakte()[0]["firma"], "Allianz Lebensversicherungs-AG", "the document's number is on one of them")
+
+    def test_a_suffix_like_partner_is_the_same_firm(self):
+        h, _ = self.lauf("Thomas Stölting & Partner", [("Thomas Stölting",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "Thomas Stölting")
+
+    def test_ocr_misreading_one_letter_is_the_card_there_another_name_is_not(self):
+        h, _ = self.lauf("Dr. Stefan Himmeke", [("Dr. Stefan Hümmeke",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "Dr. Stefan Hümmeke")
+        h, _ = self.lauf("Malerei Schmidt", [("Malerei Schmitt",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "Malerei Schmidt", "d for t is no OCR error: another firm")
+        h, _ = self.lauf("Malerei Schmidt", [("Malerei Schmitt", ["030 1234567"])])
+        self.assertEqual(h.kontakte()[0]["firma"], "Malerei Schmitt", "with the document's number it is")
+
+    def test_a_lost_ligature_is_put_back_only_from_a_known_name(self):
+        h, r = self.lauf("BKK rmus", korrespondenten=[{"id": 5, "name": "BKK firmus"}])
+        self.assertEqual(h.kontakte()[0]["firma"], "BKK firmus", "Paperless knows the word with fi")
+        h, _ = self.lauf("BFS health nance GmbH", [("BFS health finance GmbH",)])
+        self.assertEqual(h.kontakte()[0]["firma"], "BFS health finance GmbH", "the address book knows it")
+        h, _ = self.lauf("Rollladen Herkenho GmbH", text=t.MALER_KONTAKT + "\nwww.herkenhoff-rollladen.example")
+        self.assertEqual(h.kontakte()[0]["firma"], "Rollladen Herkenhoff GmbH", "the text has it elsewhere")
+        h, _ = self.lauf("BKK rmus")
+        self.assertEqual(h.kontakte()[0]["firma"], "BKK rmus", "nobody knows „firmus“: the name stays as the text has it")
+
+    def test_a_firm_twice_in_one_run_is_one_card(self):
+        text = absender("Union Krankenversicherung")[0] + "\nUnion Krankenversicherung Aktiengesellschaft"
+        p, h = t.Paperless([t.rechnung(1, text=text), t.rechnung(2, text=text)]), t.Homes()
+        m = Nacheinander([absender("Union Krankenversicherung")[1], absender("Union Krankenversicherung Aktiengesellschaft")[1]])
+        r = self.run_job(p, m, homes=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([k["firma"] for k in h.kontakte()], ["Union Krankenversicherung", "Union Krankenversicherung"],
+                         "the second document finds the card the first made")
+
+    def test_homes_without_the_search_keeps_the_contact_for_the_next_run(self):
+        text, antwort = absender("Union Krankenversicherung")
+        p, h = t.Paperless([t.rechnung(text=text)]), t.Homes()
+        h.adressbuch = None   # kontakte_suchen fails
+        r = self.run_job(p, t.Model(antwort), homes=h)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(h.kontakte(), [], "unmatched, nothing is made")
+        self.assertIn("offen", self.rec()["kontakte"]["1"])
+
+
+class Zeilen(unittest.TestCase):
+    """kontakte_suchen's lines, and im_adressbuch on them"""
+
+    def test_lines_give_names_numbers_and_mails(self):
+        z = v.adressbuchzeilen("Allianz Versicherungs-AG (Allianz Versicherungs-AG) — Tel. 089 1234, +49 30 55 · E-Mail Info@Allianz.example\n"
+                               "Thomas Stölting — Geburtstag 3. Mai\n… und 3 weitere; such genauer.")
+        self.assertEqual(z, {"Allianz Versicherungs-AG": (["089 1234", "+49 30 55"], ["info@allianz.example"]), "Thomas Stölting": ([], [])})
+        self.assertEqual(v.adressbuchzeilen("Kein Kontakt passt zu „x“."), {})
+
+    def test_the_search_words_leave_out_legal_forms_and_short_words(self):
+        self.assertEqual(v.suchworte("Dr. Stefan Hümmeke GmbH & Co. KG"), ["Stefan", "Hümmeke"])
+        self.assertEqual(v.suchworte("BKK rmus"), ["BKK", "rmus"])
+
+    def test_none_and_the_name_put_right(self):
+        leer = lambda w: ""
+        self.assertEqual(v.im_adressbuch({"firma": "Neue Firma GmbH"}, leer), (None, None))
