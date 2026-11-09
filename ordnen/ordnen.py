@@ -50,7 +50,18 @@ wrong with it: the date as the text has it (the model's, else Paperless'
 created, JJJJ-MM when the text names only „Dezember 2007“, none when the
 text names neither), no consume folder's „(n)“, never the bare „Dokument“
 (the model's gegenstand, else the statement's heading line, else the type).
-berichtigen.py puts right what was filed before.
+berichtigen.py puts right what was filed before. A mail's subject a person
+did not write is machine-made too, whatever the file was called: a forwarded
+or answered one („Fwd:“, „WG:“, „AW:“, „Re:“) or one that is a file's name
+(„Rechnung_R-261241“); it becomes „JJJJ-MM-TT Absender - Gegenstand“, the
+subject cleaned where the model names none (2026-11-09, document 641).
+
+A sender's name gets back the fi, fl, ff, ffi, ffl OCR dropped (firmen.py's
+ligaturen) before it is matched or made a correspondent, where the text
+elsewhere, a correspondent, a firm card in Homes or a firm in the owner's
+phone contacts (Homes' firmenkontakte and handy_firmen, with HAUSHALT_URL and
+HAUSHALT_TOKEN) has the word with them: never „Rollladen Herkenho GmbH“ when
+„Herkenhoff“ is known (2026-11-09, document 641).
 
 For the tax return (owner 2026-11-09): a document of a STEUER_TYPEN
 (Rechnung, Beleg/Garantie, Vertrag, Versicherungsschein, Beitrag/Bescheid,
@@ -109,7 +120,8 @@ asks it, PAPERLESS_AI_LLM_*, else the scan's MODEL_URL, MODEL_KEY, MODEL_NAME):
 
 The folder: ORDNEN_DIR, else /dokumente/ordnen (Dokumente's backed-up
 folder), else /usr/src/paperless/data/ordnen (inside Paperless)."""
-import argparse, base64, hashlib, json, os, re, subprocess, sys, time, unicodedata, urllib.error, urllib.parse, urllib.request
+import argparse, base64, hashlib, importlib.util, json, os, re, subprocess, sys, time, unicodedata, urllib.error, urllib.parse, \
+    urllib.request
 from datetime import date, datetime, timezone
 
 E = os.environ
@@ -349,13 +361,36 @@ def titel_datum(text, *kandidaten):
     return ""
 
 
+# what a mail program puts before a subject it forwards or answers; a picture's or PDF's file ending
+MAIL_VORSATZ = re.compile(r"(?:(?:fwd?|wg|aw|re|antw|wtr)\s*:\s*)+", re.I)
+ENDUNG = re.compile(r"\.(?:pdf|jpe?g|png|gif|webp|heic|tiff?)$", re.I)
+
+
+def maschinen_betreff(titel):
+    """the subject of a title no person chose, cleaned („Fwd: Rechnung_R-261241“ → „Rechnung R-261241“), else None:
+    a forwarded or answered mail's (MAIL_VORSATZ) or a file's name (one word with „_“ or a file ending, or letters
+    and four digits: „Scan2026“)"""
+    m = MAIL_VORSATZ.match(titel)
+    rest = titel[m.end():] if m else titel
+    datei = re.fullmatch(r"\S+", rest) and re.search(r"_|[^\W\d_]\D*\d{4}|\d{4}\D*[^\W\d_]", rest) or ENDUNG.search(rest)
+    if not (m or datei):
+        return None
+    return re.sub(r"[\s_]+", " ", ENDUNG.sub("", rest)).strip()
+
+
 def titel_neu(doc, absender=None, gegenstand=None, datum_=None, typ=None, stapel=None):
-    """a machine-made title in the form „JJJJ-MM-TT Absender - Gegenstand“, or None to leave it. Machine-made: it is
-    still the name of the file Paperless took (a person who renamed it is never overruled) and Dokumente filed it
-    (its field Stapel, id `stapel`) or it names the document's correspondent as its sender. Rewritten only for what
-    is wrong: no date the text backs, a „(n)“ from the consume folder, the bare word „Dokument“"""
+    """a machine-made title in the form „JJJJ-MM-TT Absender - Gegenstand“, or None to leave it. Machine-made: a mail's
+    subject no person wrote (maschinen_betreff), always rewritten; or still the name of the file Paperless took (a
+    person who renamed it is never overruled) and Dokumente filed it (its field Stapel, id `stapel`) or it names the
+    document's correspondent as its sender, rewritten only for what is wrong: no date the text backs, a „(n)“ from
+    the consume folder, the bare word „Dokument“"""
     t = rest = re.sub(r"\s+", " ", doc.get("title") or "").strip()
     datei = os.path.splitext(doc.get("original_file_name") or "")[0].strip()
+    betreff = maschinen_betreff(t)
+    if betreff is not None:
+        tag = titel_datum(doc.get("content") or "", datum_, doc.get("created"))
+        neu = ("%s %s" % (tag, " - ".join(x for x in (absender, gegenstand or betreff or typ) if x))).strip()[:128]
+        return neu if neu and neu != t else None
     if not t or (datei and datei != t):
         return None
     mt, mn = re.match(r"(\d{4}-\d{2}(?:-\d{2})?) ", rest), re.search(r" \(\d+\)$", rest)
@@ -494,6 +529,29 @@ def ein_name(name):
     return len(set(buchstaben)) >= 3 and any(c in "aeiouy" for c in buchstaben)
 
 
+_FIRMEN = {}
+
+
+def firmen():
+    """firmen.py beside this file, loaded when first needed (it loads this file itself, for ALIASE and falten)"""
+    if not _FIRMEN:
+        pfad = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmen.py")
+        spec = importlib.util.spec_from_file_location("ordnen_firmen", pfad)
+        _FIRMEN["m"] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_FIRMEN["m"])
+    return _FIRMEN["m"]
+
+
+def ligaturen(name, text, korrespondenten, adressbuch=()):
+    """name with the fi, fl, ff, ffi, ffl OCR dropped put back where the text or a known name (a correspondent, a
+    firm in adressbuch: Homes' cards and the owner's phone contacts) has the word with them. A word the address book
+    has as it is stays; so does a correspondent's, unless the address book has it with a ligature: a correspondent
+    made from damaged text never keeps the next one damaged"""
+    f = firmen()
+    buch, korr = f.wortschatz(*adressbuch), f.wortschatz(*korrespondenten)
+    return f.ligaturen(name, buch | korr | f.wortschatz(text), buch | {w for w in korr if f.ligaturen(w, buch) == w})
+
+
 def passt(name, korrespondenten):
     """the existing correspondent a sender's name is: the same words, or one whose words start with the other's"""
     w = falten(name).split()
@@ -509,8 +567,9 @@ def passt(name, korrespondenten):
     return None
 
 
-def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
-    """the model's answer as what may be set: {typ, bereiche, absender, person, felder{}, pruefen[], weg[]}"""
+def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten, adressbuch=()):
+    """the model's answer as what may be set: {typ, bereiche, absender, person, felder{}, pruefen[], weg[]}.
+    adressbuch: the firms Homes knows (adressbuch()), for the ligatures OCR drops"""
     text = (doc.get("title") or "") + "\n" + (doc.get("content") or "")
     a = antwort if isinstance(antwort, dict) else {}
     out = {"typ": None, "bereiche": [], "absender": None, "person": None, "felder": {}, "pruefen": [], "weg": []}
@@ -535,7 +594,8 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
         out["pruefen"].append("das Modell ist unsicher")
     s = a.get("absender")
     if isinstance(s, dict) and isinstance(s.get("wert"), str) and s["wert"].strip():
-        name, beleg = re.sub(r"\s+", " ", s["wert"]).strip()[:128], belegt(s, text)
+        roh, beleg = re.sub(r"\s+", " ", s["wert"]).strip()[:128], belegt(s, text)
+        name = ligaturen(roh, text, korrespondenten, adressbuch)   # the text's word stays its proof (roh)
         bekannt = passt(kanonisch(name), korrespondenten)
         if not ein_name(name):
             out["weg"].append("Absender „%s“ (kein Name)" % name)
@@ -545,7 +605,7 @@ def auswerten(antwort, doc, typen, personen, haushalt, korrespondenten):
             out["weg"].append("Absender „%s“ (gehört zum Haushalt)" % name)
         elif bekannt and (beleg or falten(bekannt) in falten(text) or falten(kanonisch(name)) == falten(bekannt)):
             out["absender"] = bekannt
-        elif beleg and (im(name, beleg) or falten(name) in falten(beleg)):
+        elif beleg and (im(roh, beleg) or falten(roh) in falten(beleg)):
             out["absender"] = kanonisch(name)
         else:
             out["weg"].append("Absender „%s“ (steht so nicht im Text)" % name)
@@ -726,6 +786,7 @@ class Ordnung:
     def __init__(self, api, dry=False, log=print):
         self.api, self.dry, self.log = api, dry, log
         self.neu_id = -1
+        self.adressbuch = []   # the firms Homes knows, for a sender's ligatures (neue)
         self.laden()
 
     def laden(self):
@@ -1283,6 +1344,34 @@ def ordner_waehlen():
     return "ordnen-daten"
 
 
+def homes(werkzeug):
+    """one of Homes' Haushalt tools (HAUSHALT_URL, HAUSHALT_TOKEN) without arguments: its last line's JSON"""
+    r = urllib.request.Request(E["HAUSHALT_URL"], method="POST", data=json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": werkzeug, "arguments": {}}}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + E.get("HAUSHALT_TOKEN", "")})
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        res = json.loads(resp.read())
+    out = res.get("result") or {}
+    if res.get("error") or out.get("isError"):
+        raise ValueError("Homes: %s lehnt ab" % werkzeug)
+    return json.loads(str(((out.get("content") or [{}])[0]).get("text") or "").rsplit("\n", 1)[-1])
+
+
+def adressbuch(frag=None, log=print):
+    """the firms' names Homes knows: its firm cards (firmenkontakte) and the firms of the owner's phone contacts
+    (handy_firmen), name and organisation; [] without HAUSHALT_URL, and a tool that does not answer adds nothing"""
+    if frag is None and not E.get("HAUSHALT_URL"):
+        return []
+    out = []
+    for werkzeug in ("firmenkontakte", "handy_firmen"):
+        try:
+            res = (frag or homes)(werkzeug)
+            out += [n for k in (res.get("kontakte") or []) for n in (k.get("name"), k.get("org")) if isinstance(n, str) and n.strip()]
+        except (OSError, ValueError, AttributeError) as x:
+            log("ordnen: Homes nennt %s nicht (%s): die Namen der Absender nur aus Paperless" % (werkzeug, x))
+    return out
+
+
 def api_aus_env():
     return API(E.get("PAPERLESS_API", "http://127.0.0.1:8000"), E.get("PAPERLESS_TOKEN", ""),
                E.get("PAPERLESS_ADMIN_USER", "admin"), E.get("PAPERLESS_ADMIN_PASSWORD", ""))
@@ -1336,8 +1425,9 @@ def alles(api, ordner, args, log=print, ask=modell):
     return text
 
 
-def neue(api, ordner, args, log=print, ask=modell):
-    """intake: the documents without a Bereich this record has not seen; the order as it is"""
+def neue(api, ordner, args, log=print, ask=modell, homes_frag=None):
+    """intake: the documents without a Bereich this record has not seen; the order as it is. homes_frag: Homes'
+    tools as adressbuch() asks them (a test's fake)"""
     rec_path = os.path.join(ordner, "ordnen.json")
     rec = lesen(rec_path, {})
     o = Ordnung(api, log=log)
@@ -1361,6 +1451,7 @@ def neue(api, ordner, args, log=print, ask=modell):
     erlaubt = erlaubte_typen(o)
     fach = fach_lesen(o, api.all("/api/documents/?fields=id,correspondent,custom_fields&custom_fields__id__in=%d" % o.feld("Fachrichtung")["id"])) \
         if o.feld("Fachrichtung") and docs else {}
+    o.adressbuch = adressbuch(homes_frag, log) if docs else []
     for i in range(0, len(docs), PRO_LAUF):
         weiter = fragen(api, o, docs[i:i + PRO_LAUF], rec, personen, haushalt, frist, log, ask, None, lambda: schreiben(rec_path, rec))
         n += einordnen(api, o, docs[i:i + PRO_LAUF], rec, seen, erlaubt, personen, haushalt, fach, log)
@@ -1391,7 +1482,7 @@ def einordnen(api, o, docs, rec, seen, erlaubt, personen, haushalt, fach, log):
         if not a or a.get("sha") != sha(d):
             continue
         frisch = api("GET", "/api/documents/%d/" % d["id"])   # the family or Gesundheit may have set something since
-        plan = auswerten(a["antwort"], d, erlaubt, personen, haushalt, [c["name"] for c in o.korr])
+        plan = auswerten(a["antwort"], d, erlaubt, personen, haushalt, [c["name"] for c in o.korr], o.adressbuch)
         body, was = neue_werte(frisch, plan, o, fach)
         titel = titel_fuer(frisch, body, plan, o)
         if titel:   # the answer stays this document's: the title is part of what was asked

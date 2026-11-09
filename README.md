@@ -311,6 +311,17 @@ touched, an emptied one is deleted), the new fields and the views.
   „JJJJ-MM-TT Absender - Gegenstand“ when it lacks a date the text backs,
   carries the consume folder's „(n)“ or is the bare „Dokument“; JJJJ-MM when
   the text names only „Dezember 2007“, no date when it names neither.
+  A mail's subject no person wrote — forwarded or answered („Fwd:“, „WG:“,
+  „AW:“, „Re:“) or a file's name („Rechnung_R-261241“) — is machine-made
+  too and always rewritten, the cleaned subject the Gegenstand when the
+  model names none (2026-11-09). A subject a person typed stays the title.
+- **A sender's name whole** (2026-11-09): before a sender is matched or made
+  a correspondent, ordnen puts back the fi, fl, ff, ffi, ffl OCR dropped
+  (firmen.py's `ligaturen`) where the text elsewhere, a correspondent, a firm
+  card in Homes or a firm of the owner's phone contacts (Homes'
+  `firmenkontakte`, `handy_firmen`; `HAUSHALT_URL`/`HAUSHALT_TOKEN`) has the
+  word with them: „Rollladen Herkenho GmbH“ is made „Rollladen Herkenhoff
+  GmbH“. Homes away, it goes by Paperless alone.
 - **Once, what was filed before** (`berichtigen.py`, its docstring is the
   contract), in Dokumente's container: `python3 /opt/berichtigen.py
   --dry-run` writes `/dokumente/ordnen/zusammenfassung-berichtigen.txt` and

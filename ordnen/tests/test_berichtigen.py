@@ -156,6 +156,19 @@ class Titel(unittest.TestCase):
                   "original_file_name": "Mietvertrag Wohnung - Kopie (2).pdf"}
         self.assertIsNone(self.neu(upload, absender="Hausverwaltung Beispiel"), "not Dokumente's, and no sender of its correspondent")
 
+    def test_a_mails_machine_subject_is_rewritten(self):
+        # document 641 (2026-11-09): mailed in, the forwarded subject became the title, the attachment had its own name
+        mail = {"id": 641, "title": "Fwd: Rechnung_R-261241", "content": "Rollladen Herkenhoff GmbH\nRechnung R-261241 vom 05.11.2026\n",
+                "created": "2026-11-05", "original_file_name": "R-261241.pdf"}
+        self.assertEqual(self.neu(mail, absender="Rollladen Herkenhoff GmbH"), "2026-11-05 Rollladen Herkenhoff GmbH - Rechnung R-261241")
+        self.assertEqual(self.neu(mail, absender="Rollladen Herkenhoff GmbH", gegenstand="Reparatur Rollladen"),
+                         "2026-11-05 Rollladen Herkenhoff GmbH - Reparatur Rollladen")
+        self.assertEqual(self.neu({**mail, "title": "WG: AW: Ihre Rechnung"}, absender=None), "2026-11-05 Ihre Rechnung")
+        for titel in ("Re: Rechnung", "Scan_20261109", "IMG-4711.jpg", "Rechnung_R-261241", "Rechnung2026"):
+            self.assertIsNotNone(self.neu({**mail, "title": titel}, absender="Rollladen Herkenhoff GmbH"), titel)
+        for titel in ("Stromrechnung Oktober", "Rechnung", "Kfz-Versicherung", "2026-11-05 Rollladen Herkenhoff GmbH - Rechnung R-261241"):
+            self.assertIsNone(self.neu({**mail, "title": titel}, absender="Rollladen Herkenhoff GmbH"), "a person's subject stays: " + titel)
+
     def test_an_older_machine_title_without_a_stack_needs_its_correspondent(self):
         alt = {"id": 4, "title": "Skandia - Dokument", "content": WERT, "created": "2007-12-05", "original_file_name": "Skandia - Dokument.pdf"}
         self.assertEqual(self.neu(alt), "2007-12-05 Skandia Lebensversicherung AG - Jährliche Wertmitteilung über Ihre Skandia Fondspolice")
@@ -175,6 +188,34 @@ class Neue(unittest.TestCase):
             self.assertNotIn("(5)", f.docs[i]["title"])
         rec = json.loads(Path(self.dir, "ordnen.json").read_text())
         self.assertEqual(rec["antworten"]["599"]["sha"], ordnen.sha(f.docs[599]), "a new title asks the model nothing again")
+
+    def test_a_mailed_invoice_gets_its_sender_whole_and_a_title(self):
+        # document 641 (2026-11-09): the correspondent is made with the ff the owner's phone knows, the title rewritten
+        text = "Rollladen Herkenho GmbH\nRechnung R-261241 vom 05.11.2026\nBetrag 412,00 EUR\n"
+        f = paperless([{"id": 641, "title": "Fwd: Rechnung_R-261241", "content": text, "created": "2026-11-05",
+                        "original_file_name": "R-261241.pdf"}])
+        a = {"typ": "Rechnung", "bereiche": ["Haus"], "absender": {"wert": "Rollladen Herkenho GmbH", "beleg": "Rollladen Herkenho GmbH"},
+             "sicher": True}
+        gefragt = []
+        homes = {"firmenkontakte": {"kontakte": [{"name": "Stadtwerke"}]},
+                 "handy_firmen": {"kontakte": [{"name": "Herr Meier", "org": "Rollladen Herkenhoff"}]}}
+        ordnen.neue(f, self.dir, SimpleNamespace(max=None, zeit=600.0), log=lambda *_: None, ask=lambda m: a,
+                    homes_frag=lambda w: gefragt.append(w) or homes[w])
+        self.assertEqual(gefragt, ["firmenkontakte", "handy_firmen"])
+        self.assertEqual([c["name"] for c in f.korr if "Herkenho" in c["name"]], ["Rollladen Herkenhoff GmbH"])
+        self.assertEqual(f.docs[641]["title"], "2026-11-05 Rollladen Herkenhoff GmbH - Rechnung R-261241")
+
+    def test_homes_away_leaves_the_name_as_the_text_has_it(self):
+        f = paperless([{"id": 642, "title": "Rechnung", "content": "Rollladen Herkenho GmbH\n", "original_file_name": "Rechnung.pdf"}])
+        a = {"typ": "Rechnung", "bereiche": ["Haus"], "absender": {"wert": "Rollladen Herkenho GmbH", "beleg": "Rollladen Herkenho GmbH"},
+             "sicher": True}
+        said = []
+
+        def weg(w):
+            raise OSError("connection refused")
+        ordnen.neue(f, self.dir, SimpleNamespace(max=None, zeit=600.0), log=said.append, ask=lambda m: a, homes_frag=weg)
+        self.assertIn("Rollladen Herkenho GmbH", [c["name"] for c in f.korr])
+        self.assertTrue(any("Homes nennt handy_firmen nicht" in z for z in said), said)
 
     def test_max_0_files_all_of_them_ten_at_a_time(self):
         docs = [{"id": i, "title": "Brief %d" % i, "content": WERT} for i in range(1, 26)]

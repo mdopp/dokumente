@@ -17,7 +17,8 @@ from now on (STAND, titel_neu); this puts right what is filed already:
   any other field stays. A reminder already in Homes' calendar is named.
 - Titles: every machine-made title (ordnen.titel_neu: still the file's name,
   filed by Dokumente or naming its correspondent) with no date, a „(n)“ or
-  the bare „Dokument“ becomes „JJJJ-MM-TT Absender - Gegenstand“.
+  the bare „Dokument“ becomes „JJJJ-MM-TT Absender - Gegenstand“; so does a
+  mail's subject no person wrote („Fwd: Rechnung_R-261241“, 2026-11-09).
 
 Each changed document gets a note saying what was put right.
 
