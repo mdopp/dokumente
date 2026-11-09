@@ -624,5 +624,192 @@ class Haengt(unittest.TestCase):
         self.assertEqual([h["was"] for h in haengt_zeilen(out.getvalue())], ["zugang", "paperless"])
 
 
+# the tax marking (owner 2026-11-09): one invented document per Steuer-Art, the words the model quotes, and the
+# Steuer-Art the marking must come to; no real names or documents
+STEUER_FAELLE = {
+    "Handwerkerleistungen": ("Malerbetrieb Beispiel GmbH\nRechnung Nr. 2025-117 vom 14.03.2025\nAnstrich Wohnzimmer\n"
+                             "Arbeitskosten 3 Std. Maler 480,00 €\nMaterial 120,00 €\nGesamt 600,00 €",
+                             "Arbeitskosten 3 Std. Maler 480,00 €"),
+    "Haushaltsnahe Dienstleistungen": ("Glanz Gebäudereinigung\nRechnung vom 02.05.2025\nFensterreinigung Einfamilienhaus 150,00 €",
+                                       "Fensterreinigung Einfamilienhaus"),
+    "Arbeitszimmer & Arbeitsmittel": ("Elektromarkt Beispiel\nRechnung vom 10.01.2025\nMonitor 27 Zoll 299,00 €\nBürostuhl Ergo 189,00 €",
+                                      "Monitor 27 Zoll 299,00 €"),
+    "Fortbildung": ("Akademie Beispiel e. V.\nRechnung vom 20.06.2025\nSeminar Projektmanagement, 2 Tage, 890,00 €",
+                    "Seminar Projektmanagement"),
+    "Krankheitskosten": ("Zahnarztpraxis Dr. Beispiel\nRechnung nach GOZ vom 05.08.2025\nProfessionelle Zahnreinigung 95,00 €",
+                         "Zahnarztpraxis Dr. Beispiel"),
+    "Versicherungen & Vorsorge": ("Beispiel Krankenversicherung AG\nBeitragsbescheinigung 2025\nBeiträge zur Krankenversicherung 2025: 6.120,00 €",
+                                  "Beiträge zur Krankenversicherung 2025"),
+    "Spenden": ("Kinderhilfe Beispiel e. V.\nZuwendungsbestätigung über Geldzuwendungen\nBetrag: 100,00 € am 12.12.2025",
+                "Zuwendungsbestätigung über Geldzuwendungen"),
+    "Kinderbetreuung": ("Kita Sonnenschein\nJahresbescheinigung 2025\nBetreuungsbeiträge Januar bis Dezember 2025: 2.400,00 €",
+                        "Betreuungsbeiträge Januar bis Dezember 2025"),
+    "Kapitalerträge": ("Beispielbank AG\nJahressteuerbescheinigung 2025\nKapitalerträge 312,45 €, Kapitalertragsteuer 78,11 €",
+                       "Jahressteuerbescheinigung 2025"),
+    "Steuerbescheid & Finanzamt": ("Finanzamt Beispielstadt\nBescheid für 2024 über Einkommensteuer\nfestgesetzt 4.210,00 €",
+                                   "Bescheid für 2024 über Einkommensteuer"),
+}
+STEUER_TYP = {"Versicherungen & Vorsorge": "Beitrag/Bescheid", "Spenden": "Urkunde", "Kinderbetreuung": "Urkunde",
+              "Kapitalerträge": "Steuer", "Steuerbescheid & Finanzamt": "Steuer"}
+
+
+def answer_steuer(art, beleg, **kw):
+    a = {"typ": STEUER_TYP.get(art, "Rechnung"), "bereiche": ["Steuer"], "sicher": True, "steuer": {"wert": art, "beleg": beleg}}
+    a.update(kw)
+    return a
+
+
+class Steuer(unittest.TestCase):
+    def plan(self, a, content):
+        doc = {"id": 11, "title": "Beleg", "content": content}
+        return ordnen.auswerten(a, doc, list(ordnen.TYPEN), ["Anna"], ["Anna Muster"], [])
+
+    def eingerichtet(self, docs=()):
+        f = base(list(docs))
+        ordnen.struktur(ordnen.Ordnung(f), ["Anna"], log=lambda *_: None)
+        return f, ordnen.Ordnung(f)
+
+    def test_the_tag_and_fields_are_made_with_the_kinds_and_the_tag_stays(self):
+        f, o = self.eingerichtet()
+        felder = {x["name"]: x for x in f.felder}
+        self.assertEqual([x["label"] for x in felder["Steuer-Art"]["extra_data"]["select_options"]], list(ordnen.STEUER_ARTEN))
+        self.assertEqual(felder["Lohnkosten"]["data_type"], "monetary")
+        self.assertIsNotNone(o.tag("steuerlich"))
+        self.assertIn(ordnen.falten("steuerlich"), ordnen.bleibende_tags())
+
+    def test_each_kind_from_the_words_that_back_it(self):
+        self.assertEqual(set(STEUER_FAELLE), set(ordnen.STEUER_ARTEN), "one case per Steuer-Art")
+        for art, (text, beleg) in STEUER_FAELLE.items():
+            with self.subTest(art):
+                self.assertEqual(self.plan(answer_steuer(art, beleg), text).get("steuer"), art)
+
+    def test_never_a_guess(self):
+        text, beleg = STEUER_FAELLE["Handwerkerleistungen"]
+        konzert = "Konzertkasse Beispiel\nRechnung vom 01.04.2025\nKonzertkarte Parkett 89,00 €"
+        for name, a, t in (("unsure: null", answer_steuer("Spenden", "x", steuer=None), konzert),
+                           ("a concert is no gift", answer_steuer("Spenden", "Konzertkarte Parkett 89,00 €"), konzert),
+                           ("the words are not in the text", answer_steuer("Handwerkerleistungen", "Arbeitskosten 2 Std. 200,00 €"), text),
+                           ("not one of the kinds", answer_steuer("Kfz-Kosten", beleg), text),
+                           ("a bare string", answer_steuer("Spenden", "x", steuer="Spenden"), konzert)):
+            with self.subTest(name):
+                p = self.plan(a, t)
+                self.assertNotIn("steuer", p)
+                self.assertFalse({"Steuerjahr", "Lohnkosten"} & set(p["felder"]))
+                self.assertTrue(any(w.startswith("Steuer-Art") for w in p["weg"]) or a["steuer"] is None)
+
+    def test_labour_cost_for_35a_only_as_the_text_names_it(self):
+        text, beleg = STEUER_FAELLE["Handwerkerleistungen"]
+        lohn = {"wert": "480,00", "beleg": "Arbeitskosten 3 Std. Maler 480,00 €"}
+        self.assertEqual(self.plan(answer_steuer("Handwerkerleistungen", beleg, lohnkosten=lohn), text)["felder"]["Lohnkosten"], "EUR480.00")
+        self.assertEqual(self.plan(answer_steuer("Handwerkerleistungen", beleg, lohnkosten={**lohn, "wert": 480}), text)["felder"]["Lohnkosten"],
+                         "EUR480.00")
+        for name, lk in (("the total is no labour cost", {"wert": 600, "beleg": "Gesamt 600,00 €"}),
+                         ("a sum the words do not name", {"wert": 500, "beleg": "Arbeitskosten 3 Std. Maler 480,00 €"}),
+                         ("material", {"wert": 120, "beleg": "Material 120,00 €"})):
+            with self.subTest(name):
+                self.assertNotIn("Lohnkosten", self.plan(answer_steuer("Handwerkerleistungen", beleg, lohnkosten=lk), text)["felder"])
+        t, b = STEUER_FAELLE["Krankheitskosten"]
+        p = self.plan(answer_steuer("Krankheitskosten", b, lohnkosten={"wert": 95, "beleg": "Professionelle Zahnreinigung 95,00 €"}), t)
+        self.assertNotIn("Lohnkosten", p["felder"], "no labour cost outside §35a")
+
+    def test_the_year_is_the_invoices_never_the_scans(self):
+        text, beleg = STEUER_FAELLE["Handwerkerleistungen"]
+        p = self.plan(answer_steuer("Handwerkerleistungen", beleg, datum={"wert": "2025-03-14", "beleg": "vom 14.03.2025"}), text)
+        self.assertEqual(p["felder"]["Steuerjahr"], 2025, "the invoice's date the text backs")
+        p = self.plan(answer_steuer("Handwerkerleistungen", beleg, datum={"wert": "2026-11-09", "beleg": "gescannt 09.11.2026"}), text)
+        self.assertNotIn("Steuerjahr", p["felder"], "a date the text does not have is no year")
+        p = self.plan(answer_steuer("Handwerkerleistungen", beleg, steuerjahr={"wert": 2024, "beleg": "vom 14.03.2025"}), text)
+        self.assertNotIn("Steuerjahr", p["felder"])
+
+    def test_marked_only_on_a_receipts_type_and_never_over_the_owner(self):
+        text, beleg = STEUER_FAELLE["Handwerkerleistungen"]
+        f, o = self.eingerichtet([{"id": 1, "title": "x", "content": text}])
+        plan = self.plan(answer_steuer("Handwerkerleistungen", beleg, datum={"wert": "2025-03-14", "beleg": "vom 14.03.2025"},
+                                       lohnkosten={"wert": 480, "beleg": "Arbeitskosten 3 Std. Maler 480,00 €"}), text)
+        body, was = ordnen.neue_werte(f.docs[1], plan, o, {})
+        self.assertIn(o.tag("steuerlich")["id"], body["tags"])
+        werte = {c["field"]: c["value"] for c in body["custom_fields"]}
+        self.assertEqual(werte[o.feld("Steuer-Art")["id"]], ordnen.optionen_von(o, "Steuer-Art")["Handwerkerleistungen"])
+        self.assertEqual(werte[o.feld("Steuerjahr")["id"]], 2025)
+        self.assertEqual(werte[o.feld("Lohnkosten")["id"]], "EUR480.00")
+        body, was = ordnen.neue_werte(f.docs[1], {**plan, "typ": "Brief", "bereiche": ["Haus"]}, o, {})
+        self.assertFalse({"Steuer-Art", "Steuerjahr", "Lohnkosten"} & set(was), "a letter is no receipt")
+        self.assertNotIn(o.tag("steuerlich")["id"], body.get("tags", []))
+        f.docs[1]["custom_fields"] = [{"field": o.feld("Steuer-Art")["id"], "value": ordnen.optionen_von(o, "Steuer-Art")["Spenden"]}]
+        body, was = ordnen.neue_werte(f.docs[1], plan, o, {})
+        self.assertNotIn("Steuer-Art", was, "the owner's Steuer-Art stays")
+        self.assertNotIn(o.tag("steuerlich")["id"], body.get("tags", []), "and the owner decides the tag")
+
+    def test_intake_marks_a_new_invoice(self):
+        text, beleg = STEUER_FAELLE["Haushaltsnahe Dienstleistungen"]
+        f, o = self.eingerichtet([{"id": 1, "title": "Reinigung", "content": text}])
+        ordnen.neue(f, tempfile.mkdtemp(), args(max=5), log=lambda *_: None,
+                    ask=lambda m: answer_steuer("Haushaltsnahe Dienstleistungen", beleg, bereiche=["Haus"]))
+        self.assertIn(o.tag("steuerlich")["id"], f.docs[1]["tags"])
+        self.assertIn(o.tag("Haus")["id"], f.docs[1]["tags"])
+
+    def test_the_question_names_the_kinds_and_the_shape(self):
+        system, user = (m["content"] for m in ordnen.frage({"title": "x", "content": "y"}, ordnen.TYPEN, [], [], []))
+        self.assertIn('"steuer": {"wert": eine der Steuer-Arten', system)
+        self.assertIn("nie das Datum eines Scans", system)
+        for art in ordnen.STEUER_ARTEN:
+            self.assertIn("- %s: " % art, user)
+
+
+class SteuerLauf(unittest.TestCase):
+    """ordnen.py steuer: the documents there are, once"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        text, _ = STEUER_FAELLE["Handwerkerleistungen"]
+        self.f = base([{"id": 1, "title": "Maler", "content": text, "document_type": 1},
+                       {"id": 2, "title": "Konzert", "content": "Konzertkarte 89,00 €", "document_type": 1},
+                       {"id": 3, "title": "Arztbrief", "content": ARZTBRIEF, "document_type": 2}])
+        ordnen.struktur(ordnen.Ordnung(self.f), ["Anna"], log=lambda *_: None)
+        self.f.felder = [x for x in self.f.felder if x["name"] not in ("Steuer-Art", "Lohnkosten")]   # the box before this change
+        self.f.tags = [t for t in self.f.tags if t["name"] != "steuerlich"]
+        self.f.writes.clear()
+        sha = {i: ordnen.sha(d) for i, d in self.f.docs.items()}
+        Path(self.dir, "ordnen.json").write_text(json.dumps({"antworten": {
+            str(i): {"sha": sha[i], "stand": 3, "antwort": {"typ": "Rechnung", "bereiche": ["Haus"], "sicher": True}} for i in (1, 2, 3)}}))
+        self.asked = []
+
+    def ask(self, m):
+        self.asked.append(m[1]["content"])
+        if "Malerbetrieb" in m[1]["content"]:
+            return answer_steuer("Handwerkerleistungen", "Arbeitskosten 3 Std. Maler 480,00 €",
+                                 datum={"wert": "2025-03-14", "beleg": "vom 14.03.2025"},
+                                 lohnkosten={"wert": 480, "beleg": "Arbeitskosten 3 Std. Maler 480,00 €"})
+        return answer_steuer("Spenden", "Konzertkarte 89,00 €")
+
+    def test_dry_run_asks_the_receipts_again_and_changes_nothing(self):
+        text = ordnen.steuer(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(self.f.writes, [])
+        self.assertEqual(len(self.asked), 2, "a medical letter is no receipt")
+        self.assertIn("steuerlich markiert: 1", text)
+        self.assertIn("    1  Handwerkerleistungen (mit Lohnkosten: 1)", text)
+        self.assertIn("#1 Maler → ", Path(self.dir, "zusammenfassung-steuer.txt").read_text())
+
+    def test_apply_backs_up_first_makes_the_fields_and_sets_only_the_marking(self):
+        ordnen.steuer(self.f, self.dir, args(dry_run=True), log=lambda *_: None, ask=self.ask)
+        n = len(self.asked)
+        before = copy.deepcopy(self.f.docs)
+        ordnen.steuer(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertEqual(len(self.asked), n, "the dry run's answers are used")
+        self.assertEqual(len(list(Path(self.dir).glob("sicherung-*.json"))), 1)
+        o = ordnen.Ordnung(self.f)
+        self.assertEqual(self.f.docs[1]["tags"], before[1]["tags"] + [o.tag("steuerlich")["id"]])
+        werte = {c["field"]: c["value"] for c in self.f.docs[1]["custom_fields"]}
+        self.assertEqual(werte, {o.feld("Steuer-Art")["id"]: ordnen.optionen_von(o, "Steuer-Art")["Handwerkerleistungen"],
+                                 o.feld("Steuerjahr")["id"]: 2025, o.feld("Lohnkosten")["id"]: "EUR480.00"})
+        for i in (2, 3):
+            self.assertEqual(self.f.docs[i], before[i])
+        for i, d in self.f.docs.items():
+            self.assertEqual((d["document_type"], d["correspondent"], d["title"]), (before[i]["document_type"], before[i]["correspondent"], before[i]["title"]))
+        before = len(self.f.writes)
+        ordnen.steuer(self.f, self.dir, args(), log=lambda *_: None, ask=self.ask)
+        self.assertEqual([w for w in self.f.writes[before:] if w[1].startswith("/api/documents/1")], [], "a second run sets nothing")
+
+
 if __name__ == "__main__":
     unittest.main()
