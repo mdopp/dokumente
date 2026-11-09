@@ -23,9 +23,14 @@ What it does:
   kontaktdaten(): only values the text backs, never the household's own (Paperless' users, HAUSHALT_NAMEN).
   A document whose sender is another firm gives nothing. The answers are kept by the text's hash, so --apply
   after a dry run asks again only for a text that changed.
+- first the owner's own phone contacts (Homes' handy_firmen: the firms in the Immich key owner's
+  /<login>/handy-kontakte/, nobody else's): when exactly one is the card's firm by firmen.py's rules (FN or ORG),
+  its first number, mail and whole address go into the card's empty fields and win over a document's text;
+  several: none is taken, the line names them. A Homes without the tool: the documents only.
 - writes through kontakt_ergaenzen only what the card lacks (phone, e-mail, address, contact person, an IBAN
   with its bank and holder): Homes fills only what is empty and never changes a value.
-- says per firm in German what it took („Telefon …, Anschrift … übernommen (aus Dokument #123)“) or „nichts im
+- says per firm in German what it took and from where („Telefon … übernommen (aus deinen
+  Handy-Kontakten); Anschrift … übernommen (aus Dokument #123)“) or „nichts im
   Text gefunden“, and records it in /dokumente/ordnen/nachlesen.json (NACHLESEN_FILE): a rerun skips a firm
   already read (with --apply) whose documents are the same, by id and text.
 
@@ -140,12 +145,64 @@ def fehlende_args(args, stand):
     return out
 
 
-def nachlesen(karte, docs, frag, haushalt, personen, mails, namen, antworten, apply, log):
-    """one card's documents, newest first, until it has phone, e-mail and address: [(field, value, doc id)] taken
-    (or, in the dry run, that would be), and the senders that were another firm"""
+HANDY = "handy"   # the source of a value from the owner's phone contacts, beside a document's id
+
+
+def handy_treffer(karte, handy):
+    """the owner's phone contacts that are the card's firm by FN or ORG: firmen.py's rules (legal form and ALIASE
+    folded, OCR's misreading, the shorter name for the fuller one), else, none matching so, all of one name's words
+    in the other's („Wienkämper“ for „Friedr. Wilh. Wienkämper GmbH & Co. KG“, firmen.derselbe)"""
+    def namen(h):
+        return [n for n in {h.get("name"), h.get("org")} if n]
+    out = [h for h in handy if any(firmen.gleich(n, karte["name"]) or firmen.gleich(karte["name"], n) for n in namen(h))]
+    return out or [h for h in handy if any(firmen.derselbe(n, karte["name"]) for n in namen(h))]
+
+
+def handy_args(h):
+    """a phone contact's values as kontaktdaten gives a document's: the first number, mail, whole address"""
+    adr = [a for a in h.get("anschrift") or [] if a.get("strasse") and a.get("plz") and a.get("ort")]
+    out = {"telefon": (h.get("telefon") or [""])[0], "email": (h.get("email") or [""])[0]}
+    if adr:
+        out["anschrift"] = {k: adr[0][k] for k in ("strasse", "plz", "ort", "land") if adr[0].get(k)}
+    return {k: v for k, v in out.items() if v}
+
+
+def schreiben(karte, args, stand, quelle, haushalt, apply, log):
+    """of args what the card lacks into it through kontakt_ergaenzen (the dry run: as if); [(field, value, quelle)]
+    taken, stand updated; None when Homes took nothing"""
+    neu = fehlende_args(args, stand)
+    if not neu:
+        return []
+    neu = {"firma": karte["name"], **neu}
+    if apply:
+        text_h, res = haushalt("kontakt_ergaenzen", neu)
+        if res.get("status") not in ("ergaenzt", "angelegt", "unveraendert"):
+            log("„%s“: Homes nahm nichts (%s)" % (karte["name"], text_h.split("\n")[0]))
+            return None
+        felder = res.get("felder") or {}
+        taken = [f for f in neu if f != "firma" and felder.get(f) in ("angelegt", "ergaenzt")]
+    else:
+        taken = [f for f in neu if f != "firma"]
+    out = []
+    for f in taken:
+        if f not in ("bank", "kontoinhaber"):
+            stand[f] = [neu[f]] if f in ("telefon", "email", "iban", "anschrift") else neu[f]
+            out.append((f, neu[f], quelle))
+    return out
+
+
+def nachlesen(karte, docs, frag, haushalt, personen, mails, namen, antworten, apply, log, handy=None):
+    """one card: first its one phone contact (handy, the owner's; it wins over a document's text), then its
+    documents, newest first, until it has phone, e-mail and address: [(field, value, HANDY or doc id)] taken (or,
+    in the dry run, that would be), and the senders that were another firm"""
     stand = aufraeumen.werte(karte)
     stand["anschrift"] = list(stand["anschrift"])
     genommen, fremd = [], []
+    if handy:
+        g = schreiben(karte, handy_args(handy), stand, HANDY, haushalt, apply, log)
+        if g is None:
+            return genommen, fremd
+        genommen += g
     for d in docs:
         if all(stand[f] for f in LUECKEN):
             break
@@ -165,41 +222,33 @@ def nachlesen(karte, docs, frag, haushalt, personen, mails, namen, antworten, ap
         if not firmen.derselbe(args["firma"], karte["name"]):
             fremd.append((args["firma"], d["id"]))
             continue
-        neu = fehlende_args(args, stand)
-        if not neu:
-            continue
-        neu = {"firma": karte["name"], **neu}
-        if apply:
-            text_h, res = haushalt("kontakt_ergaenzen", neu)
-            if res.get("status") not in ("ergaenzt", "angelegt", "unveraendert"):
-                log("„%s“: Homes nahm nichts (%s)" % (karte["name"], text_h.split("\n")[0]))
-                break
-            felder = res.get("felder") or {}
-            taken = [f for f in neu if f != "firma" and felder.get(f) in ("angelegt", "ergaenzt")]
-        else:
-            taken = [f for f in neu if f != "firma"]
-        for f in taken:
-            if f in ("bank", "kontoinhaber"):
-                continue
-            stand[f] = [neu[f]] if f in ("telefon", "email", "iban", "anschrift") else neu[f]
-            genommen.append((f, neu[f], d["id"]))
+        g = schreiben(karte, args, stand, d["id"], haushalt, apply, log)
+        if g is None:
+            break
+        genommen += g
     return genommen, fremd
 
 
-def satz(name, genommen, fremd, docs, apply):
+def herkunft(quelle):
+    return "aus deinen Handy-Kontakten" if quelle == HANDY else "aus Dokument #%d" % quelle
+
+
+def satz(name, genommen, fremd, docs, apply, mehrdeutig=()):
     """the German line for one firm"""
-    if not docs:
-        return "%s: keine Dokumente in Paperless gefunden" % name
+    hinweis = "; passt zu mehreren Handy-Kontakten (%s): von dort nichts übernommen" % ", ".join(
+        "„%s“" % m for m in mehrdeutig) if mehrdeutig else ""
     if not genommen:
+        if not docs:
+            return "%s: keine Dokumente in Paperless gefunden%s" % (name, hinweis)
         z = "%s: nichts im Text gefunden (%s)" % (name, ", ".join("Dokument #%d" % d["id"] for d in docs))
         if fremd:
             z += "; Absender dort: %s" % ", ".join("„%s“ (#%d)" % f for f in fremd)
-        return z
+        return z + hinweis
     teile = []
-    for doc in dict.fromkeys(i for _, _, i in genommen):
-        werte = ", ".join(zeigen(f, v) for f, v, i in genommen if i == doc)
-        teile.append("%s %s (aus Dokument #%d)" % (werte, "übernommen" if apply else "würde übernommen", doc))
-    return "%s: %s" % (name, "; ".join(teile))
+    for q in dict.fromkeys(i for _, _, i in genommen):
+        werte = ", ".join(zeigen(f, v) for f, v, i in genommen if i == q)
+        teile.append("%s %s (%s)" % (werte, "übernommen" if apply else "würde übernommen", herkunft(q)))
+    return "%s: %s%s" % (name, "; ".join(teile), hinweis)
 
 
 def laden(pfad):
@@ -274,6 +323,11 @@ def main(argv=None, haushalt=None, paperless=None, frag=None, log=print, datei=N
     personen = vertraege.haushalt(users, E.get("HAUSHALT_NAMEN", ""), E.get("PAPERLESS_USER", "dokumente"))
     mails = {str(u["email"]).casefold() for u in users if u.get("email")}
     namen = [c["name"] for c in korr]
+    try:   # the owner's own phone contacts (Homes knows whose: the Immich key's owner), only their firms
+        handy = haushalt("handy_firmen", {})[1].get("kontakte") or []
+    except (OSError, RuntimeError) as x:
+        handy = []
+        log("kontakte_nachlesen: deine Handy-Kontakte nicht gelesen (%s): nur die Dokumente" % str(x).split("\n")[0])
     log("%d Firmenkontakte ohne Telefon, E-Mail oder Anschrift; %s:" % (len(karten), "es wird nachgelesen" if args.apply
                                                                         else "Probelauf, nichts wird geschrieben"))
     gelesen = schon = 0
@@ -291,14 +345,17 @@ def main(argv=None, haushalt=None, paperless=None, frag=None, log=print, datei=N
             log("kontakte_nachlesen: Paperless antwortet nicht (%s); der nächste Lauf macht weiter" % x)
             speichern(datei, rec)
             return 1
-        stand = sorted([str(d["id"]), sha(d.get("content"))] for d in docs)
+        treffer = handy_treffer(k, handy)
+        eins = treffer[0] if len(treffer) == 1 else None
+        stand = sorted([str(d["id"]), sha(d.get("content"))] for d in docs) + (
+            [[HANDY, sha(json.dumps(handy_args(eins), sort_keys=True))]] if eins else [])
         alt = rec["firmen"].get(k["kennung"])
         if alt and alt.get("dokumente") == stand:
             schon += 1
             continue
         try:
             genommen, fremd = nachlesen(k, docs, frag, haushalt, personen, mails, namen, rec["antworten"], args.apply,
-                                        lambda z: log("- " + z))
+                                        lambda z: log("- " + z), eins)
         except (OSError, ValueError, KeyError, IndexError) as x:
             log("kontakte_nachlesen: das Modell oder Homes antwortet nicht (%s); der nächste Lauf macht weiter" % x)
             speichern(datei, rec)
@@ -308,10 +365,11 @@ def main(argv=None, haushalt=None, paperless=None, frag=None, log=print, datei=N
             speichern(datei, rec)
             return 1
         gelesen += 1
-        log("- " + satz(k["name"], genommen, fremd, docs, args.apply))
+        log("- " + satz(k["name"], genommen, fremd, docs, args.apply,
+                        sorted(h.get("name") or h.get("org") for h in treffer) if len(treffer) > 1 else ()))
         if args.apply:
             rec["firmen"][k["kennung"]] = {"name": k["name"], "dokumente": stand, "am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                           "uebernommen": [{"feld": f, "wert": v, "dokument": i} for f, v, i in genommen]}
+                                           "uebernommen": [{"feld": f, "wert": v, "quelle": i} for f, v, i in genommen]}
         speichern(datei, rec)
     if schon:
         log("%d Firmen schon nachgelesen, ihre Dokumente unverändert: übersprungen" % schon)
