@@ -9,6 +9,11 @@ the cards made before.
 
   kontakte_aufraeumen.py            the dry run: what would become one, in German
   kontakte_aufraeumen.py --apply    does it
+  --name "<Zielname im Probelauf>=<gewünschter Name>"   (repeatable) the name a group keeps, the owner's
+                                    instead of the one the dry run proposed (any card name of the group fits too)
+  --entfernen "<Name>"              (repeatable) removes a card Homes made that holds nothing: no number, mail,
+                                    IBAN, address or contact person, not edited by hand (else refused)
+  The dry run shows what the flags do; a flag that fits nothing changes nothing and says so.
 
 What it does:
 - reads the firm cards (category Firma) through Homes' Haushalt tool
@@ -22,9 +27,13 @@ What it does:
   Sach-AG there joins the one that shares a number, mail, IBAN or address
   with it, else it stays and the list says so).
 - per group the name it keeps: a card edited by hand keeps its own (two such
-  in one group: nothing is changed, it is listed); else Paperless'
-  correspondent's, else ALIASE's fuller one, else the most specific, with
-  umlauts, with a legal form, shortest. A card of that name stays; the others'
+  in one group: nothing is changed, it is listed); else ALIASE's fuller one;
+  else of the cards' names and Paperless' correspondent of the same words
+  the fullest (owner 2026-11-09: „DKV Deutsche Krankenversicherung AG“ over
+  „Deutsche Krankenversicherung“): the most words, then of an OCR pair the
+  one with the umlaut or ligature (Hümmeke over Himmeke), then the one with
+  a legal form, written short (AG, GmbH: „Union Krankenversicherung
+  Aktiengesellschaft“ is kept as „… AG“), then the correspondent's spelling. A card of that name stays; the others'
   numbers, mails, IBAN with bank and holder, address and contact person go into
   it through kontakt_ergaenzen (which makes it under that name when there is
   none), and each is removed (kontakt_entfernen) once Homes took all it had.
@@ -178,25 +187,46 @@ def gruppen(karten):
     return [[karten[i] for i in g] for g in gr.values()], offen
 
 
+def kurzform(name):
+    """a name with its legal form written short: „… Aktiengesellschaft“ is „… AG“"""
+    name = re.sub(r"([\s-])Aktiengesellschaft$", r"\1AG", name)
+    return re.sub(r"\s+Gesellschaft mit beschr(?:ä|ae)nkter Haftung$", " GmbH", name)
+
+
+def voll(name, korr=()):
+    """the order of a group's names, fullest first: most words, umlaut or ligature (OCR loses them), a legal form,
+    the correspondent's spelling, shortest"""
+    f = firmen.falten(name)
+    return (-len(firmen.worte(name)), not firmen.mit_umlaut(name), -sum(f.count(lig) for lig in firmen.LIGATUREN),
+            firmen.worte(name) == f.split(), name not in korr, len(name))
+
+
 def ziel(gruppe, korr):
     """the name the group keeps, and the card that has it (None: kontakt_ergaenzen makes it)"""
     hand = [k for k in gruppe if k.get("von_hand")]
     if hand:
         return hand[0]["name"], hand[0]
-    name = next((c for c in korr if any(firmen.gleich(k["heil"], c) == "gleich" for k in gruppe)), None) \
-        or next((firmen.kanonisch(k["heil"]) for k in gruppe if firmen.kanonisch(k["heil"])), None)
+    name = next((firmen.kanonisch(k["heil"]) for k in gruppe if firmen.kanonisch(k["heil"])), None)
     if not name:
-        def rang(k):
-            n = k["heil"]
-            return (-len(firmen.kern(n)), not firmen.mit_umlaut(n), firmen.worte(n) == firmen.falten(n).split(), len(n),
-                    -sum(bool(v) for v in werte(k).values()))
-        name = min(gruppe, key=rang)["heil"]
-    schluessel = lambda s: re.sub(r"\s", "", s).casefold()
-    return name, next((k for k in gruppe if schluessel(k["name"]) == schluessel(name)), None)
+        namen = [k["heil"] for k in gruppe] + [c for c in korr if any(firmen.gleich(k["heil"], c) == "gleich" for k in gruppe)]
+        name = min(namen, key=lambda n: voll(n, korr))
+    name = kurzform(name)
+    return name, karte_namens(gruppe, name)
 
 
-def plan(karten, korr):
-    """what becomes one: [{"ziel", "behalten", "quellen": [(card, [fields taken], why it stays or None)], "hinweis"}]"""
+def schluessel(s):
+    return re.sub(r"\s", "", str(s)).casefold()
+
+
+def karte_namens(karten, name):
+    return next((k for k in karten if schluessel(k["name"]) == schluessel(name)), None)
+
+
+def plan(karten, korr, namen=None):
+    """what becomes one: [{"ziel", "vorschlag", "behalten", "quellen": [(card, [fields taken], why it stays or None)],
+    "hinweis", "flagge"}]. namen: {a name of the group (the proposed one or a card's): the owner's} (--name); vorschlag
+    is the proposed name when the owner's replaced it, flagge the --name that fit"""
+    namen = namen or {}
     gr, offen = gruppen(karten)
     out = []
     for g in sorted(gr, key=lambda g: firmen.falten(g[0]["heil"])):
@@ -204,6 +234,12 @@ def plan(karten, korr):
         if len(g) == 1 and g[0]["heil"] == g[0]["name"] and not (firmen.kanonisch(g[0]["name"]) or g[0]["name"]) != g[0]["name"]:
             continue   # alone, its name whole: not renamed after Paperless' spelling
         name, behalten = ziel(g, korr)
+        vorschlag = flagge = None
+        eigene = {schluessel(name)} | {schluessel(k[x]) for k in g for x in ("name", "heil")}
+        flagge = next((v for v in namen if schluessel(v) in eigene), None) if not hand else None
+        if flagge and schluessel(namen[flagge]) != schluessel(name):
+            vorschlag, name = name, namen[flagge]
+            behalten = karte_namens(g, name)
         if len(hand) > 1:
             out.append({"ziel": name, "behalten": None, "quellen": [], "hinweis": "„%s“ sind von Hand bearbeitet: nichts geändert, bitte "
                         "selbst zusammenführen" % "“, „".join(k["name"] for k in hand)})
@@ -237,7 +273,8 @@ def plan(karten, korr):
                     stand[f] = w[f]
             quellen.append((k, nimmt, bleibt))
         if quellen:
-            out.append({"ziel": name, "behalten": behalten, "quellen": quellen, "hinweis": None})
+            out.append({"ziel": name, "vorschlag": vorschlag, "flagge": flagge, "behalten": behalten, "quellen": quellen,
+                        "hinweis": None})
     for n, ziele in sorted(offen.items()):
         out.append({"ziel": None, "behalten": None, "quellen": [], "hinweis": "„%s“ passt zu „%s“: bleibt, bitte sagen, wohin" % (
             n, "“ und „".join(ziele))})
@@ -255,7 +292,9 @@ def zeilen(p):
         nimmt = []
         for _, n, _ in g["quellen"]:
             nimmt += [x for x in n if x not in nimmt]
-        z = "„%s“ → „%s“%s" % ("“ + „".join(namen), g["ziel"], " (übernimmt: %s)" % ", ".join(nimmt) if nimmt else "")
+        z = "„%s“ → „%s“%s%s" % ("“ + „".join(namen), g["ziel"], " (statt „%s“, --name)" % g["vorschlag"] if g.get("vorschlag")
+                                 else " (--name: wie vorgeschlagen)" if g.get("flagge") else "",
+                                 " (übernimmt: %s)" % ", ".join(nimmt) if nimmt else "")
         if not g["behalten"]:
             z += "; neu angelegt"
         for k, _, bleibt in g["quellen"]:
@@ -263,6 +302,45 @@ def zeilen(p):
                 z += "; „%s“ bleibt: %s" % (k["name"], bleibt)
         out.append(z)
     return out
+
+
+def leer(k):
+    """why a card may not be removed by --entfernen, or None: it holds nothing and Homes made it"""
+    if k.get("von_hand"):
+        return "von Hand bearbeitet"
+    w = werte(k)
+    da = [WORT[f] for f in FELDER if w[f]] + (["Anschrift"] if k.get("anschrift") and not w["anschrift"] else [])
+    return "hat %s" % ", ".join(da) if da else None
+
+
+def flaggen(karten, korr, namen, entfernen):
+    """the cards --entfernen removes, the plan with --name's names, and why a flag fits nothing ([German lines])"""
+    fehler, weg = [], []
+    for n in entfernen:
+        treffer = [k for k in karten if schluessel(k["name"]) == schluessel(n)]
+        if not treffer:
+            fehler.append("--entfernen „%s“: kein Firmenkontakt dieses Namens" % n)
+        for k in treffer:
+            grund = leer(k)
+            if grund:
+                fehler.append("--entfernen „%s“: %s, wird nicht entfernt" % (n, grund))
+            else:
+                weg.append(k)
+    p = plan([k for k in karten if not any(k is x for x in weg)], korr, namen)
+    genutzt = [g["flagge"] for g in p if g.get("flagge")]
+    vorgeschlagen = [g["ziel"] for g in p if g["quellen"]]
+    for v, n in namen.items():
+        if genutzt.count(v) == 1:
+            continue
+        hand = any(k.get("von_hand") and schluessel(k["name"]) == schluessel(v) for k in karten)
+        fehler.append("--name „%s=%s“: %s" % (v, n, "„%s“ ist von Hand bearbeitet, bitte dort ändern" % v if hand else
+                                             "passt zu mehreren Gruppen" if genutzt.count(v) else
+                                             "kein Zielname im Probelauf; vorgeschlagen sind „%s“" % "“, „".join(vorgeschlagen)))
+    for g in p:
+        if g.get("vorschlag") and not any(firmen.gleich(g["ziel"], k["heil"]) or firmen.gleich(k["heil"], g["ziel"])
+                                          for k in [g["behalten"] or {"heil": ""}] + [q[0] for q in g["quellen"]] if k["heil"]):
+            fehler.append("--name „%s=%s“: „%s“ ist keiner der Namen dieser Firma" % (g["vorschlag"], g["ziel"], g["ziel"]))
+    return weg, p, fehler
 
 
 def ausfuehren(p, haushalt, log=print):
@@ -302,7 +380,19 @@ def ausfuehren(p, haushalt, log=print):
 def main(argv=None, haushalt=None, paperless=None, log=print):
     ap = argparse.ArgumentParser(description="Doppelte Firmenkontakte im Haushalts-Adressbuch zusammenführen (Probelauf ohne --apply)")
     ap.add_argument("--apply", action="store_true", help="zusammenführen, sonst nur die Liste")
+    ap.add_argument("--name", action="append", default=[], metavar="VORSCHLAG=NAME",
+                    help="der Name, den eine Gruppe behält, statt des im Probelauf vorgeschlagenen (mehrfach möglich)")
+    ap.add_argument("--entfernen", action="append", default=[], metavar="NAME",
+                    help="eine leere, von Homes angelegte Karte entfernen (mehrfach möglich)")
     args = ap.parse_args(argv)
+    namen = {}
+    for x in args.name:
+        v, gleich, n = x.partition("=")
+        v, n = v.strip().strip("„“\"'"), n.strip().strip("„“\"'")
+        if not gleich or not v or not n:
+            log("kontakte_aufraeumen: --name „%s“: bitte als „Vorschlag=Name“" % x)
+            return 2
+        namen[v] = n
     if haushalt is None:
         if not (E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")):
             log("kontakte_aufraeumen: HAUSHALT_URL und HAUSHALT_TOKEN fehlen (im Scan-Container gesetzt)")
@@ -327,17 +417,25 @@ def main(argv=None, haushalt=None, paperless=None, log=print):
             log("kontakte_aufraeumen: Paperless antwortet nicht (%s): ohne seine Namen" % x)
             paperless = None
     heile(karten, korr, paperless)
-    p = plan(karten, korr)
+    weg, p, fehler = flaggen(karten, korr, namen, [n.strip().strip("„“\"'") for n in args.entfernen])
+    if fehler:
+        for z in fehler:
+            log("kontakte_aufraeumen: " + z)
+        log("kontakte_aufraeumen: nichts geändert")
+        return 2
     log("%d Firmenkontakte; %s:" % (len(karten), "so wird zusammengeführt" if args.apply else "Probelauf, so würde zusammengeführt"))
-    for z in zeilen(p) or ["nichts doppelt"]:
+    for z in (zeilen(p) + ["„%s“ wird entfernt (leer, von Homes angelegt)" % k["name"] for k in weg]) or ["nichts doppelt"]:
         log("- " + z)
     if args.apply:
         try:
-            weg = ausfuehren(p, haushalt, log)
+            n = ausfuehren(p, haushalt, log)
+            for k in weg:
+                haushalt("kontakt_entfernen", {"kennung": k["kennung"]})
+                log("„%s“: entfernt" % k["name"])
         except (OSError, RuntimeError) as x:
             log("kontakte_aufraeumen: abgebrochen: %s; der nächste Lauf macht den Rest" % x)
             return 1
-        log("%d Kontakte zusammengeführt und entfernt" % weg)
+        log("%d Kontakte zusammengeführt und entfernt%s" % (n, ", %d leere entfernt" % len(weg) if weg else ""))
     return 0
 
 
