@@ -161,11 +161,19 @@ def kontakt_angelegt(args):
         {"status": "angelegt", "kontakt": "uid-1", "felder": {k: "angelegt" for k in args}, "gruende": {}}))
 
 
-class Homes:
-    """Homes' /mcp/haushalt: tools/call erinnerung_anlegen, kontakt_ergaenzen (#820)"""
+def kontaktzeile(name, tel=(), mails=()):
+    """one line of Homes' kontakte_suchen (contactLine): „Name (Firma) — Tel. a · E-Mail b“"""
+    teile = (["Tel. " + ", ".join(tel)] if tel else []) + (["E-Mail " + ", ".join(mails)] if mails else [])
+    return "%s (%s)" % (name, name) + (" — " + " · ".join(teile) if teile else "")
 
-    def __init__(self, kontakt=kontakt_angelegt):
+
+class Homes:
+    """Homes' /mcp/haushalt: tools/call erinnerung_anlegen, kontakt_ergaenzen (#820), kontakte_suchen over
+    adressbuch [(name, numbers, mails)], to which a card kontakt_ergaenzen made is added"""
+
+    def __init__(self, kontakt=kontakt_angelegt, adressbuch=()):
         self.calls, self.kontakt, self.ohne_kontakte = [], kontakt, False
+        self.adressbuch = [(a[0], list(a[1]) if len(a) > 1 else [], list(a[2]) if len(a) > 2 else []) for a in adressbuch]
         fake = self
 
         class H(BaseHTTPRequestHandler):
@@ -183,7 +191,16 @@ class Homes:
                     if fake.ohne_kontakte:   # a Homes before homes#164, or without Radicale: the tool is not listed
                         return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "error": {"code": -32602, "message": "unknown tool: kontakt_ergaenzen"}})
                     fehler, text = fake.kontakt(b["params"]["arguments"])
+                    if '"status": "angelegt"' in text:
+                        fake.adressbuch.append((b["params"]["arguments"]["firma"], [], []))
                     return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": text}], "isError": fehler}})
+                if b["params"]["name"] == "kontakte_suchen":
+                    if fake.adressbuch is None:   # a Homes without Radicale
+                        return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "error": {"code": -32602, "message": "unknown tool: kontakte_suchen"}})
+                    q =b["params"]["arguments"]["text"].lower()
+                    z = [kontaktzeile(*a) for a in fake.adressbuch if q in a[0].lower() or any(q in m for m in a[2])]
+                    text = "\n".join(sorted(z)) or "Kein Kontakt passt zu „%s“." % q
+                    return reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": text}], "isError": False}})
                 reply(self, 200, {"jsonrpc": "2.0", "id": b["id"], "result": {"content": [{"type": "text", "text": "Erinnerung angelegt"}], "isError": False}})
 
         self.srv, self.url = serve(H)
@@ -225,8 +242,8 @@ class Lauf(unittest.TestCase):
                "VERTRAG_ARTEN": "Vertrag, Versicherung", "VERTRAG_VORLAUF_TAGE": "28",
                "HAUSHALT_URL": (homes.url + "/mcp/haushalt") if homes else "", "HAUSHALT_TOKEN": "homestoken" if homes else "",
                "VERTRAEGE_FILE": self.record, "HEUTE": heute, **extra}
-        # as the unit feeds it: the script on stdin
-        return subprocess.run([sys.executable, "-"], input=SCRIPT.read_text(), env=env, capture_output=True, text=True, timeout=60)
+        # as dienst.py starts it: the script by its path (it finds ordnen/firmen.py from there)
+        return subprocess.run([sys.executable, "-B", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60)
 
 
 class Vertraege(Lauf):

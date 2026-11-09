@@ -149,7 +149,14 @@ TAG_REGELN = {
 # one sender under two names (decided 2026-11-06): the short or other name → the one correspondent, the fuller name
 ALIASE = {"DRV Bund": "Deutsche Rentenversicherung Bund", "DRV-Bund": "Deutsche Rentenversicherung Bund",
           "Deutsche Rentenversicherung (Bund)": "Deutsche Rentenversicherung Bund",
-          "Gemeinschaftslabor": "LCM Gemeinschaftslabor"}
+          "Gemeinschaftslabor": "LCM Gemeinschaftslabor",
+          # 2026-11-09: one insurer and one building society under the names their letters use
+          "DKV": "DKV Deutsche Krankenversicherung AG", "Deutsche Krankenversicherung": "DKV Deutsche Krankenversicherung AG",
+          "DKV Deutsche Krankenversicherung": "DKV Deutsche Krankenversicherung AG",
+          "LBS": "LBS Landesbausparkasse NordWest", "LBS Nord": "LBS Landesbausparkasse NordWest",
+          "LBS Norddeutsche Landesbausparkasse": "LBS Landesbausparkasse NordWest",
+          "LBS Norddeutsche Landesbausparkasse Berlin - Hannover": "LBS Landesbausparkasse NordWest",
+          "Landesbausparkasse NordWest": "LBS Landesbausparkasse NordWest"}
 # makers of devices and practice or lab software (decided 2026-11-06): their name heads a printout, they never send one;
 # matched as the name's first words ("Zimmer MedizinSysteme GmbH" too); never a bare word a pharmacy or a person may carry
 GERAETE = ["Zimmer MedizinSysteme", "Zimmer Diagnostik", "CompuGroup Medical", "CGM", "Schiller AG", "Schiller Medizintechnik",

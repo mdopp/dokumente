@@ -96,7 +96,17 @@ Haushalt URL and token come from the unit. The standard library only.
    household person's name just before it. An address goes only whole.
    Homes' kontakt_ergaenzen gets it once per document (no link to the
    document: Homes' contact page finds them, homes#282) (the record's kontakte); one read before is asked once
-   more, for its sender only. An IBAN Homes answers abweichend: `prüfen` and
+   more, for its sender only. Before it goes (owner 2026-11-09: a backfill
+   made „Union Krankenversicherung“ and „… Aktiengesellschaft“, „BKK rmus“
+   for BKK firmus), the name is put right and matched: the fi, fl, ff OCR
+   dropped are put back where a correspondent's name or the text elsewhere
+   has the word with them, and Homes' kontakte_suchen is asked for the
+   name's words; a contact that is the same firm by ordnen/firmen.py's rules
+   (legal form and ALIASE folded, OCR's misreading of one word, the shorter
+   name for the fuller one) gets the values under its own name. Several
+   equally good: nothing is written, the record says which (mehrdeutig).
+   Only when none is, a card is made, under ALIASE's name when it has one.
+   An IBAN Homes answers abweichend: `prüfen` and
    a note with Homes' reason. Homes away or without the tool: the contact
    waits in the record, the model is not asked again. Without Homes nothing
    is asked, sent or recorded.
@@ -107,10 +117,23 @@ says what the last run did (#829): its start, the contracts and invoices read,
 the contacts Homes took, the reminders made, the documents marked `prüfen`, and
 whether the model did not answer; paperless-mail.py's check makes the status
 line of it ("Vertragshelfer: zuletzt 13:05, 3 Rechnungen gelesen …")."""
-import base64, calendar, hashlib, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
+import base64, calendar, hashlib, importlib.util, json, os, re, sys, time, unicodedata, urllib.error, urllib.request
 from datetime import date, timedelta
 
 E = os.environ
+
+
+def _firmen():
+    """ordnen/firmen.py, whether two names are one firm: beside this file (the image's /opt) or in ordnen/ (the repo)"""
+    hier = os.path.dirname(os.path.abspath(__file__))
+    pfad = next(p for p in (os.path.join(hier, "firmen.py"), os.path.join(hier, os.pardir, "ordnen", "firmen.py")) if os.path.exists(p))
+    spec = importlib.util.spec_from_file_location("vertraege_firmen", pfad)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+firmen = _firmen()
 PRO_LAUF = 10                  # documents read a run: the household model is shared
 ZEICHEN = 16000                # of a document's text: a contract's data is on its first pages
 OCR_PRO_LAUF = 3               # documents recognised again a run: OCR is the box's CPU
@@ -451,9 +474,10 @@ def anschrift(a, text, empf, personen):
     return out, None
 
 
-def kontaktdaten(antwort, text, personen, mails):
+def kontaktdaten(antwort, text, personen, mails, namen=()):
     """the sender as kontakt_ergaenzen's arguments (#820), only values the text backs and never the
-    household's own; None without a firm. And what was not taken"""
+    household's own; None without a firm. And what was not taken. The firm's name with the ligatures OCR
+    dropped put back where namen (Paperless' correspondents) or the text has the word with them (2026-11-09)"""
     empf = belegt(antwort.get("Empfänger"), text)
     out, weg = {}, []
     for name, arg in KONTAKT_ARGS.items():
@@ -474,6 +498,7 @@ def kontaktdaten(antwort, text, personen, mails):
     if "iban" not in out:
         weg += ["%s (ohne IBAN)" % n for n, arg in KONTAKT_ARGS.items() if arg in KONTO and out.pop(arg, None)]
     if "firma" in out:
+        out["firma"] = firmen.ligaturen(out["firma"], firmen.wortschatz(text, *namen), firmen.wortschatz(*namen))
         a, warum = anschrift(antwort.get("Anschrift"), text, empf, personen)
         if a:
             out["anschrift"] = a
@@ -730,15 +755,99 @@ def erinnern(text, wann):
     return True
 
 
+def suchworte(name):
+    """the words of a name kontakte_suchen is asked for: three letters or more, no legal form, at most four"""
+    form = {f[0] for f in firmen.RECHTSFORMEN if len(f) == 1}
+    out = []
+    for w in re.findall(r"[^\W_]{3,}", name):
+        if firmen.falten(w) not in form and w not in out:
+            out.append(w)
+    return out[:4]
+
+
+def adressbuchzeilen(text):
+    """kontakte_suchen's lines: {name: (numbers, mails)}; „Name (Firma) — Tel. a, b · E-Mail c“"""
+    out = {}
+    for z in text.splitlines():
+        if not z.strip() or z.startswith(("Kein Kontakt passt", "… und", "Nur ein Teil")):
+            continue
+        name, _, rest = z.partition(" — ")
+        name = re.sub(r" \([^()]*\)$", "", name.strip())
+        teile = dict((t.split(" ", 1) + [""])[:2] for t in rest.split(" · ") if t)
+        out[name] = ([x.strip() for x in teile.get("Tel.", "").split(",") if x.strip()],
+                     [x.strip().casefold() for x in teile.get("E-Mail", "").split(",") if x.strip()])
+    return out
+
+
+def nummer(s):
+    """a phone number's digits without the trunk 0 or +49, to compare"""
+    return re.sub(r"^(?:0049|49|0)", "", re.sub(r"\D", "", s))
+
+
+def im_adressbuch(args, suche):
+    """the household contact the sender is (firmen's rules): (name, reason); (None, the name put right or None)
+    for none; ("", the names) when several are equally good. suche(word) is kontakte_suchen's text"""
+    firma = args["firma"]
+    bekannt = {}
+    for w in suchworte(firma) + suchworte(firmen.kanonisch(firma) or ""):
+        bekannt.update(adressbuchzeilen(suche(w)))
+    worte = firmen.wortschatz(*bekannt)
+    heil = firmen.ligaturen(firma, worte, worte)
+
+    def belegt(name):
+        tel, mails = bekannt[name]
+        return bool((args.get("telefon") and nummer(args["telefon"]) in {nummer(t) for t in tel}) or
+                    (args.get("email") and args["email"].casefold() in mails))
+    treffer = firmen.beste(heil, bekannt, belegt)
+    if len(treffer) > 1:
+        treffer = [t for t in treffer if belegt(t[1])] or treffer
+    if len(treffer) == 1:
+        return treffer[0][1], treffer[0][0] if heil == firma else treffer[0][0] + ", ocr"
+    if treffer:
+        return "", sorted(b for _, b in treffer)
+    return None, (heil if heil != firma else None)
+
+
+GRUND = {"gleich": "derselbe Name, Rechtsform oder Kurzname anders", "ocr": "ein Lesefehler im Namen",
+         "anfang": "der kürzere Name derselben Firma"}
+
+
 def kontakte(api, rec, prüfen_tag):
     """the senders waiting in the record, into Homes' address book through kontakt_ergaenzen (#820), each
-    once; a Homes that does not take them (away, or without the tool) keeps them for the next run"""
+    once; a Homes that does not take them (away, or without the tool) keeps them for the next run. Matched
+    first against the address book (im_adressbuch), so one firm is one card (2026-11-09)"""
+    gesucht = {}
+
+    def suche(wort):
+        if wort not in gesucht:
+            res = werkzeug("kontakte_suchen", {"text": wort})
+            if res.get("error") or (res.get("result") or {}).get("isError"):
+                raise ValueError("kontakte_suchen: %s" % ((res.get("error") or {}).get("message") or res.get("result")))
+            gesucht[wort] = str((((res.get("result") or {}).get("content") or [{}])[0]).get("text") or "")
+        return gesucht[wort]
+
     for k, e in sorted(rec.get("kontakte", {}).items(), key=lambda kv: int(kv[0])):
         if "offen" not in e:
             continue
+        # a quelle recorded before homes#282 is not sent: Homes no longer reads it
+        args = {a: v for a, v in e["offen"].items() if a != "quelle"}
         try:
-            # a quelle recorded before homes#282 is not sent: Homes no longer reads it
-            res = werkzeug("kontakt_ergaenzen", {a: v for a, v in e["offen"].items() if a != "quelle"})
+            name, grund = im_adressbuch(args, suche)
+            if name == "":
+                rec["kontakte"][k] = {"status": "mehrdeutig", "kandidaten": grund, "am": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                print("vertraege: Dokument %s: „%s“ passt zu mehreren Kontakten (%s): nichts geschrieben, bitte im Adressbuch "
+                      "zusammenführen" % (k, args["firma"], ", ".join(grund)))
+                continue
+            if name is None:   # none: a new card, under the fuller name ALIASE gives, its OCR put right
+                neu = firmen.kanonisch(grund or args["firma"]) or grund or args["firma"]
+                if neu != args["firma"]:
+                    print("vertraege: Dokument %s: „%s“ kommt als „%s“ ins Adressbuch" % (k, args["firma"], neu))
+                args["firma"] = neu
+            elif name != args["firma"]:
+                print("vertraege: Dokument %s: „%s“ ist „%s“ im Adressbuch (%s)" % (
+                    k, args["firma"], name, ", ".join(GRUND.get(g, g) for g in grund.split(", "))))
+                args["firma"] = name
+            res = werkzeug("kontakt_ergaenzen", args)
         except (OSError, ValueError) as x:
             print("vertraege: Homes antwortet nicht (%s), Kontakte im nächsten Lauf" % x)
             return
@@ -758,6 +867,10 @@ def kontakte(api, rec, prüfen_tag):
             a = {}
         felder = a.get("felder") or {}
         rec["kontakte"][k] = {"status": a.get("status") or "?", "felder": felder, "am": am}
+        if args["firma"] != firma:
+            rec["kontakte"][k]["als"] = args["firma"]
+        if a.get("status") == "angelegt":
+            gesucht.clear()   # the next document of this firm finds the new card
         LAUF["kontakte"] += a.get("status") != "unveraendert"
         print("vertraege: Dokument %s: Kontakt „%s“ %s" % (k, firma, a.get("status") or text.split("\n")[0]))
         if felder.get("iban") == "abweichend":   # the fake-invoice trick: a known firm with a new account
@@ -868,6 +981,12 @@ def main():
     if users is not None:
         absender(api, rec, tags, personen)
     homes = E.get("HAUSHALT_URL") and E.get("HAUSHALT_TOKEN")
+    namen = []   # the correspondents' names: the words a sender's name may have lost a ligature of
+    if homes:
+        try:
+            namen = [c["name"] for c in api.all("/api/correspondents/")]
+        except urllib.error.HTTPError as e:
+            print("vertraege: Paperless nennt seine Korrespondenten nicht (%d): Ligaturen nur aus dem Text" % e.code)
     ki = E.get("PAPERLESS_AI_ENABLED", "").strip().lower() == "true" and E.get("PAPERLESS_AI_LLM_ENDPOINT")
     gelesen = 0
     for d in sorted({**rechnungen, **docs}.values(), key=lambda d: d["id"]) if ki else []:
@@ -899,7 +1018,7 @@ def main():
         antwort = antwort if isinstance(antwort, dict) else {}
         gelesen += 1
         if kontakt:
-            args, weg = kontaktdaten(antwort, d.get("content") or "", personen, mails)
+            args, weg = kontaktdaten(antwort, d.get("content") or "", personen, mails, namen)
             am = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             rec.setdefault("kontakte", {})[str(d["id"])] = {"offen": args, "am": am} if args else {"status": "keiner", "verworfen": weg, "am": am}
             if weg:
