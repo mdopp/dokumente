@@ -1032,13 +1032,17 @@ def steuerlich_typ(doc, o):
 def steuer_werte(plan, werte, doc, have, o):
     """the tax marking into werte and doc's tags (doc as it will be): the tag „steuerlich“ and the Steuer-Art, only on a
     document of a STEUER_TYPEN whose Steuer-Art is empty, with the tag and the field there; Lohnkosten only with a mark;
-    Steuerjahr only on a marked document, one already „steuerlich“, or one of the type or Bereich Steuer"""
+    Steuerjahr only on a marked document, one already „steuerlich“, or one of the type or Bereich Steuer; on a marked one
+    without, the year of the date in front of its title (owner 2026-11-09: never Paperless' date, often the scan's)"""
     tag, feld, tags = o.tag(STEUER_TAG), o.feld("Steuer-Art"), doc["tags"]
     markiert = bool(plan.get("steuer") and tag and feld and steuerlich_typ(doc, o) and have.get(feld["id"]) in (None, "", []))
     if markiert:
         werte["Steuer-Art"] = plan["steuer"]
         if tag["id"] not in tags:
             tags.append(tag["id"])
+        jahr, sj = re.match(r"((?:19|20)\d\d)-\d\d-\d\d ", doc.get("title") or ""), o.feld("Steuerjahr")
+        if jahr and "Steuerjahr" not in werte and sj and have.get(sj["id"]) in (None, ""):
+            werte["Steuerjahr"] = int(jahr.group(1))   # the date ordnen read from the text and put in front of the title
     else:
         werte.pop("Steuer-Art", None)
         werte.pop("Lohnkosten", None)
