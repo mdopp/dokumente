@@ -229,6 +229,24 @@ class Auswerten(unittest.TestCase):
                       ["Stadtwerke Beispielstadt GmbH"])
         self.assertEqual(p["absender"], "Stadtwerke Beispielstadt GmbH")
 
+    def test_a_ligature_ocr_dropped_comes_back_from_what_knows_it(self):
+        # document 641 (2026-11-09): the text says „Rollladen Herkenho GmbH“, OCR lost the ff
+        roh = {**answer_invoice(), "absender": {"wert": "Rollladen Herkenho GmbH", "beleg": "Rollladen Herkenho GmbH"}}
+        doc = {"id": 641, "title": "Fwd: Rechnung_R-261241", "content": "Rollladen Herkenho GmbH\nRechnung R-261241\n"}
+
+        def plan(korr=(), buch=(), content=doc["content"]):
+            return ordnen.auswerten(roh, {**doc, "content": content}, list(ordnen.TYPEN), ["Anna"], ["Anna Muster"], list(korr), list(buch))
+        self.assertEqual(plan(buch=["Herkenhoff Rollladen"])["absender"], "Rollladen Herkenhoff GmbH", "the owner's phone contact")
+        self.assertEqual(plan(korr=["Rollladen Herkenhoff GmbH"])["absender"], "Rollladen Herkenhoff GmbH", "an existing correspondent")
+        self.assertEqual(plan(content=doc["content"] + "www.rollladen-herkenhoff.de\n")["absender"], "Rollladen Herkenhoff GmbH",
+                         "the text elsewhere")
+        self.assertEqual(plan(korr=["Rollladen Herkenho GmbH"], buch=["Rollladen Herkenhoff"])["absender"], "Rollladen Herkenhoff GmbH",
+                         "a correspondent made from the damaged text does not keep it damaged")
+        self.assertEqual(plan()["absender"], "Rollladen Herkenho GmbH", "nothing knows the word: it stays as the text has it")
+        rau = {**answer_invoice(), "absender": {"wert": "Rau Bau GmbH", "beleg": "Rau Bau GmbH"}}
+        p = ordnen.auswerten(rau, {"id": 8, "content": "Rau Bau GmbH\n"}, list(ordnen.TYPEN), [], [], ["Rau Bau GmbH"], ["Rau Bau", "Rauff Bau"])
+        self.assertEqual(p["absender"], "Rau Bau GmbH", "a word the address book has as it is stays, though another has it with ff")
+
     def test_ocr_noise_is_no_sender_and_a_hyphen_is_the_same_sender(self):
         self.doc["content"] += "KKKKK\nReha-Zentrum Beispiel\n"
         p = self.plan({**answer_invoice(), "absender": {"wert": "KKKKK", "beleg": "KKKKK"}})
