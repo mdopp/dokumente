@@ -462,6 +462,8 @@ class Doppelt:
             return ""
         if i not in self._benutzer:
             self._benutzer[i] = self.q.benutzer(i)
+        if E.get("PAPERLESS_TOKEN") and self._benutzer[i] == E.get("PAPERLESS_ADMIN_USER"):
+            return ""   # Dokumente's own (a new document in the Eingang, laib DATA.md gap 6): it may trash it, as the household's
         return self._benutzer[i]
 
     def markieren(self, d, text, tag=PRUEFEN):

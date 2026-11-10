@@ -27,7 +27,7 @@ is `ghcr.io/mdopp/dokumente`, built on every push to main.
 
 Tests run in the image: `docker build -t dokumente:test -f Containerfile .`
 then `docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3
-dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py`.
+dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_zuteilen.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py`.
 
 ## The contract with laib's template
 
@@ -62,6 +62,39 @@ http://host.containers.internal:8720/hook` with the header. For stacks
 „nur für mich“ the user also needs `add_document`; without it such a stack
 is refused before a sheet is scanned, and the household's stacks go on.
 
+**Whose a new document is** (laib docs/DATA.md gap 6; owner 2026-11-10: „Was
+du scannst oder hochlädst, gehört von Anfang an dir. Geteilt wird nur, was die
+Sortierung als Haushaltsdokument erkennt oder was du teilst.“). laib's
+paperless template gives what comes in through the consume folder (the
+scanner's household stacks too) and the household's mail address to
+Dokumente's user with the tag `Eingang`, seen by no one in the family; a
+person's own mail address (`<login>+doc@`) gives it to that person, also
+tagged. `ordnen/zuteilen.py` (its docstring is the contract) runs on every
+run, before and after `ordnen.py --neue`, over what is tagged `Eingang` only:
+
+| What came | Whose, at once | After ordnen read it |
+|---|---|---|
+| a folder `von-<login>` (Homes' app and page, the Bote) | that person's (Dokumente keeps view and change) | household document → the household's (tag `Haushalt`); else stays theirs |
+| a person's own mail address | that person's (Paperless' rule) | the same |
+| the scanner, the inbox folder, the share, the household's address | Dokumente's | household document → the household's; else the person the model read as its addressee (the field Person, matched to a Paperless account by first name or login); else it stays Dokumente's and Homes asks the admins „Wem gehört dieser Scan?“ |
+
+A household document (`ordnen.haushaltsdokument`, conservative): the model
+sure of type and Bereich, only the Bereiche Haus, Auto, Versicherung, Steuer,
+no medical type; one that names a single person only when it is about the
+house or the car. Health, work and pension, money, leisure stay a person's.
+`ordnen.py --neue` writes the decision into its record (`zuteilung`). The tag
+`Haushalt` on a person's own document is enough: Paperless' workflow „Für den
+Haushalt“ (laib's template) takes it out of their hands; a person may set it
+to share. The admins' question goes to Homes' `POST /intern/zuordnen` (the
+origin of `HAUSHALT_URL`, the Haushalt bearer) with only the sender, the
+date, the pages, when it came and a `zeichen` over them, and the people with a
+Paperless account; an answer back counts only while its `zeichen` is the
+document's. A `von-<login>` whose person has no Paperless account yet waits
+(`hängt konto`); Homes away is `hängt homes`; a document ordnen has not read a
+day after it came is asked too (Dokumente's) or just stays its person's.
+`doppelt.py` treats Dokumente's own documents as the household's (trash, not
+the tag `Doppelt`).
+
 **For the household or for one person** (decided 2026-10-28). The order
 `start` (`laib scan start`, written by laib-haushalt) may carry
 `"fuer": "haushalt" | "person"`; missing means `haushalt`, the default.
@@ -71,8 +104,8 @@ is refused before a sheet is scanned, and the household's stacks go on.
   Paperless answers, its user may upload, and the person has a Paperless
   account (they logged in once). If not, nothing is scanned and the person
   is told why; it never falls back to the household.
-- Its documents do not go through the consume folder (that files without
-  an owner, for everyone) but as uploads through the API: Paperless gives
+- Its documents do not go through the consume folder (that gives them to
+  Dokumente's sorting, below) but as uploads through the API: Paperless gives
   an upload to its uploader, so it is Dokumente's while Paperless reads it,
   seen by no one in the family. Dokumente finds each one by its checksum
   (Paperless 3 keeps the original's SHA-256, Paperless 2 its MD5; both are

@@ -414,6 +414,9 @@ class Neue(unittest.TestCase):
         self.assertIn(haus, f.docs[1]["tags"])
         self.assertIsNone(f.docs[1]["correspondent"])
         self.assertIn("Absender „Stadtwerke Beispielstadt GmbH“ ist noch kein Korrespondent", f.notes[1][0])
+        # whose it is, for zuteilen.py (laib DATA.md gap 6): a utility bill addressed to Anna is the household's
+        z = ordnen.lesen(os.path.join(self.dir, "ordnen.json"), {})["zuteilung"]["1"]
+        self.assertEqual((z["haushalt"], z["person"]), (True, "Anna"))
         f.docs[1]["tags"] = []
         ordnen.neue(f, self.dir, args(max=5), log=lambda *_: None, ask=lambda m: asked.append(1) or answer_invoice())
         self.assertEqual(len(asked), 1, "seen once: never asked again")

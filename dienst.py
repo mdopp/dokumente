@@ -59,6 +59,9 @@ class Auswertung:
         # ordnen.py --neue (2026-11-05): each new document's type, Bereich, sender, person and fields, before the helper;
         # doppelt.py --neue (2026-11-08) before it: a document scanned twice becomes one
         self.ordnen, self.doppelt = (self.beiliegend(env, k, n) for k, n in (("ORDNEN_SKRIPT", "ordnen.py"), ("DOPPELT_SKRIPT", "doppelt.py")))
+        # zuteilen.py (laib DATA.md gap 6): whose a new document is, before ordnen (a von-<login> one to its person at
+        # once) and after it (what ordnen read: the household's, its person, or the admins asked in Homes)
+        self.zuteilen = self.beiliegend(env, "ZUTEILEN_SKRIPT", "zuteilen.py")
         self.doppelt_wie = (env.get("DOPPELT") or "an").strip().lower()   # an | probe (a dry run) | aus
         data = env.get("DOKUMENTE_DATA", "/data")
         # the record is backed up (laib mounts /dokumente); /data is the scan's transient folder
@@ -143,7 +146,10 @@ class Auswertung:
                 env[k] = e[k]
         probleme = {}
         doppelt = self.doppelt_lauf(env, probleme)
+        zugeteilt = self.zuteilen_lauf(env, probleme)
         eingeordnet = self.einordnen(env, probleme) if self.ordnen and os.path.exists(self.ordnen) else None
+        # what was given adds up; what waits on the admins is the last run's
+        zugeteilt = {k: v if k == "gefragt" else zugeteilt.get(k, 0) + v for k, v in self.zuteilen_lauf(env, probleme).items()}
         start = time.monotonic()
         try:
             p = subprocess.Popen([sys.executable, self.skript], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -176,6 +182,9 @@ class Auswertung:
         for k in ("zusammengefuehrt", "zum_loeschen", "pruefen"):
             if doppelt.get(k):
                 lauf = {**lauf, "doppelt_" + k: doppelt[k]}
+        for k in ("gegeben", "haushalt", "gefragt"):
+            if zugeteilt.get(k):
+                lauf = {**lauf, "zugeteilt_" + k: zugeteilt[k]}
         dauer = int(time.monotonic() - start)
         vertraege_probleme(lauf, rc, letzte, dauer >= self.zeit, probleme)
         befunde = leere_absender(rec) + self.wache.lauf(probleme)
@@ -227,6 +236,13 @@ class Auswertung:
             return {}
         _, ergebnis = self.helfer("doppelt", [self.doppelt, "--neue"] + (["--dry-run"] if self.doppelt_wie == "probe" else []), env, probleme)
         return ergebnis if isinstance(ergebnis, dict) else {}
+
+    def zuteilen_lauf(self, env, probleme):
+        """zuteilen.py: whose the new documents are; its counts back (gegeben, haushalt, bleibt, gefragt)"""
+        if not (self.zuteilen and os.path.exists(self.zuteilen)):
+            return {}
+        _, ergebnis = self.helfer("zuteilen", [self.zuteilen], env, probleme)
+        return {k: v for k, v in ergebnis.items() if isinstance(v, int)} if isinstance(ergebnis, dict) else {}
 
     def einordnen(self, env, probleme=None):
         """ordnen.py --neue before the helper, so a document it typed a contract or invoice is read in the same
@@ -375,6 +391,12 @@ def satz_lauf(lauf, anlass):
     n = int(lauf.get("eingeordnet") or 0)
     if n:   # ordnen.py --neue: type, Bereich, sender, person
         was = "%d Dokument%s eingeordnet. " % (n, "" if n == 1 else "e") + was
+    if int(lauf.get("zugeteilt_gegeben") or 0) or int(lauf.get("zugeteilt_haushalt") or 0):   # zuteilen.py
+        was = "Neue Dokumente zugeteilt: %d einer Person, %d dem Haushalt. " % (int(lauf.get("zugeteilt_gegeben") or 0),
+                                                                              int(lauf.get("zugeteilt_haushalt") or 0)) + was
+    if int(lauf.get("zugeteilt_gefragt") or 0):
+        n = int(lauf["zugeteilt_gefragt"])
+        was += " %d Dokument%s ohne erkennbare Person: Homes fragt die Admins, wem %s." % (n, "" if n == 1 else "e", "es gehört" if n == 1 else "sie gehören")
     n = int(lauf.get("doppelt_zusammengefuehrt") or 0)
     if n:   # doppelt.py --neue
         was = "%d doppelt gescannte%s Dokument%s zusammengeführt. " % (n, "s" if n == 1 else "", "" if n == 1 else "e") + was
