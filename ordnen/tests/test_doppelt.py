@@ -7,7 +7,7 @@ one. The cases are those of the stacks scanned on 2026-11-08 (ids kept, texts ma
 up): the invoice twice (526/527, the scanning person's), the Allianz letter three
 times under two spellings of the sender (405/438/439), a scan whose date Paperless
 had not set (440), and the Skandia Jahresmitteilungen 2008–2012 (599–602)."""
-import contextlib, difflib, importlib.util, io, json, os, random, shutil, subprocess, tempfile, unittest, urllib.error
+import contextlib, difflib, importlib.util, io, json, os, random, shutil, subprocess, tempfile, unittest, unittest.mock, urllib.error
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location("doppelt_skript", Path(__file__).resolve().parent.parent / "doppelt.py")
@@ -512,6 +512,21 @@ def mini_pdf(seiten):
 
 
 @unittest.skipUnless(shutil.which("pdftotext") and shutil.which("qpdf"), "poppler and qpdf: in the image")
+class Eingang(unittest.TestCase):
+    """laib DATA.md gap 6: a new document is Dokumente's until zuteilen decides; a duplicate of it goes to the
+    trash like the household's (Dokumente owns it, Paperless lets it), never tagged for a person to delete"""
+
+    def test_dokumentes_own_is_trashed_like_the_households(self):
+        f = Fake([], {})
+        f.benutzer = lambda i: {9: "dokumente", MDOPP: "mdopp"}.get(i, "x")
+        d = doppelt.Doppelt(f, tempfile.mkdtemp(), log=lambda *_: None)
+        env = {"PAPERLESS_TOKEN": "t", "PAPERLESS_ADMIN_USER": "dokumente"}
+        with unittest.mock.patch.dict(doppelt.E, env):
+            self.assertEqual((d.besitzer({"owner": 9}), d.besitzer({"owner": None}), d.besitzer({"owner": MDOPP})), ("", "", "mdopp"))
+        with unittest.mock.patch.dict(doppelt.E, {"PAPERLESS_TOKEN": ""}):   # inside Paperless as its admin: no exception
+            self.assertEqual(doppelt.Doppelt(f, tempfile.mkdtemp(), log=lambda *_: None).besitzer({"owner": 9}), "dokumente")
+
+
 class Werkzeuge(unittest.TestCase):
     def test_pages_are_read_and_put_together_in_order(self):
         a, b = mini_pdf(["Seite eins", "Seite zwei", "Seite vier"]), mini_pdf(["Seite eins", "Seite drei"])

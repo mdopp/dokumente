@@ -53,7 +53,7 @@ class Basis(unittest.TestCase):
                     "VERTRAEGE_SKRIPT": skript,
                     "DOKUMENTE_DATA": self.tmp, "MELDUNGEN": os.path.join(self.tmp, "eingang"),
                     "AUSWERTUNG_RUHE_S": "0.3", "AUSWERTUNG_SPAETESTENS_S": "5", "AUSWERTUNG_STUENDLICH_S": "3600",
-                    "ORDNEN_SKRIPT": "", "DOPPELT_SKRIPT": "", "VERTRAEGE_FILE": os.path.join(self.tmp, "laib-vertraege.json"),
+                    "ORDNEN_SKRIPT": "", "DOPPELT_SKRIPT": "", "ZUTEILEN_SKRIPT": "", "VERTRAEGE_FILE": os.path.join(self.tmp, "laib-vertraege.json"),
                     }
         scan.AUSWERTUNG.clear()
 
@@ -353,3 +353,28 @@ class Doppelt(Basis):
         os.remove(os.path.join(self.tmp, "doppelt-argv"))
         dienst.Auswertung({**self.env, "DOPPELT_SKRIPT": self.doppelt(), "DOPPELT": "aus"}).lauf("stündlich")
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "doppelt-argv")))
+
+
+ZUTEILEN = r'''
+import json, os, sys
+open(%r, "a").write("zuteilen ")
+print("zuteilen " + json.dumps({"gegeben": 1, "haushalt": 2, "bleibt": 0, "gefragt": 1}))
+'''
+
+
+class Zuteilen(Basis):
+    """laib DATA.md gap 6: whose a new document is, before ordnen (a von-<login> one at once) and after it"""
+
+    def test_zuteilen_runs_around_ordnen_and_the_family_reads_it(self):
+        reihe = os.path.join(self.tmp, "reihe")
+        z, o = os.path.join(self.tmp, "zuteilen.py"), os.path.join(self.tmp, "ordnen.py")
+        Path(z).write_text(ZUTEILEN % reihe)
+        Path(o).write_text("open(%r, 'a').write('ordnen ')" % reihe)
+        a = dienst.Auswertung({**self.env, "ZUTEILEN_SKRIPT": z, "ORDNEN_SKRIPT": o})
+        a.lauf("neue Dokumente")
+        self.assertEqual(Path(reihe).read_text().split(), ["zuteilen", "ordnen", "zuteilen"])
+        lauf = scan.AUSWERTUNG["lauf"]
+        self.assertEqual((lauf["zugeteilt_gegeben"], lauf["zugeteilt_haushalt"], lauf["zugeteilt_gefragt"]), (2, 4, 1),
+                         "given adds up over both runs; waiting is the last run's")
+        self.assertIn("Neue Dokumente zugeteilt: 2 einer Person, 4 dem Haushalt.", scan.AUSWERTUNG["detail"])
+        self.assertIn("1 Dokument ohne erkennbare Person: Homes fragt die Admins, wem es gehört.", scan.AUSWERTUNG["detail"])

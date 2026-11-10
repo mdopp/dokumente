@@ -153,7 +153,8 @@ BEREICHE = {
     "Arbeit & Rente": "Arbeit und Rente: Arbeitgeber, Gehalt, Rentenversicherung, Betriebsrente, Pension",
     "Freizeit": "Freizeit: Reisen, Konzerte, Tickets, Hobbys, Vereine, Einkäufe für die Freizeit",
 }
-ARBEIT = {"Stapel", "prüfen", "KI-ausgewertet", "korrespondent-ok", "Doppelt", "steuerlich"}   # workflow tags: stay (Doppelt: doppelt.py)
+ARBEIT = {"Stapel", "prüfen", "KI-ausgewertet", "korrespondent-ok", "Doppelt", "steuerlich",
+          "Eingang", "Haushalt"}   # workflow tags: stay (Doppelt: doppelt.py; Eingang, Haushalt: laib DATA.md gap 6)
 # the tags that grew before the order, and where each goes (a tag not named here is never touched)
 K, T, P = "korrespondent", "typ", "thema"
 TAG_REGELN = {
@@ -1498,7 +1499,26 @@ def einordnen(api, o, docs, rec, seen, erlaubt, personen, haushalt, fach, log):
             notiz(api, d["id"], was, plan)
             log("ordnen: %s (%d): %s" % (d.get("title"), d["id"], ", ".join(sorted(was))))
         seen[str(d["id"])] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # whose it is, for zuteilen.py (laib DATA.md gap 6): the household's, or the person the model named
+        rec.setdefault("zuteilung", {})[str(d["id"])] = {"haushalt": haushaltsdokument(plan), "person": plan.get("person"),
+                                                          "am": seen[str(d["id"])]}
     return n
+
+
+# What the household shares (laib DATA.md gap 6; owner 2026-11-10: „Geteilt wird nur, was die Sortierung als
+# Haushaltsdokument erkennt“), conservatively: the model sure of type and Bereich (nothing to prüfen), every
+# Bereich one of HAUSHALT_BEREICHE (the house, the car, insurance, tax), nothing medical; and when the model
+# names one person it concerns, only a document about the house or the car (a utility bill addressed to one of
+# them; not that person's life insurance). Health, work and pension, money, leisure: always a person's.
+HAUSHALT_BEREICHE = ("Haus", "Auto", "Versicherung", "Steuer")
+
+
+def haushaltsdokument(plan):
+    """whether plan (auswerten's) is a household document"""
+    b = set(plan.get("bereiche") or [])
+    medizin = {falten(x) for x in befund_arten()}
+    return bool(plan.get("typ") and b and not plan.get("pruefen") and b <= set(HAUSHALT_BEREICHE)
+                and falten(plan["typ"]) not in medizin and (not plan.get("person") or b & {"Haus", "Auto"}))
 
 
 def titel_fuer(doc, body, plan, o):
