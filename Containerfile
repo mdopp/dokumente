@@ -5,7 +5,7 @@
 # for the separator sheets' Code 128 / QR (#814: the library alone, scan.py
 # calls it through ctypes; zbar-tools would pull in ImageMagick); the program
 # itself is scan.py, stdlib apart from those.
-FROM docker.io/library/debian:trixie-slim
+FROM docker.io/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       sane-utils libsane1 sane-airscan tesseract-ocr tesseract-ocr-deu tesseract-ocr-osd \

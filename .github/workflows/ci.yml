@@ -11,7 +11,7 @@ jobs:
     # the tests run in the image itself: SANE, Tesseract, poppler, zbar, Pillow as on the box
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: docker build -t dokumente:test -f Containerfile .
       - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_zuteilen.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py
       # the image as laib starts it: dienst.py finds scan.py and vertraege.py beside it in /opt
@@ -29,8 +29,8 @@ jobs:
       packages: write
       id-token: write # cosign signs keyless with this workflow's identity (Laib ADR 0034)
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -39,7 +39,7 @@ jobs:
         name: the version Laib shows the family between two images
         run: echo "version=$(date -u +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: Containerfile
@@ -49,6 +49,12 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.v.outputs.version }}
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
       - name: sign the image; Laib proposes a new digest of ours only with this signature (Laib ADR 0034)
         run: cosign sign --yes ghcr.io/mdopp/dokumente@${{ steps.build.outputs.digest }}
+  pins:
+    # actions by commit, base images by digest; Dependabot moves them (laib ADR 0034, laib#1165)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: bash scripts/pins.sh
