@@ -48,11 +48,8 @@ ordnen.py, record doppelt.json):
   doppelt.py --neue [--dry-run] [--max N]
       intake (dienst.py, before ordnen.py --neue): documents added since the
       record began, at most N (5) per run, each against the documents of its
-      date; first the merges a run before uploaded.
-  doppelt.py --alle [--dry-run] [--max N] [--hintergrund]
-      once over the documents there are: every date's documents pairwise.
-      --dry-run changes nothing and writes plan-doppelt.json and
-      zusammenfassung-doppelt.txt, the list to look at first.
+      date; first the merges a run before uploaded. --dry-run (DOPPELT=probe)
+      changes nothing, only logs.
 
 Each line „hängt {json}“ is a step that cannot do its work (dienst.py's
 watch); the last line „doppelt {json}“ counts what was done: zusammengefuehrt
@@ -683,7 +680,7 @@ class Doppelt:
         docs = self.q.dokumente()
         self.weg |= self.markierte(docs)
         hoechste = max((d["id"] for d in docs), default=0)
-        if "ab" not in self.rec:   # the documents there were before are --alle's, after the owner saw its list
+        if "ab" not in self.rec:   # intake begins after the documents there are
             self.rec["ab"] = hoechste
             self.speichern()
             return
@@ -703,62 +700,9 @@ class Doppelt:
                 self.speichern()
         self.warten(docs)
 
-    def alle(self, maximal=None):
-        """once: every date's documents pairwise; the contained ones first, so a letter scanned three times ends as one"""
-        if not self.dry:
-            self.offene()
-        docs = sorted(self.q.dokumente(), key=lambda d: d["id"])
-        self.weg |= self.markierte(docs)
-        if "ab" not in self.rec:   # intake goes on after these
-            self.rec["ab"] = max((d["id"] for d in docs), default=0)
-            self.speichern()
-        tage = {}
-        for d in docs:
-            for t in daten(d):
-                tage.setdefault(t, []).append(d)
-        paare, gesehen = [], set()
-        for gruppe in tage.values():
-            for i, a in enumerate(gruppe):
-                for b in gruppe[i + 1:]:
-                    if (a["id"], b["id"]) not in gesehen and paar_moeglich(a, b, self.namen()):
-                        gesehen.add((a["id"], b["id"]))
-                        paare.append((a, b))
-        self.log("doppelt: %d Dokumente, %d Paare mit demselben Datum" % (len(docs), len(paare)))
-        rang = {"gleich": 0, "a_in_b": 0, "b_in_a": 0, "ergaenzt": 1, "unsicher": 2}
-        bewertet = []
-        for a, b in paare:
-            art = vergleich(self.q.seiten(a["id"]), self.q.seiten(b["id"]))["art"]
-            if art in rang:
-                bewertet.append((rang[art], a["id"], b["id"], a, b))
-        n = 0
-        for _, _, _, a, b in sorted(bewertet, key=lambda x: x[:3]):
-            if maximal is not None and n >= maximal:
-                self.log("doppelt: Menge erreicht, der Rest beim nächsten Mal")
-                break
-            n += bool(self.paar(a, b))
-        self.warten(docs)
-
-    def zusammenfassung(self):
-        zeilen = ["Doppelt gescannt: %d Fälle" % len(self.plan), ""]
-        for p in self.plan:
-            if p["art"].startswith("enthalten"):
-                zeilen.append("  #%d (%d S.) steckt ganz in #%d (%d S.) → %s%s%s" % (
-                    p["weg"][0], p["seiten"][1], p["behalten"], p["seiten"][0],
-                    "#%d bekommt den Tag „%s“ (gehört %s), #%d bleibt" % (p["weg"][0], DOPPELT, p["besitzer"], p["behalten"]) if p.get("besitzer")
-                    else "#%d in den Papierkorb" % p["weg"][0],
-                    "; übernommen: " + ", ".join(p["uebernommen"]) if p.get("uebernommen") else "",
-                    "" if p["art"] == "enthalten" else " (Dokumente darf nicht löschen: nur markiert)"))
-            elif p["art"] == "zusammengesetzt":
-                zeilen.append("  #%d (%d S.) + #%d (%d S.) → ein neues Dokument mit %d Seiten (%s), %s" % (
-                    p["aus"][0], p["seiten"][0], p["aus"][1], p["seiten"][1], p["seiten"][2], p["reihe"],
-                    "beide bekommen den Tag „%s“ (gehören %s)" % (DOPPELT, p["besitzer"]) if p.get("besitzer") else "beide in den Papierkorb"))
-            else:
-                zeilen.append("  #%d und #%d: unsicher (%s) → beide prüfen" % (p["dokumente"][0], p["dokumente"][1], p["grund"]))
-        return "\n".join(zeilen)
-
 
 def sperre(ordner):
-    """one Doppelt at a time (the intake and a run over all); a lock whose process is gone is taken over"""
+    """one Doppelt at a time; a lock whose process is gone is taken over"""
     p = os.path.join(ordner, "doppelt.lock")
     try:
         pid = int(open(p).read().strip() or 0)
@@ -780,16 +724,11 @@ def api_aus_env():
 
 def main(argv=None, quelle=None):
     ap = argparse.ArgumentParser(prog="doppelt")
-    wie = ap.add_mutually_exclusive_group(required=True)
-    wie.add_argument("--neue", action="store_true")
-    wie.add_argument("--alle", action="store_true")
+    ap.add_argument("--neue", action="store_true", required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--max", type=int, default=None)
-    ap.add_argument("--hintergrund", action="store_true")
     args = ap.parse_args(argv)
     ordner = ordnen.ordner_waehlen()
-    if args.hintergrund:
-        ordnen.hintergrund(ordner)
     if not sperre(ordner):
         print("doppelt: ein Lauf ist schon im Gang")
         return 0
@@ -797,22 +736,13 @@ def main(argv=None, quelle=None):
     try:
         print("doppelt: Start %s%s" % (jetzt(), " (Probelauf)" if args.dry_run else ""), flush=True)
         d = Doppelt(quelle or Quelle(api_aus_env()), ordner, dry=args.dry_run)
-        if args.neue:
-            d.neue(args.max or PRO_LAUF)
-        else:
-            d.alle(args.max)
-            text = d.zusammenfassung()
-            schreiben(os.path.join(ordner, "plan-doppelt.json"), {"at": jetzt(), "dry_run": args.dry_run, "faelle": d.plan})
-            with open(os.path.join(ordner, "zusammenfassung-doppelt.txt"), "w", encoding="utf-8") as f:
-                f.write(("PROBELAUF – nichts geändert\n" if args.dry_run else "Angewendet\n") + text + "\n")
-            print(text, flush=True)
+        d.neue(args.max or PRO_LAUF)
         return 0
     except (OSError, ValueError, subprocess.SubprocessError) as e:   # Paperless away: said, the next run tries again
         print("doppelt: abgebrochen: %s" % e, flush=True)
-        if args.neue:
-            if getattr(e, "code", None) in (401, 403):   # Paperless away is ordnen's to say, once
-                ordnen.zugang_haengt(e)
-        return 0 if args.neue else 2
+        if getattr(e, "code", None) in (401, 403):   # Paperless away is ordnen's to say, once
+            ordnen.zugang_haengt(e)
+        return 0
     finally:
         if d is not None:
             print("doppelt " + json.dumps(d.zaehler), flush=True)

@@ -190,6 +190,15 @@ def lauf_in(f, d, argv):
     return rc, out.getvalue(), d
 
 
+def alle(f, argv=(), d=None):
+    """intake over every document of the fixture, as if each had just come: the record begins before them"""
+    d = d or tempfile.mkdtemp()
+    p = Path(d, "doppelt.json")
+    if not p.exists():
+        p.write_text(json.dumps({"ab": 0}))
+    return lauf_in(f, d, ["--neue", "--max", "99", *argv])
+
+
 def haengt(out):
     """the kinds a run says hang, each with its detail"""
     return {json.loads(z[len("hängt "):])["was"]: json.loads(z[len("hängt "):])["detail"] for z in out.splitlines() if z.startswith("hängt {")}
@@ -278,29 +287,30 @@ class Kandidaten(unittest.TestCase):
                          {"2017-08-01", "2017-06-17", "2021-05-05"})
 
 
-class Alle(unittest.TestCase):
-    def test_dry_run_changes_nothing_and_lists_every_case_with_the_kept_and_the_marked_one(self):
+class Faelle(unittest.TestCase):
+    def test_dry_run_changes_nothing_and_logs_every_case_with_the_kept_and_the_marked_one(self):
         f = heute()
-        rc, out, d = lauf(f, ["--alle", "--dry-run"])
+        rc, out, d = alle(f, ["--dry-run"])
         self.assertEqual(rc, 0)
         self.assertEqual(f.writes, [])
-        text = Path(d, "zusammenfassung-doppelt.txt").read_text()
-        self.assertTrue(text.startswith("PROBELAUF"))
-        for zeile in ("#438 (2 S.) steckt ganz in #405 (6 S.) → #438 bekommt den Tag „Doppelt“ (gehört mdopp), #405 bleibt; übernommen: Tags, Felder",
-                      "#439 (6 S.) steckt ganz in #405 (6 S.) → #439 bekommt den Tag „Doppelt“ (gehört mdopp), #405 bleibt",
-                      "#440 (3 S.) steckt ganz in #405 (6 S.) → #440 bekommt den Tag „Doppelt“ (gehört mdopp), #405 bleibt",
-                      "#436 (2 S.) steckt ganz in #407 (6 S.) → #436 in den Papierkorb; übernommen: Absender, Tags",
-                      "#434 (4 S.) steckt ganz in #409", "#435 (6 S.) steckt ganz in #409", "#411 (1 S.) steckt ganz in #433",
-                      "#527 (2 S.) steckt ganz in #526 (2 S.) → #527 bekommt den Tag „Doppelt“ (gehört mdopp), #526 bleibt"):
-            self.assertIn(zeile, text)
-        self.assertNotIn("450", text, "the next year's letter is no duplicate")
-        plan = json.loads(Path(d, "plan-doppelt.json").read_text())
-        self.assertEqual(len(plan["faelle"]), 8)
+        self.assertTrue(out.startswith("doppelt: Start") and "(Probelauf)" in out.splitlines()[0])
+        for zeile in ("#438 „Dokument“ (2 Seiten) steckt ganz in #405 „2017-06-17 Allianz Lebensversicherungs-AG - Beitragsanpassung“ (6 Seiten): "
+                      "bekäme den Tag „Doppelt“ (gehört mdopp), übernommen: Tags, Felder",
+                      "#439 „2017-06-17 Allianz Lebensversicherungs-Aktiengesellschaft - Beitragsanpassung“ (6 Seiten) steckt ganz in #405",
+                      "#440 „Dokument“ (3 Seiten) steckt ganz in #405",
+                      "#436 „Dokument 436“ (2 Seiten) steckt ganz in #407 „Dokument 407“ (6 Seiten): würde in den Papierkorb gelegt, übernommen: Absender, Tags",
+                      "#434 „Dokument 434“ (4 Seiten) steckt ganz in #409", "#435 „Dokument 435“ (6 Seiten) steckt ganz in #409",
+                      "#411 „Dokument 411“ (1 Seite) steckt ganz in #433",
+                      "#527 „2022-02-01 Beispiel Handwerk GmbH - Rechnung 4711“ (2 Seiten) steckt ganz in #526"):
+            self.assertIn(zeile, out)
+        self.assertEqual(out.count(" steckt ganz in "), 8)
+        self.assertNotIn("#450", out, "the next year's letter is no duplicate")
         self.assertEqual(haengt(out), {}, "nothing is tagged yet")
+        self.assertFalse(Path(d, "doppelt.json").read_text().count("gesehen"), "a dry run keeps no record")
 
     def test_the_households_partial_ones_go_to_the_trash_and_the_whole_ones_take_what_they_lack(self):
         f = heute()
-        rc, out, d = lauf(f, ["--alle"])
+        rc, out, d = alle(f)
         self.assertEqual(sorted(x["id"] for x in f.trash), [411, 434, 435, 436])
         k = f.docs[407]
         self.assertEqual(k["correspondent"], 9, "the sender the partial one had")
@@ -310,13 +320,13 @@ class Alle(unittest.TestCase):
         self.assertEqual(len(rec["erledigt"]), 8)
         self.assertIn('doppelt {"zusammengefuehrt": 4, "zum_loeschen": 4, "pruefen": 0}', out)
         n = len(f.writes)
-        rc, out, d = lauf_in(f, d, ["--alle"])
+        rc, out, d = alle(f, d=d)
         self.assertEqual(len(f.writes), n, "a second run does nothing")
         self.assertIn("4 doppelte Scans warten auf dein Löschen", haengt(out)["doppelt"], "but still says what waits")
 
     def test_a_persons_partial_one_is_tagged_doppelt_for_them_to_delete_and_the_run_says_how_many(self):
         f = heute()
-        rc, out, d = lauf(f, ["--alle"])
+        rc, out, d = alle(f)
         t = f.tag_id("Doppelt", anlegen=False)
         self.assertIsNotNone(t, "made once, the household's")
         for i in (438, 439, 440, 527):
@@ -340,7 +350,7 @@ class Alle(unittest.TestCase):
 
     def test_without_the_right_to_delete_the_households_wait_marked_and_it_says_so(self):
         f = heute(loeschen=False)
-        rc, out, d = lauf(f, ["--alle"])
+        rc, out, d = alle(f)
         self.assertEqual(f.trash, [])
         self.assertIn(2, f.docs[436]["tags"])
         self.assertIn(2, f.docs[434]["tags"])
@@ -351,7 +361,7 @@ class Alle(unittest.TestCase):
     def test_paperless_refusing_to_delete_marks_instead_of_breaking_off(self):
         f = heute()
         f.verboten = {436}
-        rc, out, d = lauf(f, ["--alle"])
+        rc, out, d = alle(f)
         self.assertEqual(rc, 0)
         self.assertEqual(sorted(x["id"] for x in f.trash), [411, 434, 435])
         self.assertIn(f.tag_id("Doppelt", anlegen=False), f.docs[436]["tags"])
@@ -363,7 +373,7 @@ class Alle(unittest.TestCase):
         f = heute()
         f.docs[436]["owner"] = 8
         f.docs[438]["owner"] = None
-        lauf(f, ["--alle"])
+        alle(f)
         self.assertIn(436, f.docs)
         self.assertIn(438, f.docs)
         self.assertFalse([w for w in f.writes if w[1] in (407, 436, 438)])
@@ -377,10 +387,12 @@ class Alle(unittest.TestCase):
                  {i: jahresmitteilung(j, b) for i, (j, b) in jahre.items()}, True, KORRESPONDENTEN)
         a, b = doppelt.falten(f.texte[599][0]), doppelt.falten(f.texte[600][0])
         self.assertGreater(ratio(a, b), 0.9, "the fixture is the hard case")
-        rc, out, d = lauf(f, ["--alle"])
-        self.assertIn("doppelt: 5 Dokumente, 10 Paare mit demselben Datum", out, "the start date makes them candidates")
+        docs, namen = {d["id"]: d for d in f.dokumente()}, f.korrespondenten()
+        self.assertEqual(sum(doppelt.paar_moeglich(docs[a], docs[b], namen) for a in jahre for b in jahre if a < b), 10,
+                         "the start date makes them candidates")
+        rc, out, d = alle(f)
         self.assertEqual(f.writes, [])
-        self.assertIn("Doppelt gescannt: 0 Fälle", out)
+        self.assertIn('doppelt {"zusammengefuehrt": 0, "zum_loeschen": 0, "pruefen": 0}', out)
 
 
 class Zusammensetzen(unittest.TestCase):
@@ -400,7 +412,7 @@ class Zusammensetzen(unittest.TestCase):
 
     def test_two_halves_become_one_document_in_page_order(self):
         f = self.haelften()
-        rc, out, d = lauf(f, ["--alle"])
+        rc, out, d = alle(f)
         [(inhalt, titel, felder)] = f.uploads
         self.assertEqual(json.loads(inhalt)["seiten"], [VIER[0], VIER[1], VIER[2], VIER[3]])
         self.assertEqual((titel, felder["document_type"], felder["correspondent"], felder["tags"], felder["created"]),
@@ -417,10 +429,10 @@ class Zusammensetzen(unittest.TestCase):
 
     def test_a_persons_two_halves_become_their_document_and_both_halves_wait_for_their_deleting(self):
         f = self.haelften(owner=MDOPP)
-        rc, out, d = lauf(f, ["--alle", "--dry-run"])
-        self.assertIn("#425 (3 S.) + #430 (2 S.) → ein neues Dokument mit 4 Seiten (A1 A2 B2 A3), beide bekommen den Tag „Doppelt“ (gehören mdopp)",
-                      Path(d, "zusammenfassung-doppelt.txt").read_text())
-        rc, out, d = lauf(f, ["--alle"])
+        rc, out, d = alle(f, ["--dry-run"])
+        self.assertIn("ein Dokument mit 4 Seiten (A=#425, B=#430: A1 A2 B2 A3)", out)
+        self.assertEqual((f.writes, f.uploads), ([], []))
+        rc, out, d = alle(f)
         self.assertEqual(len(f.uploads), 1)
         f.ablegen(612)
         rc, out, d = lauf_in(f, d, ["--neue"])
@@ -439,7 +451,7 @@ class Zusammensetzen(unittest.TestCase):
 
     def test_unsure_is_only_marked_on_both_with_the_other_named(self):
         self.f = f = Fake([{"id": 600}, {"id": 601}], {600: [VIER[1], VIER[2]], 601: [VIER[3], rauschen(VIER[2])]})
-        lauf(f, ["--alle"])
+        alle(f)
         self.assertEqual((f.trash, f.uploads), ([], []))
         self.assertIn(2, f.docs[600]["tags"])
         self.assertIn(2, f.docs[601]["tags"])
@@ -458,7 +470,7 @@ class Neue(unittest.TestCase):
         f.texte[700] = [rauschen(ZWEI[0])]
         lauf_in(f, d, ["--neue"])
         self.assertEqual([x["id"] for x in f.trash], [700])
-        self.assertIn(407, f.docs, "the older duplicate pair 407/436 is --alle's")
+        self.assertIn(407, f.docs, "the older duplicate pair 407/436 came before intake began")
         n = len(f.writes)
         lauf_in(f, d, ["--neue"])
         self.assertEqual(len(f.writes), n)

@@ -50,11 +50,11 @@ wrong with it: the date as the text has it (the model's, else Paperless'
 created, JJJJ-MM when the text names only „Dezember 2007“, none when the
 text names neither), no consume folder's „(n)“, never the bare „Dokument“
 (the model's gegenstand, else the statement's heading line, else the type).
-berichtigen.py puts right what was filed before. A mail's subject a person
-did not write is machine-made too, whatever the file was called: a forwarded
-or answered one („Fwd:“, „WG:“, „AW:“, „Re:“) or one that is a file's name
-(„Rechnung_R-261241“); it becomes „JJJJ-MM-TT Absender - Gegenstand“, the
-subject cleaned where the model names none (2026-11-09, document 641).
+A mail's subject a person did not write is machine-made too, whatever the
+file was called: a forwarded or answered one („Fwd:“, „WG:“, „AW:“, „Re:“)
+or one that is a file's name („Rechnung_R-261241“); it becomes
+„JJJJ-MM-TT Absender - Gegenstand“, the subject cleaned where the model
+names none (2026-11-09, document 641).
 
 A sender's name gets back the fi, fl, ff, ffi, ffl OCR dropped (firmen.py's
 ligaturen) before it is matched or made a correspondent, where the text

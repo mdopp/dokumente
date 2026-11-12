@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: docker build -t dokumente:test -f Containerfile .
-      - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_zuteilen.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py
+      - run: docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3 dokumente:test -B -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_zuteilen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py
       # the image as laib starts it: dienst.py finds scan.py and vertraege.py beside it in /opt
       - run: docker run --rm --entrypoint python3 dokumente:test -c "import sys; sys.path.insert(0, '/opt'); import dienst; a = dienst.Auswertung({}); assert dienst.scan.__file__ == '/opt/scan.py' and a.skript == '/opt/vertraege.py' and a.ordnen == '/opt/ordnen.py' and a.doppelt == '/opt/doppelt.py' and a.zuteilen == '/opt/zuteilen.py', (dienst.scan.__file__, a.skript, a.ordnen, a.doppelt, a.zuteilen); print('ok')"
       # vertraege.py and kontakte_aufraeumen.py find firmen.py (and it ordnen.py) beside them in /opt
