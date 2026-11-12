@@ -17,7 +17,6 @@ COPY vertraege/vertraege.py /opt/vertraege.py
 COPY ordnen/ordnen.py /opt/ordnen.py
 COPY ordnen/doppelt.py /opt/doppelt.py
 COPY ordnen/zuteilen.py /opt/zuteilen.py
-COPY ordnen/berichtigen.py /opt/berichtigen.py
 COPY ordnen/firmen.py /opt/firmen.py
 COPY ordnen/kontakte_aufraeumen.py /opt/kontakte_aufraeumen.py
 COPY ordnen/kontakte_nachlesen.py /opt/kontakte_nachlesen.py

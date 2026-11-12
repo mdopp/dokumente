@@ -27,7 +27,7 @@ is `ghcr.io/mdopp/dokumente`, built on every push to main.
 
 Tests run in the image: `docker build -t dokumente:test -f Containerfile .`
 then `docker run --rm -v "$PWD:/src:ro" -w /src --entrypoint python3
-dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_zuteilen.py ordnen/tests/test_berichtigen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py`.
+dokumente:test -m unittest scan/tests/test_scan.py vertraege/tests/test_vertraege.py tests/test_dienst.py ordnen/tests/test_ordnen.py ordnen/tests/test_doppelt.py ordnen/tests/test_zuteilen.py ordnen/tests/test_firmen.py ordnen/tests/test_kontakte_aufraeumen.py ordnen/tests/test_kontakte_nachlesen.py vertraege/tests/test_kontakte_abgleich.py`.
 
 ## The contract with laib's template
 
@@ -316,15 +316,9 @@ touched, an emptied one is deleted), the new fields and the views.
   the one that would go is marked `prüfen`, and the watch says `loeschen`.
   A delete Paperless refuses anyway (403) is marked `Doppelt` like a
   person's, never a broken-off run.
-  - On every run after the hook, before `ordnen.py --neue`: documents added
-    since its record began, at most `DOPPELT_PRO_LAUF`.
-  - Once over the documents there are, in Dokumente's container (its token
-    and env are there): `python3 /opt/doppelt.py --alle --dry-run` changes
-    nothing and writes `/dokumente/ordnen/zusammenfassung-doppelt.txt` and
-    `plan-doppelt.json`, the list to look at; then the same without
-    `--dry-run` (`--hintergrund` detaches, its log `lauf.log`; `--max N`
-    acts on N pairs). A merge it uploads is finished by the next run after
-    the hook.
+  It runs on every run after the hook, before `ordnen.py --neue`: documents
+  added since its record began, at most `DOPPELT_PRO_LAUF`; a merge it
+  uploads is finished by the next run.
 - **A periodic statement is no contract** (2026-11-08: a fund policy's yearly
   Wertmitteilung came in as a Versicherungsschein, and vertraege.py filled
   Vertragsbeginn, -ende and Betrag on each). Vertrag and Versicherungsschein
@@ -355,14 +349,6 @@ touched, an emptied one is deleted), the new fields and the views.
   `firmenkontakte`, `handy_firmen`; `HAUSHALT_URL`/`HAUSHALT_TOKEN`) has the
   word with them: „Rollladen Herkenho GmbH“ is made „Rollladen Herkenhoff
   GmbH“. Homes away, it goes by Paperless alone.
-- **Once, what was filed before** (`berichtigen.py`, its docstring is the
-  contract), in Dokumente's container: `python3 /opt/berichtigen.py
-  --dry-run` writes `/dokumente/ordnen/zusammenfassung-berichtigen.txt` and
-  `plan-berichtigen.json`; then without `--dry-run` (a backup first, which
-  `ordnen.py wiederherstellen` puts back, titles included). It retypes the
-  statements Dokumente typed as a contract, takes off the contract fields
-  vertraege.py's note names on them, fixes machine titles, never asks the
-  model.
 - **One firm, one contact** (`firmen.py`, owner 2026-11-09): vertraege.py
   matches a sender against the household address book (Homes'
   kontakte_suchen) before kontakt_ergaenzen makes a card: legal form and
